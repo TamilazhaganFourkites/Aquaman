@@ -17,6 +17,10 @@ from .state import OceanState
 
 def route_after_research(state: OceanState) -> str:
     r = state.get("route")
+    # RCA-only run (control-plane "In RCA" stage): always take the analysis path, even if
+    # the researcher leaned "coding" — the fix is a separate later run ("RCA Done").
+    if config.RCA_ONLY and r != "unsupported" and r in ("rca", "coding"):
+        return "rca"
     if r in ("rca", "coding"):
         return r
     # sop / loft / ff_onboarding / unclassified are handled by other harnesses, not this
@@ -26,6 +30,9 @@ def route_after_research(state: OceanState) -> str:
 
 def after_rca(state: OceanState) -> str:
     # RCA agent -> RCA Done (terminal report) | Fix needed -> deps+reachability -> coder
+    # In RCA-only mode we always stop at the report; the fix is a separate "RCA Done" run.
+    if config.RCA_ONLY:
+        return "done"
     return "fix_needed" if state.get("rca_fix_needed") else "done"
 
 

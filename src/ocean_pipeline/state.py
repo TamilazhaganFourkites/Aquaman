@@ -41,10 +41,12 @@ class OceanState(TypedDict, total=False):
     # --- Station 1 / 1.5 ---
     dependency_report: dict
     reachability_report: dict        # binding artifact fk-coder must obey
+    reachability_blocking: bool      # surfaced in the runner log
 
     # --- Station 4: code ---
     branch: str
     pushed_sha: str
+    files_changed: int
 
     # --- Station 5: review loop (gated at MAX_REVIEW_ITERATIONS) ---
     review_verdict: ReviewVerdict

@@ -100,34 +100,87 @@ automatically. The engineer still owns final merge, sign-off, and deploy.
 
 ## Observability
 
-**Live logs (`-v` / `--verbose`) — local, no data leaves.** By default the run prints one
-`✓ <node>` line as each station *completes*. With `--verbose` (or `OCEAN_PIPELINE_VERBOSE=1`)
-each station agent's inner activity — tool calls and text — streams to the console/log as it
-happens, so a multi-minute node isn't a black box:
+**Runner log (default) — clean, management-legible.** Every run prints a plain-English
+process log: a `▶` header per station, live **milestones** for the significant actions
+(clone / branch / edit / test / commit / push / PR / docker / pytest — noise suppressed), a
+`✓` line with elapsed time + outcome, and structured facts (`└`). No jargon:
 
-```bash
-ocean-pipeline MM-14609 --verbose 2>&1 | tee run.log
-#   ✓ researcher
-#     [station4-coder] ⚙ Bash {"command":"git checkout -b MM-14609/..."}
-#     [station4-coder] Editing app/services/eta/exception_clearer.rb ...
-#   ✓ coder
+```
+════════════════════════════════════════════════════════════════
+  FK Ocean Pipeline   ·   MM-14609
+  run EXE-1a2b3c4d
+════════════════════════════════════════════════════════════════
+
+▶  Research & routing
+     · querying Atlassian
+     · dispatching sub-agent: ocean SME
+  ✓  Research & routing                        34s   → routed to coding
+        └ repo: ocean-worker (ruby, docker)
+
+▶  Coding
+     · cloning the target repo
+     · creating the ticket branch
+     · editing exception_clearer.rb
+     · installing gems (Docker)
+     · committing changes
+     · pushing the branch
+  ✓  Coding                                  3m30s   branch pushed
+        └ 3 file(s) changed
+
+▶  Adversarial code review
+  ✓  Adversarial code review                   42s   APPROVE
+        └ no CRITICAL/MAJOR findings
+
+▶  Local SIT (automation testing)
+     · repointing config to local + mocks
+     · starting the mock server
+     · bringing up local Docker infra
+     · running the SIT (pytest)
+     · opening the draft PR
+  ✓  Local SIT (automation testing)          6m20s   SIT passed
+        └ 2/2 tests passed
+        └   passed: test_eta_exception_cleared_on_pod
+        └ ran ocean-worker local · mocked: tracking-service
+────────────────────────────────────────────────────────────────
+  RESULT: COMPLETED   ·   took 11m06s   ·   finished 23:04:48
+  sit_passed; service PR #123 ready-for-review
+  spend: $1.41 · 330k tokens · 74 tool calls   across 5 station runs
+════════════════════════════════════════════════════════════════
 ```
 
-Per-station verdicts also land in `$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/*.verdict.json`.
+Each station shows: a timestamped `▶` header, live `·` milestones, per-station spend
+(`done — $0.52 · 140k tokens · 24 tool calls`), and a `✓` line with elapsed + facts —
+including review findings spelled out (severity + summary + file) and SIT test names. The
+footer totals cost / tokens / tool-calls for the whole run.
 
-**LangGraph Studio (visual graph UI) — runs locally.** The graph is exposed via
-`langgraph.json`:
+**`--verbose` (engineers) — the deep dive.** Adds each agent's raw tool calls + text on top
+of the milestones, for debugging. Off by default. Per-station verdicts also land in
+`$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/*.verdict.json`.
+
+**Langfuse (self-hosted run UI) — recommended.** FourKites runs open-source Langfuse at
+`https://langfuse.fourkites.com` (on FK infra), so run data stays in-house — this is the FK
+alternative to LangSmith/`smith.langchain.com`, which we do **not** use. When the
+`LANGFUSE_*` credentials are present, every run traces automatically — each node shows up as a
+span (timing, state, tool activity) in the Langfuse UI:
 
 ```bash
-pip install -e '.[studio]'
-cp .env.example .env          # set FK_AIDEVELOPER_DIR
-langgraph dev                 # opens LangGraph Studio in the browser
+pip install -e '.[langfuse]'
+# creds go in ~/.fourkites-secrets.env (auto-loaded) — get keys from Luvkush:
+#   LANGFUSE_PUBLIC_KEY=pk-lf-...
+#   LANGFUSE_SECRET_KEY=sk-lf-...
+#   LANGFUSE_BASE_URL=https://langfuse.fourkites.com
+ocean-pipeline MM-14609 --verbose
+# -> prints "Langfuse tracing → https://langfuse.fourkites.com"; open that UI to watch the run
 ```
 
-`langgraph dev` runs a **local** server; Studio renders the graph, shows nodes executing, and
-lets you inspect state per step. Keep `LANGSMITH_TRACING` unset so no run data is exported.
-Note: running the graph *from Studio* triggers the real agents/side-effects — for a
-side-effect-free view of the topology use `ocean-pipeline --print-graph`.
+It's fully opt-in and gated: no `langfuse` package or no creds → tracing is a silent no-op.
+There is **no signup and no cloud export** — the FK Langfuse instance is self-hosted.
+
+**LangGraph Studio (visual graph UI) — optional, needs a LangSmith account.** The graph is
+exposed via `langgraph.json` (`pip install -e '.[studio]'` then `langgraph dev`). Note the
+Studio *front-end* is hosted at `smith.langchain.com` and requires a LangSmith login to open,
+so for FK use prefer Langfuse above. For a zero-dependency static view of the topology use
+`ocean-pipeline --print-graph`.
 
 ## Tests
 

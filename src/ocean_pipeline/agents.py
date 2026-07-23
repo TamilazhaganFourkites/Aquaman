@@ -19,12 +19,13 @@ This keeps CLAUDE.md's model intact: context is minimal, capabilities
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Type, TypeVar
 
 from pydantic import BaseModel
 
-from . import config
+from . import config, metrics, ui
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -77,6 +78,90 @@ def _emit(label: str, line: str) -> None:
     print(f"    [{label}] {line}", flush=True)
 
 
+def _classify_bash(command: str) -> str | None:
+    """Map a shell command to a readable milestone, or None to suppress it (ls/cat/cd/…)."""
+    c = command.strip().lower()
+    checks = [
+        ("git clone", "cloning the target repo"),
+        ("checkout -b", "creating the ticket branch"),
+        ("git commit", "committing changes"),
+        ("git push", "pushing the branch"),
+        ("gh pr create", "opening the draft PR"),
+        ("gh pr ready", "marking the PR ready for review"),
+        ("gh pr edit", "cross-linking the test PR"),
+        ("gh pr list", "checking for an existing PR"),
+        ("route_local", "repointing config to local + mocks"),
+        ("ocean_mock_helper", "starting the mock server"),
+        ("start-infra", "bringing up local Docker infra"),
+        ("docker compose up", "bringing up local Docker infra"),
+        ("docker-compose up", "bringing up local Docker infra"),
+        ("bundle install", "installing gems (Docker)"),
+        ("rspec", "running Ruby unit tests"),
+        ("pytest", "running the SIT (pytest)"),
+        ("generate_test_report", "generating the test report"),
+        ("stop-infra", "tearing down infra"),
+        ("mvn ", "building/testing (Maven)"),
+        ("go build", "building (Go)"),
+        ("go test", "testing (Go)"),
+    ]
+    for needle, label in checks:
+        if needle in c:
+            return label
+    return None
+
+
+def _count_tools(msg) -> int:
+    content = getattr(msg, "content", None)
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for b in content if getattr(b, "name", None) is not None)
+
+
+def _usage(msg) -> tuple[float, int, int]:
+    """Best-effort (cost_usd, input_tokens, output_tokens) from a ResultMessage."""
+    cost = getattr(msg, "total_cost_usd", None) or getattr(msg, "cost_usd", None) or 0.0
+    u = getattr(msg, "usage", None)
+    in_tok = out_tok = 0
+    if u is not None:
+        in_tok = getattr(u, "input_tokens", None)
+        out_tok = getattr(u, "output_tokens", None)
+        if in_tok is None and isinstance(u, dict):
+            in_tok, out_tok = u.get("input_tokens", 0), u.get("output_tokens", 0)
+    try:
+        return float(cost or 0.0), int(in_tok or 0), int(out_tok or 0)
+    except (TypeError, ValueError):
+        return 0.0, 0, 0
+
+
+def _milestones(msg) -> list[str]:
+    """Curated, human-readable actions from an agent message — the significant tool
+    calls only (edits, git/gh, docker, tests, MCP queries); noise is dropped."""
+    content = getattr(msg, "content", None)
+    if not isinstance(content, list):
+        return []
+    out: list[str] = []
+    for block in content:
+        name = getattr(block, "name", None)
+        if name is None:
+            continue
+        inp = getattr(block, "input", None) or {}
+        if not isinstance(inp, dict):
+            inp = {}
+        if name == "Bash":
+            m = _classify_bash(str(inp.get("command", "")))
+            if m:
+                out.append(m)
+        elif name in ("Write", "Edit", "MultiEdit"):
+            fp = inp.get("file_path") or inp.get("path") or ""
+            out.append(f"editing {os.path.basename(str(fp))}" if fp else "editing a file")
+        elif name.startswith("mcp__"):
+            svc = name.split("__")[1] if "__" in name else name
+            out.append(f"querying {svc}")
+        elif name == "Task":
+            out.append(f"dispatching sub-agent: {inp.get('description', 'subtask')}")
+    return out
+
+
 def _format_message(msg) -> list[str]:
     """Best-effort, SDK-shape-tolerant one-liners for a streamed agent message:
     tool calls, assistant/thinking text, and the final result."""
@@ -113,12 +198,26 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
         cwd=str(cwd),
         permission_mode=permission_mode,
     )
+    ui.station_start(label)   # "▶ <station>" header; milestones stream underneath
+    tools = 0
+    cost = in_tok = out_tok = 0.0
     async for message in query(prompt=prompt, options=options):
-        # The artifact / canonical file is the return channel; with --verbose we also
-        # surface the agent's live activity so a multi-minute node isn't a black box.
+        # Default: curated, readable milestones (the significant actions).
+        for m in _milestones(message):
+            ui.milestone(m)
+        tools += _count_tools(message)
+        c, i, o = _usage(message)
+        cost += c
+        in_tok += i
+        out_tok += o
+        # --verbose: also dump the raw per-message activity for debugging.
         if config.VERBOSE:
             for line in _format_message(message):
                 _emit(label, line)
+    spend = metrics.fmt(cost, int(in_tok), int(out_tok), tools)
+    if spend:
+        ui.milestone(f"done — {spend}")
+    metrics.add(cost, int(in_tok), int(out_tok), tools)
 
 
 async def run_station(

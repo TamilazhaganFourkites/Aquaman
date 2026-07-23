@@ -30,6 +30,13 @@ STATION_MODEL = os.environ.get("OCEAN_PIPELINE_MODEL", "claude-opus-4-8")
 # so a long-running node isn't a black box. Toggled by env or the CLI --verbose flag.
 VERBOSE = os.environ.get("OCEAN_PIPELINE_VERBOSE", "").lower() in ("1", "true", "yes")
 
+# RCA-only mode: run research -> ocean-rca report and STOP after the report, even when
+# the root cause needs a code fix (do NOT auto-proceed to coding). This preserves the
+# staged control-plane workflow where "In RCA" analyses + reports, and the fix is a
+# separate run once the ticket moves to "RCA Done". Toggled by env (set by the
+# oas-autodev spawn-aquaman.sh for the rca action) or the CLI --rca-only flag.
+RCA_ONLY = os.environ.get("OCEAN_PIPELINE_RCA_ONLY", "").lower() in ("1", "true", "yes")
+
 # Hard cap on the Station 5 <-> Station 4 review loop (CLAUDE.md: max 2 iterations).
 MAX_REVIEW_ITERATIONS = 2
 

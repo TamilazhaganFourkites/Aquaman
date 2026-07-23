@@ -83,7 +83,7 @@ async def reachability_gate(state: OceanState) -> dict:
         verdict_model=schemas.ReachabilityVerdict,
     )
     telemetry.station_event(state["execution_id"], 1.5, "end", blocking=v.blocking)
-    return {"reachability_report": _load_json(v.report_path)}
+    return {"reachability_report": _load_json(v.report_path), "reachability_blocking": v.blocking}
 
 
 # ------------------------------------------------------------------ Station 4
@@ -121,7 +121,8 @@ async def coder(state: OceanState) -> dict:
     )
     telemetry.station_event(state["execution_id"], 4, "end")
     # A fresh code pass supersedes prior SIT findings; clear them once addressed.
-    return {"branch": v.branch, "pushed_sha": v.pushed_sha, "sit_findings": []}
+    return {"branch": v.branch, "pushed_sha": v.pushed_sha,
+            "files_changed": v.files_changed, "sit_findings": []}
 
 
 # ------------------------------------------------------------------ Station 5
@@ -338,7 +339,13 @@ async def rca_agent(state: OceanState) -> dict:
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
-            f"Produce the ocean-rca evidence-cited report for {state['ticket_id']}. Then decide: "
+            f"Produce the ocean-rca evidence-cited report for {state['ticket_id']}. "
+            f"POST the completed 5-part report back to {state['ticket_id']} as a Jira comment via the "
+            f"Atlassian MCP (addCommentToJiraIssue), prefixed '🤖 Aquaman Ocean RCA': root cause, "
+            f"evidence (with proof — specific SigNoz/ClickHouse log lines + the source that produced "
+            f"them + read-only Redshift records), affected service/component, and recommended fix. "
+            f"STRICT PRODUCTION SAFETY: use rca-app / fourkites MCP tools for READ/GET only; NEVER call "
+            f"any create/update/delete/resolve tool against production. Then decide: "
             f"does the root cause require a code fix in an ocean repo? If yes, set fix_needed=true "
             f"and populate findings_for_coder with a concrete implementation brief (repo, file, "
             f"what to change, why). If it is working-as-expected / config / data with no code change, "

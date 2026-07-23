@@ -10,3 +10,5 @@ venv/
 checkpoints.sqlite
 .env
 .langgraph_api/
+*.log
+.vscode/
