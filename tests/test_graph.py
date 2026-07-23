@@ -60,27 +60,27 @@ def _install(script: Script, tmp_path, monkeypatch):
     async def fake_run_station(**kw):
         station = kw["station"]
         script.calls[station] += 1
-        if station.startswith("station0-researcher"):
+        if station.startswith("researcher"):
             return schemas.ResearchVerdict(route=script.route, packet_path=nowhere, target_repos=[])
-        if station.startswith("rca-agent"):
+        if station.startswith("rca_agent"):
             return schemas.RcaVerdict(report_path=nowhere, fix_needed=script.rca_fix,
                                       findings_for_coder=(["fix X in ocean-worker"] if script.rca_fix else []))
-        if station.startswith("station1-deps") or station.startswith("station1_5-reachability"):
+        if station.startswith("dep_resolver") or station.startswith("reachability_gate"):
             return schemas.ReachabilityVerdict(report_path=nowhere)
-        if station.startswith("station4-coder"):
+        if station.startswith("coder"):
             return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b", pushed_sha="deadbeef")
-        if station.startswith("station5-review"):
+        if station.startswith("harsh_reviewer"):
             v = script.next_review()
             findings = [{"severity": "MAJOR", "file": "f.rb", "summary": "x"}] if v == "CHANGES_REQUIRED" else []
             return schemas.ReviewVerdict(verdict=v, findings=findings)
-        if station.startswith("station3_87-open-pr"):
+        if station.startswith("open_pr"):
             (config.artifacts_dir(kw["execution_id"]) / "pr_number.txt").write_text("123")
             return schemas.CoderVerdict(branch="b", pushed_sha="sha")
         # graph_augment / release_intel / ready-flip
         return schemas.CoderVerdict(branch="b", pushed_sha="sha")
 
     async def fake_run_skill(**kw):
-        script.calls["station6-sit"] += 1
+        script.calls["automation_testing"] += 1
         outcome = script.next_sit()  # passed | code_fault | could_not_verify
         verdict = {
             "ticket_id": kw["ticket_id"],
@@ -143,10 +143,10 @@ def test_happy_path(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "completed"
     assert final["ready_flipped"] is True
-    assert s.calls["station4-coder"] == 1
-    assert s.calls["station5-review"] == 1
-    assert s.calls["station6-sit"] == 1
-    assert s.calls["station6_5-ready-flip"] == 1
+    assert s.calls["coder"] == 1
+    assert s.calls["harsh_reviewer"] == 1
+    assert s.calls["automation_testing"] == 1
+    assert s.calls["flip_ready"] == 1
 
 
 def test_review_loop_then_approve(tmp_path, monkeypatch):
@@ -154,8 +154,8 @@ def test_review_loop_then_approve(tmp_path, monkeypatch):
     _install(s, tmp_path, monkeypatch)
     final = _run()
     assert final["final_status"] == "completed"
-    assert s.calls["station4-coder"] == 2      # initial + one rework
-    assert s.calls["station5-review"] == 2
+    assert s.calls["coder"] == 2      # initial + one rework
+    assert s.calls["harsh_reviewer"] == 2
 
 
 def test_review_iteration_cap(tmp_path, monkeypatch):
@@ -163,7 +163,7 @@ def test_review_iteration_cap(tmp_path, monkeypatch):
     _install(s, tmp_path, monkeypatch)
     final = _run()
     # capped at MAX_REVIEW_ITERATIONS then proceeds to open_pr and on to SIT
-    assert s.calls["station5-review"] == config.MAX_REVIEW_ITERATIONS
+    assert s.calls["harsh_reviewer"] == config.MAX_REVIEW_ITERATIONS
     assert final["final_status"] == "completed"
 
 
@@ -172,9 +172,9 @@ def test_code_fault_loop_then_pass(tmp_path, monkeypatch):
     _install(s, tmp_path, monkeypatch)
     final = _run()
     assert final["final_status"] == "completed"
-    assert s.calls["station6-sit"] == 2
-    assert s.calls["station4-coder"] == 2      # initial + one code_fault rework
-    assert s.calls["station3_87-open-pr"] == 1  # opened once; re-entry is a no-op
+    assert s.calls["automation_testing"] == 2
+    assert s.calls["coder"] == 2      # initial + one code_fault rework
+    assert s.calls["open_pr"] == 1  # opened once; re-entry is a no-op
 
 
 def test_code_fault_budget_exhausted(tmp_path, monkeypatch):
@@ -183,7 +183,7 @@ def test_code_fault_budget_exhausted(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "failed"
     assert "coding_attempts_exhausted" in final["final_outcome"]
-    assert s.calls["station6-sit"] == config.MAX_CODING_ATTEMPTS + 1  # initial + N reworks
+    assert s.calls["automation_testing"] == config.MAX_CODING_ATTEMPTS + 1  # initial + N reworks
 
 
 def test_could_not_verify_stops(tmp_path, monkeypatch):
@@ -192,8 +192,8 @@ def test_could_not_verify_stops(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "failed"
     assert "could_not_verify" in final["final_outcome"]
-    assert s.calls["station6-sit"] == 1        # no rework loop on could_not_verify
-    assert s.calls["station6_5-ready-flip"] == 0
+    assert s.calls["automation_testing"] == 1        # no rework loop on could_not_verify
+    assert s.calls["flip_ready"] == 0
 
 
 def test_rca_no_fix_terminal(tmp_path, monkeypatch):
@@ -201,8 +201,8 @@ def test_rca_no_fix_terminal(tmp_path, monkeypatch):
     _install(s, tmp_path, monkeypatch)
     final = _run()
     assert final["final_status"] == "rca_report"
-    assert s.calls["station4-coder"] == 0
-    assert s.calls["station1-deps"] == 0
+    assert s.calls["coder"] == 0
+    assert s.calls["dep_resolver"] == 0
 
 
 def test_rca_fix_runs_gates_then_codes(tmp_path, monkeypatch):
@@ -210,10 +210,10 @@ def test_rca_fix_runs_gates_then_codes(tmp_path, monkeypatch):
     _install(s, tmp_path, monkeypatch)
     final = _run()
     assert final["final_status"] == "completed"
-    assert s.calls["rca-agent"] == 1
-    assert s.calls["station1-deps"] == 1          # RCA fix went THROUGH the gates
-    assert s.calls["station1_5-reachability"] == 1
-    assert s.calls["station4-coder"] == 1
+    assert s.calls["rca_agent"] == 1
+    assert s.calls["dep_resolver"] == 1          # RCA fix went THROUGH the gates
+    assert s.calls["reachability_gate"] == 1
+    assert s.calls["coder"] == 1
 
 
 def test_unsupported_route_stops(tmp_path, monkeypatch):
@@ -222,4 +222,4 @@ def test_unsupported_route_stops(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "failed"
     assert "unsupported route" in final["final_outcome"]
-    assert s.calls["station4-coder"] == 0
+    assert s.calls["coder"] == 0

@@ -21,7 +21,7 @@ from pathlib import Path
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from . import config, metrics, telemetry, tracing, ui
+from . import config, metrics, report, telemetry, tracing, ui
 from .graph import build_graph, compile_app
 from .state import OceanState
 
@@ -66,18 +66,23 @@ async def _drive_stream(app, initial, thread) -> tuple[dict, float]:
         now = time.monotonic()
         for node, update in chunk.items():
             ui.step(node, update, now - last)
+            report.record(node, now - last, update)
         last = now
     snapshot = await app.aget_state(thread)
     return snapshot.values, time.monotonic() - start
 
 
 async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
-    """Run (or resume) the graph, guaranteeing a telemetry END row even on failure."""
+    """Run (or resume) the graph, guaranteeing a telemetry END row + report even on failure."""
     Path(config.CHECKPOINT_DB).parent.mkdir(parents=True, exist_ok=True)
+    metrics.reset()
+    report.start(ticket_id, execution_id)
+    out_dir = config.artifacts_dir(execution_id)
     handler = tracing.callback_handler()   # self-hosted Langfuse, or None if unconfigured
     if handler is not None:
         thread = {**thread, "callbacks": [handler]}
         print(f"[ocean-pipeline] Langfuse tracing → {tracing.host()}")
+    final: dict = {}
     try:
         async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
             app = compile_app(saver)
@@ -86,8 +91,16 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
     except Exception as e:  # noqa: BLE001 — never leave a `running` row orphaned (AP-223)
         telemetry.execution_end(execution_id, ticket_id, "failed", "unknown")
         print(f"\n[FAILED] {type(e).__name__}: {e}")
+        final = {**final, "final_status": final.get("final_status") or "failed",
+                 "final_outcome": final.get("final_outcome") or f"{type(e).__name__}: {e}"}
         raise
     finally:
+        try:
+            path = report.finish(final, out_dir)
+            if path:
+                print(f"  Full report: {path}")
+        except Exception:
+            pass
         if handler is not None:
             tracing.flush()
 
@@ -100,7 +113,6 @@ async def _run(ticket_id: str, context: str) -> None:
         )
     execution_id = telemetry.new_execution_id()
     telemetry.execution_start(execution_id, ticket_id)
-    metrics.reset()
 
     thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": RECURSION_LIMIT}
     initial: OceanState = {

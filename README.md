@@ -144,17 +144,23 @@ process log: a `▶` header per station, live **milestones** for the significant
 ────────────────────────────────────────────────────────────────
   RESULT: COMPLETED   ·   took 11m06s   ·   finished 23:04:48
   sit_passed; service PR #123 ready-for-review
-  spend: $1.41 · 330k tokens · 74 tool calls   across 5 station runs
+  usage: 330k tokens · 74 tool calls   across 5 station runs
 ════════════════════════════════════════════════════════════════
 ```
 
-Each station shows: a timestamped `▶` header, live `·` milestones, per-station spend
-(`done — $0.52 · 140k tokens · 24 tool calls`), and a `✓` line with elapsed + facts —
+Each station shows: a timestamped `▶` header, live `·` milestones, per-station usage
+(`done — 140k tokens · 24 tool calls`), and a `✓` line with elapsed + facts —
 including review findings spelled out (severity + summary + file) and SIT test names. The
 footer totals cost / tokens / tool-calls for the whole run.
 
+**Run report (written at the end).** Every run leaves a consolidated, shareable
+`run-report.md` (+ `run-report.json`) in `$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/` — header
+(ticket, timing, result, PR links, total usage) + a timeline table of every node with its
+duration and outcome. Written even if the run fails (partial timeline). The console prints
+`Full report: <path>` at the end.
+
 **`--verbose` (engineers) — the deep dive.** Adds each agent's raw tool calls + text on top
-of the milestones, for debugging. Off by default. Per-station verdicts also land in
+of the milestones, for debugging. Off by default. Per-node verdicts also land in
 `$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/*.verdict.json`.
 
 **Langfuse (self-hosted run UI) — recommended.** FourKites runs open-source Langfuse at

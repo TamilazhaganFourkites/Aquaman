@@ -30,11 +30,10 @@ def _k(n: int) -> str:
 
 
 def fmt(cost: float, input_tokens: int, output_tokens: int, tools: int | None = None) -> str:
-    """One compact 'spend' string, e.g. '$0.38 · 52k tokens · 12 tool calls'."""
+    """One compact usage string, e.g. '52k tokens · 12 tool calls'. No cost/$ is shown or
+    recorded anywhere; the `cost` arg is accepted for call-site compatibility and ignored."""
     tok = (input_tokens or 0) + (output_tokens or 0)
     parts: list[str] = []
-    if cost:
-        parts.append(f"${cost:.2f}")
     if tok:
         parts.append(f"{_k(tok)} tokens")
     if tools:

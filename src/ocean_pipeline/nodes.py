@@ -34,7 +34,7 @@ async def researcher(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0, "start")
     v: schemas.ResearchVerdict = await agents.run_station(
         agent_md="fk-researcher.md",
-        station="station0-researcher",
+        station="researcher",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -55,7 +55,7 @@ async def dep_resolver(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1, "start")
     v: schemas.ReachabilityVerdict = await agents.run_station(
         agent_md="fk-dependency-resolver.md",
-        station="station1-deps",
+        station="dep_resolver",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -73,7 +73,7 @@ async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
     v: schemas.ReachabilityVerdict = await agents.run_station(
         agent_md="fk-reachability-gate.md",
-        station="station1_5-reachability",
+        station="reachability_gate",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -109,7 +109,7 @@ async def coder(state: OceanState) -> dict:
 
     v: schemas.CoderVerdict = await agents.run_station(
         agent_md="fk-coder.md",
-        station="station4-coder",
+        station="coder",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -131,7 +131,7 @@ async def harsh_reviewer(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 5, "start", review_iteration=iteration)
     v: schemas.ReviewVerdict = await agents.run_station(
         agent_md="fk-harsh-reviewer.md",
-        station="station5-review",
+        station="harsh_reviewer",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -156,7 +156,7 @@ async def open_pr(state: OceanState) -> dict:
         pr_file.unlink()
     await agents.run_station(
         agent_md="fk-coder.md",
-        station="station3_87-open-pr",
+        station="open_pr",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -182,7 +182,7 @@ async def graph_augment(state: OceanState) -> dict:
     try:
         await agents.run_station(
             agent_md="fk-coder.md",
-            station="station4_5b-graph-augment",
+            station="graph_augment",
             ticket_id=state["ticket_id"],
             execution_id=state["execution_id"],
             task_prompt=f"Run Graph Caller Chain Augmentation for PR #{state['pr_number']}.\n\n{_summary(state)}",
@@ -200,7 +200,7 @@ async def release_intel(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 4.6, "start")
     await agents.run_station(
         agent_md="fk-coder.md",
-        station="station4_6-release-intel",
+        station="release_intel",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=f"Run the Release Intelligence Writer for {state['ticket_id']}.\n\n{_summary(state)}",
@@ -232,7 +232,7 @@ async def automation_testing(state: OceanState) -> dict:
 
     await agents.run_skill(
         skill_name="ocean-automation-testing",
-        station="station6-automation-testing",
+        station="automation_testing",
         ticket_id=tid,
         task_prompt=(
             f"Run ocean-automation-testing for {tid} HEADLESS (pipeline Station 6), end to end.\n"
@@ -295,7 +295,7 @@ async def flip_ready(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 6.5, "start")
     await agents.run_station(
         agent_md="fk-coder.md",
-        station="station6_5-ready-flip",
+        station="flip_ready",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -335,7 +335,7 @@ async def rca_agent(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0.1, "start", route="rca")
     v: schemas.RcaVerdict = await agents.run_station(
         agent_md="fk-researcher.md",   # routes into the ocean-rca skill; standalone, no PR
-        station="rca-agent",
+        station="rca_agent",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(

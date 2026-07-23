@@ -36,39 +36,30 @@ _LABELS = {
 }
 _STOP_NODES = {"stop_run", "unsupported_route"}
 
-# station-string (as passed to the agent runner) -> plain-English label, for the
-# live "▶ started" header that brackets the curated milestones streamed underneath.
-_STATION_LABELS = {
-    "station0-researcher":        "Research & routing",
-    "rca-agent":                  "Root-cause analysis (RCA)",
-    "rca":                        "RCA report",
-    "station1-deps":              "Dependency resolution",
-    "station1_5-reachability":    "Reachability verification",
-    "station4-coder":             "Coding",
-    "station5-review":            "Adversarial code review",
-    "station3_87-open-pr":        "Open draft PR",
-    "station4_5b-graph-augment":  "Code-graph augmentation",
-    "station4_6-release-intel":   "Release intelligence",
-    "station6-author":            "SIT: author/locate test",
-    "station6-run":               "SIT: run locally",
-    "station6-report":            "SIT: verdict",
-    "station6-automation-testing":"Local SIT (automation testing)",
-    "station6_5-ready-flip":      "Flip PR to ready-for-review",
-}
 
-
-def station_label(station: str) -> str:
-    return _STATION_LABELS.get(station, station)
-
-
-def station_start(station: str) -> None:
-    """Header printed when a station's agent begins; milestones stream under it."""
-    print(f"\n▶  {_now()}  {station_label(station)}", flush=True)
+def station_start(node: str) -> None:
+    """Header printed when a node's agent begins; milestones stream under it.
+    Keyed on the LangGraph node name — the same label map as the completion line."""
+    print(f"\n▶  {_now()}  {_LABELS.get(node, node)}", flush=True)
 
 
 def milestone(text: str) -> None:
-    """One curated, human-readable action inside a running station."""
+    """One curated, human-readable action inside a running node."""
     print(f"     · {text}", flush=True)
+
+
+def node_label(node: str) -> str:
+    return _LABELS.get(node, node)
+
+
+def outcome_line(node: str, update: dict) -> str:
+    """Highlight + detail facts for a node, flattened to one line (for the report table)."""
+    parts = []
+    hi = _highlight(node, update)
+    if hi:
+        parts.append(hi)
+    parts += [d.strip() for d in _details(node, update)]
+    return "; ".join(p for p in parts if p)
 
 
 def _fmt_elapsed(sec: float) -> str:
@@ -195,7 +186,7 @@ def summary(final: dict, total: float) -> None:
     if final.get("final_outcome"):
         print(f"  {final['final_outcome']}")
     t = metrics.totals()
-    spend = metrics.fmt(t["cost"], t["input"], t["output"], t["tools"])
-    if spend:
-        print(f"  spend: {spend}   across {t['stations']} station runs")
+    usage = metrics.fmt(t["cost"], t["input"], t["output"], t["tools"])
+    if usage:
+        print(f"  usage: {usage}   across {t['stations']} station runs")
     print("═" * WIDTH + "\n", flush=True)
