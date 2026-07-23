@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import shutil
 import time
 from pathlib import Path
@@ -32,6 +33,12 @@ RECURSION_LIMIT = 100
 
 def _project(ticket_id: str) -> str:
     return ticket_id.split("-", 1)[0].upper() if "-" in ticket_id else ""
+
+
+def _ticket_key(ticket_id: str) -> str:
+    """The bare Jira key (e.g. 'MM-14475') from a possibly free-form ticket arg."""
+    m = re.search(r"[A-Z]+-\d+", ticket_id or "")
+    return m.group(0) if m else ""
 
 
 def _preflight() -> None:
@@ -80,8 +87,19 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
     out_dir = config.artifacts_dir(execution_id)
     handler = tracing.callback_handler()   # self-hosted Langfuse, or None if unconfigured
     if handler is not None:
-        thread = {**thread, "callbacks": [handler]}
-        print(f"[ocean-pipeline] Langfuse tracing → {tracing.host()}")
+        tkey = _ticket_key(ticket_id)
+        thread = {
+            **thread,
+            "callbacks": [handler],
+            "run_name": tkey or "aquaman-run",   # names the Langfuse trace by the ticket
+            "metadata": {
+                **thread.get("metadata", {}),
+                "langfuse_session_id": execution_id,
+                "langfuse_tags": ["aquaman"] + ([tkey] if tkey else []),
+            },
+        }
+        print(f"[ocean-pipeline] Langfuse tracing → {tracing.host()}"
+              f"  (trace: {tkey or 'aquaman-run'}, tags: aquaman{',' + tkey if tkey else ''})")
     final: dict = {}
     try:
         async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:

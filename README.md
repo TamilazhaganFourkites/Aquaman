@@ -179,6 +179,12 @@ ocean-pipeline MM-14609 --verbose
 # -> prints "Langfuse tracing → https://langfuse.fourkites.com"; open that UI to watch the run
 ```
 
+Each run's trace is **named by the Jira key** (`MM-14475`, not the generic `LangGraph`),
+carries `session = <EXE-id>`, and is **tagged `aquaman` + the ticket** — so in a shared
+project you filter to `aquaman` (or search the ticket) and see only pipeline runs. Note
+Langfuse exports a span when it *ends*, so a long node's trace appears once it completes;
+the full trace lands when the run finishes (Aquaman flushes on exit).
+
 It's fully opt-in and gated: no `langfuse` package or no creds → tracing is a silent no-op.
 There is **no signup and no cloud export** — the FK Langfuse instance is self-hosted.
 
