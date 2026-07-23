@@ -26,6 +26,10 @@ CHECKPOINT_DB = os.environ.get("OCEAN_PIPELINE_CHECKPOINT_DB", str(ARTIFACTS_ROO
 # Default model for station agents. Always the latest capable Opus unless overridden.
 STATION_MODEL = os.environ.get("OCEAN_PIPELINE_MODEL", "claude-opus-4-8")
 
+# When true, stream each station agent's inner activity (tool calls + text) to the log,
+# so a long-running node isn't a black box. Toggled by env or the CLI --verbose flag.
+VERBOSE = os.environ.get("OCEAN_PIPELINE_VERBOSE", "").lower() in ("1", "true", "yes")
+
 # Hard cap on the Station 5 <-> Station 4 review loop (CLAUDE.md: max 2 iterations).
 MAX_REVIEW_ITERATIONS = 2
 

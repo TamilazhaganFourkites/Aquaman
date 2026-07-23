@@ -110,3 +110,9 @@ def compile_app(checkpointer):
     is an async context manager whose lifetime must span the ainvoke call.
     """
     return build_graph().compile(checkpointer=checkpointer)
+
+
+# Uncompiled StateGraph exposed for LangGraph Studio / `langgraph dev` (referenced by
+# langgraph.json). Studio supplies its own persistence, so hand it the builder — not a
+# checkpointer-bound compile. Construction is side-effect-free (no agent calls).
+graph = build_graph()

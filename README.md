@@ -68,10 +68,14 @@ src/ocean_pipeline/
 
 ## Setup
 
+Requires **Python ≥ 3.11** (LangGraph needs ≥ 3.10). On macOS the default `python3` is
+often an old 3.7/3.9 — create the venv with an explicit modern interpreter:
+
 ```bash
-pip install -e .
-export FK_AIDEVELOPER_DIR=/path/to/fk-aideveloper   # source of the station agents
-export ANTHROPIC_API_KEY=...                          # or `ant auth login`
+python3.12 -m venv .venv && source .venv/bin/activate   # NOT `python3` if that's 3.7/3.9
+pip install -e .                                        # add '.[studio]' for the Studio UI
+export FK_AIDEVELOPER_DIR=/path/to/fk-aideveloper       # source of the station agents
+export ANTHROPIC_API_KEY=...                            # or `ant auth login`
 ```
 
 Prerequisites: the Claude Agent SDK spawns the `claude` CLI, so Claude Code must be
@@ -93,6 +97,37 @@ ocean-pipeline --print-graph              # mermaid diagram straight from the co
 Node completions stream to the console as the run proceeds. The pipeline **never
 auto-merges or auto-deploys**; on SIT PASS it flips the service PR to ready-for-review
 automatically. The engineer still owns final merge, sign-off, and deploy.
+
+## Observability
+
+**Live logs (`-v` / `--verbose`) — local, no data leaves.** By default the run prints one
+`✓ <node>` line as each station *completes*. With `--verbose` (or `OCEAN_PIPELINE_VERBOSE=1`)
+each station agent's inner activity — tool calls and text — streams to the console/log as it
+happens, so a multi-minute node isn't a black box:
+
+```bash
+ocean-pipeline MM-14609 --verbose 2>&1 | tee run.log
+#   ✓ researcher
+#     [station4-coder] ⚙ Bash {"command":"git checkout -b MM-14609/..."}
+#     [station4-coder] Editing app/services/eta/exception_clearer.rb ...
+#   ✓ coder
+```
+
+Per-station verdicts also land in `$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/*.verdict.json`.
+
+**LangGraph Studio (visual graph UI) — runs locally.** The graph is exposed via
+`langgraph.json`:
+
+```bash
+pip install -e '.[studio]'
+cp .env.example .env          # set FK_AIDEVELOPER_DIR
+langgraph dev                 # opens LangGraph Studio in the browser
+```
+
+`langgraph dev` runs a **local** server; Studio renders the graph, shows nodes executing, and
+lets you inspect state per step. Keep `LANGSMITH_TRACING` unset so no run data is exported.
+Note: running the graph *from Studio* triggers the real agents/side-effects — for a
+side-effect-free view of the topology use `ocean-pipeline --print-graph`.
 
 ## Tests
 

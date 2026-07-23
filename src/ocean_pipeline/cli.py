@@ -119,7 +119,12 @@ def main() -> None:
     p.add_argument("--context", default="", help="extra context for the run")
     p.add_argument("--resume", metavar="EXECUTION_ID", help="continue a crashed run from its last checkpoint")
     p.add_argument("--print-graph", action="store_true", help="print the mermaid diagram and exit")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="stream each station agent's live activity (tool calls + text)")
     args = p.parse_args()
+
+    if args.verbose:
+        config.VERBOSE = True
 
     if args.print_graph:
         print(build_graph().compile().get_graph().draw_mermaid())

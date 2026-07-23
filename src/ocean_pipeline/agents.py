@@ -73,7 +73,36 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str) -> None:
+def _emit(label: str, line: str) -> None:
+    print(f"    [{label}] {line}", flush=True)
+
+
+def _format_message(msg) -> list[str]:
+    """Best-effort, SDK-shape-tolerant one-liners for a streamed agent message:
+    tool calls, assistant/thinking text, and the final result."""
+    out: list[str] = []
+    content = getattr(msg, "content", None)
+    if isinstance(content, list):
+        for block in content:
+            name = getattr(block, "name", None)        # ToolUseBlock
+            text = getattr(block, "text", None)         # Text/ThinkingBlock
+            if name is not None:
+                inp = getattr(block, "input", None)
+                arg = json.dumps(inp, default=str) if inp is not None else ""
+                out.append(f"⚙ {name} {arg[:200]}")
+            elif text:
+                t = " ".join(str(text).split())
+                if t:
+                    out.append(t[:220])
+        return out
+    result = getattr(msg, "result", None)               # ResultMessage
+    if result:
+        out.append(f"✔ {str(result)[:200]}")
+    return out
+
+
+async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str,
+                 label: str = "station") -> None:
     # Imported lazily so the graph/routing test suite runs without the SDK (or the
     # `claude` CLI it spawns) installed — the SDK is only needed at actual run time.
     from claude_agent_sdk import ClaudeAgentOptions, query
@@ -84,8 +113,12 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
         cwd=str(cwd),
         permission_mode=permission_mode,
     )
-    async for _message in query(prompt=prompt, options=options):
-        pass  # driven to completion; the artifact / canonical file is the return channel
+    async for message in query(prompt=prompt, options=options):
+        # The artifact / canonical file is the return channel; with --verbose we also
+        # surface the agent's live activity so a multi-minute node isn't a black box.
+        if config.VERBOSE:
+            for line in _format_message(message):
+                _emit(label, line)
 
 
 async def run_station(
@@ -115,6 +148,7 @@ async def run_station(
             prompt=f"{prefix}\n\n{task_prompt}\n{contract}",
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
             permission_mode=permission_mode or config.STATION_PERMISSION_MODE,
+            label=station,
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(station, agent_md, f"agent run failed: {type(e).__name__}: {e}") from e
@@ -148,4 +182,5 @@ async def run_skill(
         prompt=f"{prefix}\n\n{task_prompt}",
         cwd=cwd or config.FK_AIDEVELOPER_DIR,
         permission_mode=permission_mode or config.SKILL_PERMISSION_MODE,
+        label=station,
     )

@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "ocean_pipeline": "ocean_pipeline.graph:graph"
+  },
+  "env": ".env"
+}
