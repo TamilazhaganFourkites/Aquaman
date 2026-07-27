@@ -167,8 +167,10 @@ def _milestones(msg) -> list[str]:
             fp = inp.get("file_path") or inp.get("path") or ""
             out.append(f"editing {os.path.basename(str(fp))}" if fp else "editing a file")
         elif name.startswith("mcp__"):
-            svc = name.split("__")[1] if "__" in name else name
-            out.append(f"querying {svc}")
+            parts = name.split("__")
+            svc = parts[1] if len(parts) > 1 else name
+            tool = "__".join(parts[2:])   # the specific MCP tool, e.g. getJiraIssue
+            out.append(f"querying {svc}: {tool}" if tool else f"querying {svc}")
         elif name == "Task":
             out.append(f"dispatching sub-agent: {inp.get('description', 'subtask')}")
     return out
