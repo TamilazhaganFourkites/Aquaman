@@ -60,6 +60,15 @@ Set `route` to one of:
 - `rca` — this is a root-cause investigation (the graph runs the RCA path; no code here).
 - `sop | loft | ff_onboarding | unclassified` — handled by other harnesses; the graph stops cleanly.
 
+## Domain classification
+
+Also set `domain_bucket` to the ocean domain the ticket touches, so the graph can consult the
+right domain SME next:
+- `callback_notification` — callbacks/webhooks triggered, computed, delivered.
+- `load_creation` — loads created / enriched / deduplicated / mode-classified.
+- `ocean_tracking_milestones` — milestone events (AX/PX/X2/AG/C1/UV/VA/VD/OA/D), ETA.
+- `""` — none clearly applies.
+
 ## Output
 
 Two separate writes:

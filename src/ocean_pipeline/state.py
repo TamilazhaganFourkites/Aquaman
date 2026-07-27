@@ -33,6 +33,8 @@ class OceanState(TypedDict, total=False):
     route: Route
     research_packet: dict
     target_repos: list[TargetRepo]   # carries the language-scoped Docker decision
+    domain_bucket: str               # ocean domain; drives the SME-consult node
+    sme_findings: dict               # ownership/reuse guidance from the consulted ocean SME
 
     # --- RCA branch (diagram: RCA agent -> RCA Done -> Fix needed -> coder) ---
     rca_fix_needed: bool

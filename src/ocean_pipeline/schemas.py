@@ -18,6 +18,14 @@ class ResearchVerdict(BaseModel):
     route: Literal["coding", "rca", "sop", "loft", "ff_onboarding", "unclassified"]
     packet_path: str
     target_repos: list[dict]              # [{repo, language, build_env, branch}]
+    # Ocean domain the ticket touches, so the graph can consult the right SME node.
+    domain_bucket: str = ""               # callback_notification | load_creation | ocean_tracking_milestones | ""
+
+
+class SmeVerdict(BaseModel):
+    """Ocean domain SME answer: which repo/file/mechanism owns the change + reuse guidance."""
+    summary: str = ""
+    findings: list = Field(default_factory=list)
 
 
 class ReachabilityVerdict(BaseModel):

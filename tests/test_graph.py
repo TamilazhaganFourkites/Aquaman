@@ -28,9 +28,10 @@ class Script:
     """Per-test control over what the mocked agents return, plus call counts."""
 
     def __init__(self, *, route="coding", rca_fix=False, review_seq=("APPROVE",),
-                 sit_seq=("passed",)):
+                 sit_seq=("passed",), sme_bucket=""):
         self.route = route
         self.rca_fix = rca_fix
+        self.sme_bucket = sme_bucket
         self.review_seq = list(review_seq)
         self.sit_seq = list(sit_seq)
         self._review_i = 0
@@ -61,7 +62,10 @@ def _install(script: Script, tmp_path, monkeypatch):
         node = kw["node"]
         script.calls[node] += 1
         if node.startswith("researcher"):
-            return schemas.ResearchVerdict(route=script.route, packet_path=nowhere, target_repos=[])
+            return schemas.ResearchVerdict(route=script.route, packet_path=nowhere,
+                                           target_repos=[], domain_bucket=script.sme_bucket)
+        if node.startswith("sme_consult"):
+            return schemas.SmeVerdict(summary="owner: ocean-worker", findings=["reuse helper X"])
         if node.startswith("rca_agent"):
             return schemas.RcaVerdict(report_path=nowhere, fix_needed=script.rca_fix,
                                       findings_for_coder=(["fix X in ocean-worker"] if script.rca_fix else []))
@@ -154,6 +158,7 @@ def test_happy_path(tmp_path, monkeypatch):
     assert final["final_status"] == "completed"
     assert final["ready_flipped"] is True
     assert final["worktree_dir"] == "/tmp/ws/ocean-worker"  # coder's clone threaded into state
+    assert s.calls["sme_consult"] == 0   # no domain_bucket -> SME node is a no-op
     assert s.calls["coder"] == 1
     assert s.calls["harsh_reviewer"] == 1
     assert s.calls["automation_testing"] == 1
@@ -234,6 +239,16 @@ def test_unsupported_route_stops(tmp_path, monkeypatch):
     assert final["final_status"] == "failed"
     assert "unsupported route" in final["final_outcome"]
     assert s.calls["coder"] == 0
+
+
+def test_sme_consult_runs_for_known_bucket(tmp_path, monkeypatch):
+    s = Script(sme_bucket="load_creation", review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    final = _run()
+    assert final["final_status"] == "completed"
+    assert s.calls["sme_consult"] == 1          # graph consulted the SME for a known bucket
+    assert s.calls["dep_resolver"] == 1          # SME sits before the gates
+    assert final["sme_findings"]["summary"] == "owner: ocean-worker"
 
 
 # ----------------------------------------------------------------- vendored workers (Phase B)

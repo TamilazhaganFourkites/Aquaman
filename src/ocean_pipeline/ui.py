@@ -19,6 +19,7 @@ def _now() -> str:
 # internal node id -> plain-English station label
 _LABELS = {
     "researcher":         "Research & routing",
+    "sme_consult":        "Ocean SME consult",
     "rca_agent":          "Root-cause analysis (RCA)",
     "rca_done":           "RCA report delivered",
     "unsupported_route":  "Unsupported ticket — stopped",

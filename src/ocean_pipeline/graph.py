@@ -60,6 +60,7 @@ def build_graph():
     g = StateGraph(OceanState)
 
     g.add_node("researcher", nodes.researcher)
+    g.add_node("sme_consult", nodes.sme_consult)
     g.add_node("rca_agent", nodes.rca_agent)
     g.add_node("rca_done", nodes.rca_done)
     g.add_node("unsupported_route", nodes.unsupported_route)
@@ -76,9 +77,11 @@ def build_graph():
     g.add_node("stop_run", nodes.stop_run)
 
     g.add_edge(START, "researcher")
+    # Coding route consults the ocean SME (graph-owned dispatch) before the gates.
     g.add_conditional_edges("researcher", route_after_research,
-                            {"rca": "rca_agent", "coding": "dep_resolver",
+                            {"rca": "rca_agent", "coding": "sme_consult",
                              "unsupported": "unsupported_route"})
+    g.add_edge("sme_consult", "dep_resolver")
     g.add_edge("unsupported_route", END)
     # RCA agent -> RCA Done (terminal) | Fix needed -> deps + reachability gate -> coder
     g.add_conditional_edges("rca_agent", after_rca,

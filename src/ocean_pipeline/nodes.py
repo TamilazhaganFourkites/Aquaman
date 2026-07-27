@@ -68,9 +68,46 @@ async def researcher(state: OceanState) -> dict:
         ),
         verdict_model=schemas.ResearchVerdict,
     )
-    telemetry.station_event(state["execution_id"], 0, "end", route=v.route)
+    telemetry.station_event(state["execution_id"], 0, "end", route=v.route,
+                            domain_bucket=v.domain_bucket)
     return {"route": v.route, "research_packet": _load_json(v.packet_path),
-            "target_repos": v.target_repos}
+            "target_repos": v.target_repos, "domain_bucket": v.domain_bucket}
+
+
+# ------------------------------------------------------------------ Station 0.5 — ocean SME consult
+_SME_BY_BUCKET = {
+    "callback_notification": "sme-callback-notification.md",
+    "load_creation": "sme-load-creation.md",
+    "ocean_tracking_milestones": "sme-ocean-milestones.md",
+}
+
+
+async def sme_consult(state: OceanState) -> dict:
+    """Graph-owned SME dispatch: the graph (not the researcher) picks the ocean domain SME by
+    domain_bucket and consults it for ownership/reuse guidance. A no-op when no bucket applies."""
+    bucket = state.get("domain_bucket") or ""
+    exec_id = state["execution_id"]
+    sme_md = _SME_BY_BUCKET.get(bucket)
+    if not sme_md:
+        telemetry.station_event(exec_id, 0.5, "skip", domain_bucket=bucket or "(none)")
+        return {"sme_findings": {}}
+    telemetry.station_event(exec_id, 0.5, "start", domain_bucket=bucket)
+    v: schemas.SmeVerdict = await agents.run_agent(
+        agent_md=sme_md,   # fk-aideveloper SME (referenced expert knowledge; resolves via fallback)
+        node="sme_consult",
+        ticket_id=state["ticket_id"],
+        execution_id=exec_id,
+        task_prompt=(
+            f"Static-architecture question for {state['ticket_id']} (domain: {bucket}). Which "
+            f"repo/file/mechanism owns the change this ticket needs, and what should the coder reuse "
+            f"or extend? Answer from your curated knowledge; fall back to grep / the code graph only "
+            f"where uncovered. Do NOT write code or open anything.\n\n"
+            f"Research summary:\n{_brief(state.get('research_packet'))}\n\n{_summary(state)}"
+        ),
+        verdict_model=schemas.SmeVerdict,
+    )
+    telemetry.station_event(exec_id, 0.5, "end", findings=len(v.findings))
+    return {"sme_findings": {"summary": v.summary, "findings": v.findings}}
 
 
 # ------------------------------------------------------------------ Station 1
@@ -147,6 +184,7 @@ async def coder(state: OceanState) -> dict:
             f"ticket branch — do NOT re-clone. Report its absolute path as repo_dir.\n\n"
             f"Binding reachability report (build what it says is NOT_YET_BUILT; do not re-litigate "
             f"its verdicts):\n{_brief(state.get('reachability_report'), limit=12000)}\n\n"
+            f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}\n\n"
             f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
             f"{_summary(state)}"
         ),
