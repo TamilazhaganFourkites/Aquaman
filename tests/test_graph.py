@@ -100,6 +100,12 @@ def _install(script: Script, tmp_path, monkeypatch):
         path = config.automation_verdict_path(kw["ticket_id"])
         if node == "learn_repo" or node == "sit_run":
             return  # onboarding pass / execute phase write no final verdict
+        if node == "sit_author":
+            path.write_text(json.dumps({"ticket_id": kw["ticket_id"], "test_path": "test_MM_1_ocean.py"}))
+            return
+        if node == "sit_testrail":
+            (config.artifacts_dir(kw["execution_id"]) / "testrail_run.txt").write_text("555")
+            return
         if node == "sit_resolve":
             script._cur = script.next_sit()  # passed | code_fault | could_not_verify | needs_onboarding
             needs = script._cur == "needs_onboarding"
@@ -124,6 +130,11 @@ def _install(script: Script, tmp_path, monkeypatch):
             "findings_for_coder": [{"test": "test_x", "cause": "bug"}] if outcome == "code_fault" else [],
             "needs_onboarding": False, "onboard_repo": "",
         }))
+
+    # Default the QA review gate to AUTO (no human pause) + no TestRail, so the full-path tests run
+    # without interrupting. Gate-specific tests override these.
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", True)
+    monkeypatch.setattr(config, "QA_TESTRAIL", False)
 
     monkeypatch.setattr(agents, "run_agent", fake_run_agent)
     monkeypatch.setattr(agents, "run_skill", fake_run_skill)
@@ -407,6 +418,67 @@ def test_human_gate_reject_stops(tmp_path, monkeypatch):
     assert final["final_status"] == "failed"
     assert "rejected" in final["final_outcome"]
     assert s.calls["flip_ready"] == 0
+
+
+def test_qa_gate_auto_with_testrail(tmp_path, monkeypatch):
+    """Auto mode + TestRail on: the gate auto-approves with TestRail; sit_testrail runs (in parallel
+    with sit_run) and its run id lands in the report."""
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "QA_TESTRAIL", True)   # override _install default
+    final = _run()
+    assert final["final_status"] == "completed"
+    assert s.calls["sit_author"] == 1
+    assert s.calls["sit_run"] == 1
+    assert s.calls["sit_testrail"] == 1
+    assert final["sit_report"]["testrail_run_id"] == 555
+
+
+def test_qa_gate_auto_no_testrail(tmp_path, monkeypatch):
+    """Auto mode, TestRail off (the demo default): draft → auto-approve → run, no TestRail branch."""
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)   # QA_REVIEW_AUTO=True, QA_TESTRAIL=False
+    final = _run()
+    assert final["final_status"] == "completed"
+    assert s.calls["sit_author"] == 1
+    assert s.calls["sit_testrail"] == 0
+
+
+def test_qa_gate_human_approve(tmp_path, monkeypatch):
+    """Gate ON: the run pauses at the drafted SIT for a human; --qa approve-no-testrail proceeds to run."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", False)   # gate ON (default in prod)
+    app = graph.build_graph().compile(checkpointer=MemorySaver())
+    thread = {"configurable": {"thread_id": "t-qa"}, "recursion_limit": 100}
+    asyncio.run(app.ainvoke(_initial(), config=thread))
+    assert asyncio.run(app.aget_state(thread)).next   # paused at qa_review_gate
+    assert s.calls["sit_run"] == 0                     # nothing ran before approval
+    asyncio.run(app.ainvoke(Command(resume={"decision": "approve_no_testrail"}), config=thread))
+    final = asyncio.run(app.aget_state(thread)).values
+    assert final["final_status"] == "completed"
+    assert s.calls["sit_testrail"] == 0
+    assert s.calls["flip_ready"] == 1
+
+
+def test_qa_gate_changes_then_approve(tmp_path, monkeypatch):
+    """Gate ON: 'changes' loops back to redraft (sit_author runs again), then approve proceeds."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", False)
+    app = graph.build_graph().compile(checkpointer=MemorySaver())
+    thread = {"configurable": {"thread_id": "t-qa-changes"}, "recursion_limit": 100}
+    asyncio.run(app.ainvoke(_initial(), config=thread))
+    asyncio.run(app.ainvoke(Command(resume={"decision": "changes", "note": "cover null-SCAC"}), config=thread))
+    assert asyncio.run(app.aget_state(thread)).next   # redrafted, paused again
+    assert s.calls["sit_author"] == 2                  # initial draft + redraft
+    asyncio.run(app.ainvoke(Command(resume={"decision": "approve_no_testrail"}), config=thread))
+    final = asyncio.run(app.aget_state(thread)).values
+    assert final["final_status"] == "completed"
 
 
 def test_jira_noop_without_token(monkeypatch):

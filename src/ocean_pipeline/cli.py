@@ -159,17 +159,18 @@ async def _run(ticket_id: str, context: str) -> None:
     await _execute(execution_id, ticket_id, initial, thread)
 
 
-async def _resume(execution_id: str, decision: str | None = None) -> None:
+async def _resume(execution_id: str, resume_value=None) -> None:
     _preflight()
     thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": RECURSION_LIMIT}
-    # A plain crash-resume replays from the checkpoint (input None). Resuming a human-approval
-    # gate injects the decision via Command(resume=...) so interrupt() returns it.
+    # A plain crash-resume replays from the checkpoint (input None). Resuming a paused gate injects
+    # the decision via Command(resume=...) so the pending interrupt() returns it — a string for the
+    # ready-flip gate ("approve"/"reject"), or a {decision, note} dict for the QA review gate.
     initial = None
-    if decision is not None:
+    if resume_value is not None:
         from langgraph.types import Command
-        initial = Command(resume=decision)
+        initial = Command(resume=resume_value)
     print(f"[ocean-pipeline] resuming execution={execution_id}"
-          + (f" ({decision})" if decision else ""))
+          + (f" ({resume_value})" if resume_value else ""))
     await _execute(execution_id, "", initial, thread)
 
 
@@ -182,6 +183,9 @@ def main() -> None:
                    help="with --resume: approve a paused human-approval gate (proceed to ready-flip)")
     p.add_argument("--reject", action="store_true",
                    help="with --resume: reject a paused human-approval gate (leave the PR draft)")
+    p.add_argument("--qa", choices=["approve-testrail", "approve-no-testrail", "changes"],
+                   help="with --resume: answer a paused QA review gate")
+    p.add_argument("--note", default="", help="with --resume --qa changes: feedback for the redraft")
     p.add_argument("--print-graph", action="store_true", help="print the mermaid diagram and exit")
     p.add_argument("--rca-only", action="store_true",
                    help="run research + ocean-rca report and STOP (no auto-coding, even if a fix is needed)")
@@ -197,8 +201,15 @@ def main() -> None:
     if args.print_graph:
         print(build_graph().compile().get_graph().draw_mermaid())
     elif args.resume:
-        decision = "approve" if args.approve else ("reject" if args.reject else None)
-        asyncio.run(_resume(args.resume, decision))
+        if args.qa:   # QA review gate: {decision, note}
+            resume_value = {"decision": args.qa.replace("-", "_"), "note": args.note}
+        elif args.approve:
+            resume_value = "approve"
+        elif args.reject:
+            resume_value = "reject"
+        else:
+            resume_value = None
+        asyncio.run(_resume(args.resume, resume_value))
     elif args.ticket:
         asyncio.run(_run(args.ticket, args.context))
     else:

@@ -51,6 +51,16 @@ MAX_REVIEW_ITERATIONS = 2
 # resume with an approve/reject decision — the pipeline still never merges or deploys.
 REQUIRE_APPROVAL = os.environ.get("OCEAN_PIPELINE_REQUIRE_APPROVAL", "").lower() in ("1", "true", "yes")
 
+# SIT QA review gate. After the SIT scenarios + sample test are drafted, a human reviews them and
+# makes the same 3-way call ocean-qa-agent offers interactively: approve-with-TestRail /
+# approve-without-TestRail / changes-needed. Default ON (the graph interrupt()s and waits). Set
+# QA_REVIEW_AUTO for a hands-off run (no pause) — it then auto-approves, creating TestRail cases
+# only if QA_TESTRAIL is on. The TestRail branch runs in PARALLEL with the local run (TestRail's
+# API is slow + rate-limited, so it must not block the functional gate).
+QA_REVIEW_AUTO = os.environ.get("OCEAN_PIPELINE_QA_AUTOAPPROVE", "").lower() in ("1", "true", "yes")
+QA_TESTRAIL = os.environ.get("OCEAN_PIPELINE_TESTRAIL", "").lower() in ("1", "true", "yes")
+MAX_QA_REVIEW_ITERATIONS = int(os.environ.get("OCEAN_PIPELINE_MAX_QA_REVIEW_ITERATIONS", "3"))
+
 # Shared coding-attempts budget for the code_fault full-loop
 # (Station 6 code_fault -> fk-coder -> Station 5 re-review -> Station 6).
 MAX_CODING_ATTEMPTS = 2

@@ -56,14 +56,23 @@ persistence — it invokes the skill's *learn-a-repo mechanic* (`local_service_e
 authorized onboarding pass (clone → profile → commit the profile), then re-runs `automation_testing`. Capped
 by `MAX_ONBOARD_ATTEMPTS`. Standalone/interactive `/ocean-automation-testing` runs still self-onboard.
 
-Station 6 is **decomposed into three graph nodes** so LangGraph owns its sequence rather than the skill
-running end-to-end: `sit_resolve → sit_run → sit_triage`. Each drives the `ocean-automation-testing` skill
-one `--only` phase at a time (`resolve` / `author`+`run` / `report`), with the skill's own
-`memory/tickets/<TICKET>-automation-testing.json` carrying state between them. The graph branches at the two
-real decision points: after `sit_resolve` (an unsupported repo → `learn_repo`, before any authoring/running)
-and after `sit_triage` (`pass` → human gate → ready-flip; `code_fault` → rework; `could_not_verify` → stop).
-A Docker/infra bring-up failure is the skill's own `could_not_verify`; a missing verdict file is treated as
-`could_not_verify` as a backstop. `flip_ready` then cross-links the test PR into the service PR and flips it to ready.
+Station 6 is **decomposed into graph nodes** so LangGraph owns its sequence rather than the skill running
+end-to-end: `sit_resolve → sit_author → qa_review_gate → sit_run [‖ sit_testrail] → sit_triage`. Each drives
+the `ocean-automation-testing` skill one `--only` phase at a time, with the skill's own
+`memory/tickets/<TICKET>-automation-testing.json` carrying state between them.
+
+- **`sit_resolve`** resolves the changed repo; an unsupported repo branches to `learn_repo` *before* any
+  authoring/running.
+- **`sit_author`** drafts the SIT scenarios + sample test and **stops** (no TestRail, no run).
+- **`qa_review_gate`** is a **human 3-way review** (default ON) — the same choice `ocean-qa-agent` offers
+  interactively, surfaced as an `interrupt()` so it works headless: `--qa approve-testrail` |
+  `approve-no-testrail` | `changes` (loops back to redraft). `OCEAN_PIPELINE_QA_AUTOAPPROVE` skips the pause.
+- **`sit_run`** executes the approved SIT local + mock-first; on *approve-testrail*, **`sit_testrail`** writes
+  the TestRail cases **in parallel** (the API is slow + rate-limited, so it never blocks the functional run).
+- **`sit_triage`** parses junit, triages (`pass` → human gate → ready-flip; `code_fault` → rework;
+  `could_not_verify` → stop), and opens the test-automation PR on pass.
+
+`flip_ready` then cross-links the test PR into the service PR and flips it to ready.
 
 ## Layout
 

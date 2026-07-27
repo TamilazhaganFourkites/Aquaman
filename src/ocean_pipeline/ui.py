@@ -31,7 +31,10 @@ _LABELS = {
     "graph_augment":      "Code-graph augmentation",
     "release_intel":      "Release intelligence",
     "sit_resolve":        "Local SIT — resolve & gate",
-    "sit_run":            "Local SIT — author & run",
+    "sit_author":         "Local SIT — draft test",
+    "qa_review_gate":     "QA review — awaiting approval",
+    "sit_run":            "Local SIT — run",
+    "sit_testrail":       "TestRail — writing cases",
     "sit_triage":         "Local SIT — triage & verdict",
     "learn_repo":         "Onboarding an unsupported repo",
     "prep_rework":        "Rework — SIT found a defect",
@@ -157,6 +160,12 @@ def _highlight(node: str, upd: dict) -> str:
         return f"PR #{upd['pr_number']}"
     if node == "sit_resolve":
         return f"needs onboarding: {upd.get('onboard_repo', '')}" if upd.get("needs_onboarding") else "repo resolved"
+    if node == "sit_author":
+        return "SIT drafted — awaiting review"
+    if node == "qa_review_gate" and upd.get("qa_decision"):
+        return upd["qa_decision"].replace("_", " ")
+    if node == "sit_testrail":
+        return f"TestRail run {upd['testrail_run_id']}" if upd.get("testrail_run_id") else "TestRail cases written"
     if node == "sit_triage" and upd.get("automation_result"):
         fc = upd.get("failure_class")
         return f"SIT {upd['automation_result']}" + (f" ({fc})" if fc else "")

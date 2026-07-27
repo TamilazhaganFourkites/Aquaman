@@ -40,7 +40,8 @@ _STATION_NAMES = {
     1: "dependency_resolver", 1.5: "reachability_gate",
     3.87: "open_pr", 4: "coder", 4.5: "graph_caller_augmentation",
     4.6: "release_intelligence_writer", 5: "harsh_review", 5.9: "code_fault_rework",
-    5.95: "learn_repo", 6.0: "sit_resolve", 6.2: "sit_run", 6.4: "sit_triage", 6.5: "flip_ready",
+    5.95: "learn_repo", 6.0: "sit_resolve", 6.1: "sit_author", 6.15: "qa_review_gate",
+    6.2: "sit_run", 6.3: "sit_testrail", 6.4: "sit_triage", 6.5: "flip_ready",
 }
 # Aquaman phase label -> the server's station status enum.
 _STATUS = {

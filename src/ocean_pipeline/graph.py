@@ -56,6 +56,17 @@ def after_sit_resolve(state: OceanState) -> str:
     return "run"
 
 
+def after_qa_review(state: OceanState):
+    # Human 3-way review of the drafted SIT (or auto-approved). "changes" redrafts (capped);
+    # approve-with-TestRail fans out to run + TestRail in parallel; approve-without-TestRail just runs.
+    d = state.get("qa_decision")
+    if d == "changes" and state.get("qa_review_iteration", 0) < config.MAX_QA_REVIEW_ITERATIONS:
+        return "sit_author"
+    if d == "approve_testrail":
+        return ["sit_run", "sit_testrail"]
+    return "sit_run"   # approve_no_testrail, or "changes" budget exhausted -> proceed without TestRail
+
+
 def after_sit_triage(state: OceanState) -> str:
     if state.get("automation_result") == "passed":
         return "pass"
@@ -92,7 +103,10 @@ def build_graph():
     g.add_node("release_intel", nodes.release_intel)
     # Station 6 decomposed into graph-owned phases (drives the skill one --only phase at a time).
     g.add_node("sit_resolve", nodes.sit_resolve)                 # resolve changed repo + onboarding check
-    g.add_node("sit_run", nodes.sit_run)                         # author + execute the SIT (local, mock-first)
+    g.add_node("sit_author", nodes.sit_author)                   # draft SIT scenarios + sample test, then STOP
+    g.add_node("qa_review_gate", nodes.qa_review_gate)           # human 3-way review of the drafted SIT
+    g.add_node("sit_run", nodes.sit_run)                         # execute the approved SIT (local, mock-first)
+    g.add_node("sit_testrail", nodes.sit_testrail)               # create TestRail cases (parallel with sit_run)
     g.add_node("sit_triage", nodes.sit_triage)                   # parse junit, triage, verdict, open test PR
     g.add_node("learn_repo", nodes.learn_repo)                   # graph-owned onboarding of an unsupported repo
     g.add_node("prep_rework", nodes.prep_rework)
@@ -122,13 +136,21 @@ def build_graph():
     g.add_edge("graph_augment", "release_intel")
     g.add_edge("release_intel", "sit_resolve")
 
-    # Station 6, decomposed: resolve -> (onboard? | run) -> triage -> branch on the verdict.
+    # Station 6, decomposed: resolve -> (onboard? | author) -> QA review gate -> run [+ TestRail] -> triage.
     g.add_conditional_edges("sit_resolve", after_sit_resolve, {
-        "onboard": "learn_repo",         # unsupported repo -> onboard it first (before authoring/running)
-        "run": "sit_run",
+        "onboard": "learn_repo",         # unsupported repo -> onboard it first (before authoring)
+        "run": "sit_author",             # draft the SIT, then the human review gate
         "stop": "stop_run",              # unsupported + onboarding budget exhausted
     })
+    g.add_edge("sit_author", "qa_review_gate")
+    # Human 3-way review: changes -> redraft; approve -> run; approve+TestRail -> run ‖ TestRail (parallel).
+    g.add_conditional_edges("qa_review_gate", after_qa_review, {
+        "sit_author": "sit_author",
+        "sit_run": "sit_run",
+        "sit_testrail": "sit_testrail",
+    })
     g.add_edge("sit_run", "sit_triage")
+    g.add_edge("sit_testrail", "sit_triage")   # parallel branch joins here (fan-in)
     g.add_conditional_edges("sit_triage", after_sit_triage, {
         "pass": "human_gate",            # PASS -> optional human-approval gate -> ready-flip
         "onboard": "learn_repo",         # late-surfaced unsupported repo

@@ -64,13 +64,20 @@ class OceanState(TypedDict, total=False):
     graph_augmented: bool
     release_intel_written: bool
 
-    # --- Station 6: local SIT (ocean-automation-testing skill, run end-to-end) ---
+    # --- Station 6: local SIT (decomposed: resolve -> author -> qa gate -> run[+testrail] -> triage) ---
     automation_result: AutomationResult
     failure_class: FailureClass
     execution_mode: str              # local-mock-first | qat-fallback
     sit_report: dict                 # tests[] / changed_repo / dependencies / evidence
     test_automation_pr_url: str      # opened by the skill on pass
     sit_findings: list               # findings_for_coder (code_fault -> fk-coder)
+
+    # --- QA review gate (human 3-way: approve+TestRail / approve / changes) ---
+    qa_test_path: str                # drafted SIT file, shown to the reviewer
+    qa_decision: str                 # approve_testrail | approve_no_testrail | changes
+    qa_note: str                     # reviewer feedback carried back to sit_author on "changes"
+    qa_review_iteration: int         # capped by MAX_QA_REVIEW_ITERATIONS
+    testrail_run_id: int             # from the parallel sit_testrail branch (via state, not the verdict file)
 
     # --- graph-owned repo onboarding (MM-14621): unsupported ocean repo -> learn_repo -> re-run SIT ---
     needs_onboarding: bool           # Station 6 reported the changed repo is unsupported locally

@@ -327,11 +327,66 @@ async def sit_resolve(state: OceanState) -> dict:
     return {"needs_onboarding": needs, "onboard_repo": partial.get("onboard_repo", "")}
 
 
-# ------------------------------------------------------------------ Station 6b — author + execute
+# ------------------------------------------------------------------ Station 6b — author (draft + STOP)
+async def sit_author(state: OceanState) -> dict:
+    """Draft the SIT scenarios + sample test (skill Station 1) and STOP — no TestRail cases, no run.
+    A human reviews the draft at qa_review_gate before anything executes or gets committed. On a
+    'changes' loop-back, the reviewer's note is fed in so ocean-qa-agent revises the draft."""
+    tid, exec_id = state["ticket_id"], state["execution_id"]
+    it = state.get("qa_review_iteration", 0)
+    telemetry.station_event(exec_id, 6.1, "start", qa_review_iteration=it)
+    note = state.get("qa_note") or ""
+    revise = (f"\nThe reviewer requested CHANGES to the prior draft — revise the scenarios/test to "
+              f"address this feedback:\n{note}\n") if note else ""
+    await agents.run_skill(
+        skill_name="ocean-automation-testing",
+        node="sit_author",
+        ticket_id=tid,
+        task_prompt=(
+            f"Run ocean-automation-testing Station 1 (author) ONLY for {tid} (`--only author`), HEADLESS. "
+            f"Station 0 (resolve) already ran — do NOT re-resolve. Draft the invariant-compliant SIT "
+            f"scenarios + the pytest file via ocean-qa-agent with `--no-review --skip-testrail`: "
+            f"AUTHOR/UPDATE the test file (reuse only if it still covers the current diff) and record the "
+            f"scenarios + the test path, then STOP. Do NOT create TestRail cases and do NOT execute the "
+            f"SIT — a human reviews this draft next.{revise}\n\n{_summary(state)}"
+        ),
+    )
+    partial = _load_json(str(config.automation_verdict_path(tid)))
+    telemetry.station_event(exec_id, 6.1, "end")
+    return {"qa_test_path": partial.get("test_path") or partial.get("existing_test_path", ""),
+            "qa_review_iteration": it + 1, "qa_note": ""}
+
+
+# ------------------------------------------------------------------ Station 6b.5 — QA review gate (human 3-way)
+async def qa_review_gate(state: OceanState) -> dict:
+    """Human review of the drafted SIT — the same 3-way choice ocean-qa-agent offers interactively
+    (approve-with-TestRail / approve-without-TestRail / changes), surfaced at the graph level so it
+    works headless. Default ON (interrupt + wait). QA_REVIEW_AUTO skips the pause and auto-approves
+    (with TestRail only if QA_TESTRAIL is set)."""
+    exec_id = state["execution_id"]
+    if config.QA_REVIEW_AUTO:
+        decision = "approve_testrail" if config.QA_TESTRAIL else "approve_no_testrail"
+        telemetry.station_event(exec_id, 6.15, "auto", qa_decision=decision)
+        return {"qa_decision": decision, "qa_note": ""}
+    from langgraph.types import interrupt
+    raw = interrupt({
+        "action": "qa_review",
+        "ticket_id": state["ticket_id"],
+        "test_path": state.get("qa_test_path"),
+        "prompt": ("Review the drafted SIT scenarios + sample test, then resume with ONE of: "
+                   "`--qa approve-testrail` | `--qa approve-no-testrail` | "
+                   "`--qa changes --note '<feedback>'`."),
+    })
+    decision = raw.get("decision") if isinstance(raw, dict) else str(raw)
+    note = raw.get("note", "") if isinstance(raw, dict) else ""
+    telemetry.station_event(exec_id, 6.15, "decision", qa_decision=decision)
+    return {"qa_decision": decision, "qa_note": note}
+
+
+# ------------------------------------------------------------------ Station 6c — execute the approved SIT
 async def sit_run(state: OceanState) -> dict:
-    """Author/locate the SIT then execute it local + mock-first (skill Stations 1-2). No graph branch
-    sits between resolve and triage, so this is one linear node; it captures per-test results to junit
-    and leaves the verdict to sit_triage."""
+    """Execute the approved SIT local + mock-first (skill Station 2). Authoring + human review already
+    happened; this only runs the changed repo locally, mocks the rest, and captures per-test results."""
     tid, exec_id = state["ticket_id"], state["execution_id"]
     telemetry.station_event(exec_id, 6.2, "start")
     await agents.run_skill(
@@ -339,18 +394,52 @@ async def sit_run(state: OceanState) -> dict:
         node="sit_run",
         ticket_id=tid,
         task_prompt=(
-            f"Run ocean-automation-testing Stations 1-2 for {tid}, HEADLESS. Station 0 (resolve) already "
-            f"ran — its context is in the verdict json; do NOT re-resolve. Station 1: author or locate the "
-            f"invariant-compliant SIT via ocean-qa-agent (reuse only if it still covers the current diff, "
-            f"else update/author). Station 2: EXECUTE it local + mock-first — run ONLY the changed repo "
-            f"locally per its language-scoped build_env (ruby=docker) and mock the rest (ocean_mock_helper "
-            f"+ route_local); never present a native-host Ruby run as passed. Capture per-test pass/fail to "
-            f"reports/junit.xml. Do NOT run Station 3 (report/verdict) — the graph's sit_triage node does "
-            f"that next.\n\n{_summary(state)}"
+            f"Run ocean-automation-testing Station 2 (execute) ONLY for {tid} (`--only run`), HEADLESS. "
+            f"The SIT was authored + human-approved already — do NOT re-author. EXECUTE it local + "
+            f"mock-first: run ONLY the changed repo locally per its language-scoped build_env "
+            f"(ruby=docker) and mock the rest (ocean_mock_helper + route_local); never present a "
+            f"native-host Ruby run as passed. Capture per-test pass/fail to reports/junit.xml. Do NOT "
+            f"run Station 3 (report/verdict) — the graph's sit_triage node does that next."
+            f"\n\n{_summary(state)}"
         ),
     )
     telemetry.station_event(exec_id, 6.2, "end")
     return {}
+
+
+# ------------------------------------------------------------------ Station 6c' — TestRail cases (parallel)
+async def sit_testrail(state: OceanState) -> dict:
+    """Create the TestRail cases for the approved SIT (Project 22 / Suite 197). Runs IN PARALLEL with
+    sit_run — TestRail's API is slow + rate-limited, so it must not block the functional gate. Returns
+    the run id via STATE (a dedicated file, not the shared verdict json) to avoid a write race with
+    the concurrent sit_run/sit_triage."""
+    tid, exec_id = state["ticket_id"], state["execution_id"]
+    telemetry.station_event(exec_id, 6.3, "start")
+    tr_path = config.artifacts_dir(exec_id) / "testrail_run.txt"
+    if tr_path.exists():
+        tr_path.unlink()
+    await agents.run_skill(
+        skill_name="ocean-automation-testing",
+        node="sit_testrail",
+        ticket_id=tid,
+        execution_id=exec_id,
+        task_prompt=(
+            f"Create the TestRail cases for the SIT already authored + approved for {tid} via "
+            f"ocean-qa-agent (Project 22 / Suite 197 — its Steps 6/6a). Do ONLY TestRail case creation "
+            f"for the EXISTING authored test at {state.get('qa_test_path') or '(the ticket SIT)'} — do "
+            f"NOT re-author, execute, or open any PR. This runs in parallel with the local SIT run, so "
+            f"touch ONLY TestRail (respect its rate limits). Write ONLY the integer TestRail run id to "
+            f"{tr_path}.\n\n{_summary(state)}"
+        ),
+    )
+    run_id = 0
+    if tr_path.exists():
+        try:
+            run_id = int(tr_path.read_text().strip())
+        except (ValueError, OSError):
+            run_id = 0
+    telemetry.station_event(exec_id, 6.3, "end", testrail_run_id=run_id)
+    return {"testrail_run_id": run_id}
 
 
 # ------------------------------------------------------------------ Station 6c — report + triage + verdict
@@ -399,7 +488,8 @@ async def sit_triage(state: OceanState) -> dict:
             "changed_repo": v.changed_repo.model_dump() if v.changed_repo else None,
             "dependencies": [d.model_dump() for d in v.dependencies],
             "evidence": v.evidence,
-            "testrail_run_id": v.testrail_run_id,
+            # prefer the id from the parallel sit_testrail branch (via state) over the skill's verdict
+            "testrail_run_id": state.get("testrail_run_id") or v.testrail_run_id,
         },
     }
 

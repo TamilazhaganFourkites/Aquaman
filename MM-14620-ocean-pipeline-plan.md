@@ -164,6 +164,11 @@ Jira post) is **plain Python** — no agent.
    injects the decision. Jira lifecycle via best-effort `jira.py` (In Progress at research start;
    In Review + PR-link comment at flip; no-op without `JIRA_API_TOKEN`).
 9. ✅ **DONE** — README corrected (interrupt() + telemetry claims now match reality).
+10. ✅ **DONE (added on request)** — SIT **QA review gate**: `sit_author` drafts the scenarios + sample
+    test and stops; `qa_review_gate` is a human **3-way** review (default ON, `interrupt()`; auto via
+    `OCEAN_PIPELINE_QA_AUTOAPPROVE`) — `approve-testrail` / `approve-no-testrail` / `changes` (loops back
+    to redraft). On `approve-testrail`, `sit_testrail` writes the TestRail cases **in parallel** with the
+    local run (TestRail's API is slow/rate-limited). CLI: `--resume <exe> --qa <choice> [--note …]`.
 
 ### Phase D — Demo hardening ❌ DROPPED (team wants a real flow)
 The team decided to demo a **real end-to-end run**, not a mock/simulated one, so the demo-safety
