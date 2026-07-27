@@ -336,16 +336,19 @@ def test_sme_consult_runs_for_known_bucket(tmp_path, monkeypatch):
     assert final["sme_findings"]["summary"] == "owner: ocean-worker"
 
 
-# ----------------------------------------------------------------- vendored workers (Phase B)
+# ----------------------------------------------------------------- vendored workers (Phase B + Workstream B)
 def test_vendored_workers_resolve():
-    """The migrated workers are vendored into this repo and resolve BEFORE any fk-aideveloper
-    fallback; un-migrated agents still fall back. Guards the Phase B decoupling."""
-    for name in ("research.md", "code.md", "review.md"):
+    """Every migrated worker is vendored into this repo and resolves BEFORE any fk-aideveloper
+    fallback; only the ocean SME agents still fall back (referenced domain knowledge). Guards the
+    control-plane decoupling — no graph node should load a heavy fk-aideveloper station file."""
+    for name in ("research.md", "code.md", "review.md",           # Phase B
+                 "dep-resolve.md", "reachability.md", "rca-research.md",   # Workstream B
+                 "graph-augment.md", "release-intel.md"):
         p = agents._agent_path(name)
         assert p == config.VENDORED_AGENTS_DIR / name and p.exists(), f"{name} not vendored"
         assert "Not your job" in p.read_text(), f"{name} missing the process-ownership boundary"
-    # un-migrated agents still resolve to the fk-aideveloper station dir
-    assert agents._agent_path("fk-coder.md") == config.AGENTS_DIR / "fk-coder.md"
+    # ocean SME agents intentionally still resolve to the fk-aideveloper station dir (domain knowledge)
+    assert agents._agent_path("sme-load-creation.md") == config.AGENTS_DIR / "sme-load-creation.md"
 
 
 def test_run_agent_loads_vendored_worker(tmp_path, monkeypatch):

@@ -115,7 +115,7 @@ async def sme_consult(state: OceanState) -> dict:
 async def dep_resolver(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1, "start")
     v: schemas.ReachabilityVerdict = await agents.run_agent(
-        agent_md="fk-dependency-resolver.md",
+        agent_md="dep-resolve.md",   # vendored slim worker (Workstream B)
         node="dep_resolver",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -133,7 +133,7 @@ async def dep_resolver(state: OceanState) -> dict:
 async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
     v: schemas.ReachabilityVerdict = await agents.run_agent(
-        agent_md="fk-reachability-gate.md",
+        agent_md="reachability.md",   # vendored slim worker (Workstream B)
         node="reachability_gate",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -260,7 +260,7 @@ async def graph_augment(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 4.5, "start")
     try:
         await agents.run_agent(
-            agent_md="fk-coder.md",
+            agent_md="graph-augment.md",   # vendored slim worker (Workstream B)
             node="graph_augment",
             ticket_id=state["ticket_id"],
             execution_id=state["execution_id"],
@@ -278,7 +278,7 @@ async def graph_augment(state: OceanState) -> dict:
 async def release_intel(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 4.6, "start")
     await agents.run_agent(
-        agent_md="fk-coder.md",
+        agent_md="release-intel.md",   # vendored slim worker (Workstream B)
         node="release_intel",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -615,7 +615,7 @@ async def rca_agent(state: OceanState) -> dict:
     coder (diagram: RCA agent -> RCA Done -> Fix needed -> coder)."""
     telemetry.station_event(state["execution_id"], 0.1, "start", route="rca")
     v: schemas.RcaVerdict = await agents.run_agent(
-        agent_md="fk-researcher.md",   # routes into the ocean-rca skill; standalone, no PR
+        agent_md="rca-research.md",   # vendored slim worker (Workstream B); drives the ocean-rca approach
         node="rca_agent",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
