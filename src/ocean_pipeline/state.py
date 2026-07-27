@@ -47,6 +47,7 @@ class OceanState(TypedDict, total=False):
     branch: str
     pushed_sha: str
     files_changed: int
+    worktree_dir: str        # absolute path of the coder's local clone; reviewer + rework cwd here
 
     # --- Station 5: review loop (gated at MAX_REVIEW_ITERATIONS) ---
     review_verdict: ReviewVerdict

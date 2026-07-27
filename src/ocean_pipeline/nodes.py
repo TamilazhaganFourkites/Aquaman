@@ -130,14 +130,21 @@ async def coder(state: OceanState) -> dict:
         rework += (f"\nAddress these Station 6 SIT code-fault findings (real defects a passing "
                    f"SIT would catch):\n{json.dumps(sit_findings, indent=2)}\n")
 
+    # The graph owns the clone location: the coder clones into a per-run workspace and works
+    # there, so the reviewer and any rework pass run against the SAME tree (reuse on re-entry).
+    workspace = config.workspace_dir(state["execution_id"])
     v: schemas.CoderVerdict = await agents.run_agent(
         agent_md="code.md",   # vendored slim worker (Phase B)
         node="coder",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
+        cwd=workspace,
         task_prompt=(
             f"Decompose and implement {state['ticket_id']} per FK North Star. isbu: commit + PUSH "
             f"the branch and STOP (no PR — the graph opens it).{rework}\n\n"
+            f"WORKSPACE: clone the target repo into {workspace} and do all work there. If the clone "
+            f"already exists (a rework pass re-enters here), reuse it — `git fetch` + checkout the "
+            f"ticket branch — do NOT re-clone. Report its absolute path as repo_dir.\n\n"
             f"Binding reachability report (build what it says is NOT_YET_BUILT; do not re-litigate "
             f"its verdicts):\n{_brief(state.get('reachability_report'), limit=12000)}\n\n"
             f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
@@ -147,12 +154,13 @@ async def coder(state: OceanState) -> dict:
     )
     telemetry.station_event(state["execution_id"], 4, "end")
     # A fresh code pass supersedes prior SIT findings; clear them once addressed.
-    # Persist WHICH repo the coder pushed to + the PR title/body it proposed, so the
-    # open_pr code node can open the PR deterministically (preserve prior values if a
-    # rework pass leaves them blank).
+    # Persist WHICH repo the coder pushed to + WHERE the clone lives + the PR title/body it
+    # proposed, so the reviewer/rework run in the same tree and open_pr opens deterministically
+    # (preserve prior values if a rework pass leaves them blank).
     return {"branch": v.branch, "pushed_sha": v.pushed_sha,
             "files_changed": v.files_changed, "sit_findings": [],
             "service_repo": v.repo or state.get("service_repo", ""),
+            "worktree_dir": v.repo_dir or state.get("worktree_dir", ""),
             "pr_title": v.pr_title or state.get("pr_title", ""),
             "pr_body": v.pr_body or state.get("pr_body", "")}
 
@@ -161,15 +169,21 @@ async def coder(state: OceanState) -> dict:
 async def harsh_reviewer(state: OceanState) -> dict:
     iteration = state.get("review_iteration", 0)
     telemetry.station_event(state["execution_id"], 5, "start", review_iteration=iteration)
+    # Review in the SAME clone the coder pushed from, so `git diff` + independent test
+    # re-execution see the real tree (falls back to the default cwd if unset).
+    wt = state.get("worktree_dir") or ""
     v: schemas.ReviewVerdict = await agents.run_agent(
         agent_md="review.md",   # vendored slim worker (Phase B)
         node="harsh_reviewer",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
+        cwd=Path(wt) if wt else None,
         task_prompt=(
             f"Adversarially review the pushed committed diff on branch {state.get('branch')} for "
-            f"{state['ticket_id']} (review round {iteration + 1}). Classify every finding "
-            f"CRITICAL/MAJOR/MINOR. APPROVE only at zero CRITICAL and zero MAJOR.\n\n"
+            f"{state['ticket_id']} (review round {iteration + 1}) in the clone at "
+            f"{wt or '(the current directory)'}. Get the diff with `git diff <base>...HEAD`. "
+            f"Classify every finding CRITICAL/MAJOR/MINOR. APPROVE only at zero CRITICAL and zero "
+            f"MAJOR.\n\n"
             f"Research summary (for AC context):\n{_brief(state.get('research_packet'))}\n\n"
             f"{_summary(state)}"
         ),

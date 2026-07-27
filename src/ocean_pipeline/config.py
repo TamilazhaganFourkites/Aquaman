@@ -80,6 +80,15 @@ def artifacts_dir(execution_id: str) -> Path:
     return d
 
 
+def workspace_dir(execution_id: str) -> Path:
+    """Per-run workspace the coder clones the target repo into. The graph owns this location
+    (rather than letting the worker pick an opaque sandbox) so the reviewer and a rework coder
+    run against the SAME working tree — the coder reports the clone path back as repo_dir."""
+    d = ARTIFACTS_ROOT / execution_id / "workspace"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def automation_verdict_path(ticket_id: str) -> Path:
     """Canonical machine-readable verdict the ocean-automation-testing skill writes
     (SKILL.md Station 3). This orchestrator reads it rather than imposing its own schema."""

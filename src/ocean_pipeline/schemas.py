@@ -42,6 +42,7 @@ class CoderVerdict(BaseModel):
     # The graph opens the PR itself (deterministic code), so the coder only reports WHICH repo
     # it pushed to and the human-readable title/body to use — it never runs `gh pr create`.
     repo: str = ""            # owner/name (or bare name) of the repo the branch was pushed to
+    repo_dir: str = ""        # absolute path of the local clone (reviewer + rework run here)
     pr_title: str = ""        # PR title the open_pr code node will use
     pr_body: str = ""         # PR body the open_pr code node will use
 

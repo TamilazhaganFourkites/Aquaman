@@ -69,7 +69,8 @@ def _install(script: Script, tmp_path, monkeypatch):
             return schemas.ReachabilityVerdict(report_path=nowhere)
         if node.startswith("coder"):
             return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b", pushed_sha="deadbeef",
-                                        repo="cloudqwest/ocean-worker", pr_title="t", pr_body="b")
+                                        repo="cloudqwest/ocean-worker", repo_dir="/tmp/ws/ocean-worker",
+                                        pr_title="t", pr_body="b")
         if node.startswith("harsh_reviewer"):
             v = script.next_review()
             findings = [{"severity": "MAJOR", "file": "f.rb", "summary": "x"}] if v == "CHANGES_REQUIRED" else []
@@ -152,6 +153,7 @@ def test_happy_path(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "completed"
     assert final["ready_flipped"] is True
+    assert final["worktree_dir"] == "/tmp/ws/ocean-worker"  # coder's clone threaded into state
     assert s.calls["coder"] == 1
     assert s.calls["harsh_reviewer"] == 1
     assert s.calls["automation_testing"] == 1
