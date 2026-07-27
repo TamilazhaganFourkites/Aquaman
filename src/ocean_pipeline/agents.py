@@ -274,7 +274,7 @@ async def run_agent(
     )
     try:
         await _drive_with_retry(
-            system_prompt=_read(config.AGENTS_DIR / agent_md),
+            system_prompt=_read(_agent_path(agent_md)),
             prompt=f"{guardrails}\n\n{task_prompt}\n{contract}",
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
             permission_mode=permission_mode or config.STATION_PERMISSION_MODE,

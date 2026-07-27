@@ -244,3 +244,23 @@ def test_vendored_workers_resolve():
         assert "Not your job" in p.read_text(), f"{name} missing the process-ownership boundary"
     # un-migrated agents still resolve to the fk-aideveloper station dir
     assert agents._agent_path("fk-coder.md") == config.AGENTS_DIR / "fk-coder.md"
+
+
+def test_run_agent_loads_vendored_worker(tmp_path, monkeypatch):
+    """run_agent must actually LOAD the vendored worker (regression: it previously read
+    config.AGENTS_DIR unconditionally, so a real run would FileNotFoundError on research.md —
+    the graph tests never caught it because they mock run_agent itself)."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    captured: dict = {}
+
+    async def fake_drive(**kw):
+        captured["system_prompt"] = kw["system_prompt"]
+        (config.artifacts_dir("EXE-x") / "researcher.verdict.json").write_text(
+            json.dumps({"route": "coding", "packet_path": "/tmp/p.json", "target_repos": []}))
+
+    monkeypatch.setattr(agents, "_drive_with_retry", fake_drive)
+    v = asyncio.run(agents.run_agent(
+        agent_md="research.md", node="researcher", ticket_id="MM-1", execution_id="EXE-x",
+        task_prompt="go", verdict_model=schemas.ResearchVerdict))
+    assert v.route == "coding"
+    assert "Not your job" in captured["system_prompt"]  # proves it loaded workers/research.md

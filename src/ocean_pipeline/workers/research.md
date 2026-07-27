@@ -62,11 +62,12 @@ Set `route` to one of:
 
 ## Output
 
-Write the research packet JSON to the path the orchestrator gives you (the exact schema is
-appended to this prompt as an orchestration contract). Populate `route`, `packet_path` (where you
-wrote the full packet), and `target_repos` (each `{repo, language, build_env, branch}` with the
-LANGUAGE-SCOPED build_env: ruby=docker, java/go=native). Write the full packet — sources queried,
-AC pre-check results with evidence, mechanism/ownership findings, gotchas — to `packet_path`.
+Two separate writes:
+1. Write the FULL research packet — sources queried, AC pre-check results with evidence,
+   mechanism/ownership findings, gotchas — to a JSON file you choose. Use an **absolute** path.
+2. Write your machine-readable VERDICT to the path in the orchestration contract appended below.
+   It carries `route`, `packet_path` (the absolute path you wrote in step 1), and `target_repos`
+   (each `{repo, language, build_env, branch}`, LANGUAGE-SCOPED build_env: ruby=docker, java/go=native).
 
 ## Not your job (the graph owns this)
 

@@ -139,7 +139,7 @@ async def coder(state: OceanState) -> dict:
             f"Decompose and implement {state['ticket_id']} per FK North Star. isbu: commit + PUSH "
             f"the branch and STOP (no PR — the graph opens it).{rework}\n\n"
             f"Binding reachability report (build what it says is NOT_YET_BUILT; do not re-litigate "
-            f"its verdicts):\n{_brief(state.get('reachability_report'))}\n\n"
+            f"its verdicts):\n{_brief(state.get('reachability_report'), limit=12000)}\n\n"
             f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
             f"{_summary(state)}"
         ),
