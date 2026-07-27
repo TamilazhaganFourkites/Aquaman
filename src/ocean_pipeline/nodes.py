@@ -33,6 +33,15 @@ def _load_json(path: str) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def _brief(obj, limit: int = 6000) -> str:
+    """Serialize a state slice to feed a worker INLINE (explicit state, not a file handoff).
+    Bounded so a large packet can't blow the prompt."""
+    if not obj:
+        return "(none)"
+    s = json.dumps(obj, indent=2, default=str)
+    return s if len(s) <= limit else s[:limit] + "\n… (truncated)"
+
+
 def _service_slug(state: OceanState) -> str:
     """The `<org>/<name>` slug of the repo whose branch we open/flip the PR on. Prefer what the
     coder reported; fall back to the single target repo when there's exactly one."""
@@ -48,15 +57,14 @@ def _service_slug(state: OceanState) -> str:
 async def researcher(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0, "start")
     v: schemas.ResearchVerdict = await agents.run_agent(
-        agent_md="fk-researcher.md",
+        agent_md="research.md",   # vendored slim worker (Phase B); resolves under workers/
         node="researcher",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
-            f"Build the research packet for {state['ticket_id']} and classify the route "
-            f"(coding vs rca vs sop vs loft vs ff_onboarding). Dispatch Ocean SMEs as needed. "
-            f"Resolve per-repo extensions and record language-scoped build_env for each target "
-            f"repo (ruby=docker, java/go=native).\n\n{_summary(state)}"
+            f"Research {state['ticket_id']} and classify the route "
+            f"(coding vs rca vs sop vs loft vs ff_onboarding). Record the language-scoped "
+            f"build_env for each target repo (ruby=docker, java/go=native).\n\n{_summary(state)}"
         ),
         verdict_model=schemas.ResearchVerdict,
     )
@@ -123,13 +131,16 @@ async def coder(state: OceanState) -> dict:
                    f"SIT would catch):\n{json.dumps(sit_findings, indent=2)}\n")
 
     v: schemas.CoderVerdict = await agents.run_agent(
-        agent_md="fk-coder.md",
+        agent_md="code.md",   # vendored slim worker (Phase B)
         node="coder",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
-            f"Decompose and implement {state['ticket_id']} per FK North Star and the binding "
-            f"reachability-report.json. isbu: commit + PUSH the branch and STOP (no PR).{rework}\n\n"
+            f"Decompose and implement {state['ticket_id']} per FK North Star. isbu: commit + PUSH "
+            f"the branch and STOP (no PR — the graph opens it).{rework}\n\n"
+            f"Binding reachability report (build what it says is NOT_YET_BUILT; do not re-litigate "
+            f"its verdicts):\n{_brief(state.get('reachability_report'))}\n\n"
+            f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
             f"{_summary(state)}"
         ),
         verdict_model=schemas.CoderVerdict,
@@ -151,14 +162,16 @@ async def harsh_reviewer(state: OceanState) -> dict:
     iteration = state.get("review_iteration", 0)
     telemetry.station_event(state["execution_id"], 5, "start", review_iteration=iteration)
     v: schemas.ReviewVerdict = await agents.run_agent(
-        agent_md="fk-harsh-reviewer.md",
+        agent_md="review.md",   # vendored slim worker (Phase B)
         node="harsh_reviewer",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
             f"Adversarially review the pushed committed diff on branch {state.get('branch')} for "
-            f"{state['ticket_id']}. Classify every finding CRITICAL/MAJOR/MINOR. APPROVE only at "
-            f"zero CRITICAL and zero MAJOR.\n\n{_summary(state)}"
+            f"{state['ticket_id']} (review round {iteration + 1}). Classify every finding "
+            f"CRITICAL/MAJOR/MINOR. APPROVE only at zero CRITICAL and zero MAJOR.\n\n"
+            f"Research summary (for AC context):\n{_brief(state.get('research_packet'))}\n\n"
+            f"{_summary(state)}"
         ),
         verdict_model=schemas.ReviewVerdict,
     )

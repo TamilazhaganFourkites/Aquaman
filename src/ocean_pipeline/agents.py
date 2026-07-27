@@ -73,6 +73,14 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _agent_path(agent_md: str) -> Path:
+    """Resolve a worker prompt: prefer the vendored slim worker owned by this repo, and fall
+    back to the fk-aideveloper station agent for any node not yet migrated (Phase B is
+    incremental — one node at a time points at a vendored file here)."""
+    vendored = config.VENDORED_AGENTS_DIR / agent_md
+    return vendored if vendored.exists() else config.AGENTS_DIR / agent_md
+
+
 def _emit(label: str, line: str) -> None:
     print(f"    [{label}] {line}", flush=True)
 

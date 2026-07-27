@@ -232,3 +232,15 @@ def test_unsupported_route_stops(tmp_path, monkeypatch):
     assert final["final_status"] == "failed"
     assert "unsupported route" in final["final_outcome"]
     assert s.calls["coder"] == 0
+
+
+# ----------------------------------------------------------------- vendored workers (Phase B)
+def test_vendored_workers_resolve():
+    """The migrated workers are vendored into this repo and resolve BEFORE any fk-aideveloper
+    fallback; un-migrated agents still fall back. Guards the Phase B decoupling."""
+    for name in ("research.md", "code.md", "review.md"):
+        p = agents._agent_path(name)
+        assert p == config.VENDORED_AGENTS_DIR / name and p.exists(), f"{name} not vendored"
+        assert "Not your job" in p.read_text(), f"{name} missing the process-ownership boundary"
+    # un-migrated agents still resolve to the fk-aideveloper station dir
+    assert agents._agent_path("fk-coder.md") == config.AGENTS_DIR / "fk-coder.md"
