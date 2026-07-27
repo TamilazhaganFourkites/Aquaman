@@ -116,6 +116,13 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
                   f"  reject:  ocean-pipeline --resume {execution_id} --reject")
         else:
             _report(execution_id, final, total)
+            # Machine-readable completion line for headless runners (oas-autodev's
+            # reconcile matches `pr=#<n>` / a PR URL in the log tail). Emitting the PR
+            # number on a clean finish means a green run is tracked as ready-for-merge
+            # instead of being mis-classified as blocked (exit 0 + no PR string).
+            pr = final.get("pr_number")
+            print(f"[DONE] {ticket_id} status={final.get('final_status') or 'completed'}"
+                  + (f" pr=#{pr}" if pr else ""))
     except Exception as e:  # noqa: BLE001 — never leave a `running` row orphaned (AP-223)
         telemetry.execution_end(execution_id, ticket_id, "failed", "unknown",
                                 final_outcome=f"{type(e).__name__}: {e}")
