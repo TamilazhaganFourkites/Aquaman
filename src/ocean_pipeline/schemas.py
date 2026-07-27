@@ -1,6 +1,6 @@
 """Structured verdicts.
 
-Most stations write to <artifacts>/<station>.verdict.json (see agents.run_station).
+Most worker nodes write to <artifacts>/<node>.verdict.json (see agents.run_agent).
 Station 6 is the exception: the ocean-automation-testing skill already defines its
 own machine-readable contract (SKILL.md Station 3) and writes it to the canonical
 memory/tickets/<TICKET>-automation-testing.json. AutomationVerdict mirrors that
@@ -13,7 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-# ---- generic per-station verdicts (written via run_station's contract) -------
+# ---- generic per-node verdicts (written via run_agent's contract) -------
 class ResearchVerdict(BaseModel):
     route: Literal["coding", "rca", "sop", "loft", "ff_onboarding", "unclassified"]
     packet_path: str
@@ -39,6 +39,11 @@ class CoderVerdict(BaseModel):
     branch: str
     pushed_sha: str
     files_changed: int = 0
+    # The graph opens the PR itself (deterministic code), so the coder only reports WHICH repo
+    # it pushed to and the human-readable title/body to use — it never runs `gh pr create`.
+    repo: str = ""            # owner/name (or bare name) of the repo the branch was pushed to
+    pr_title: str = ""        # PR title the open_pr code node will use
+    pr_body: str = ""         # PR body the open_pr code node will use
 
 
 class ReviewVerdict(BaseModel):

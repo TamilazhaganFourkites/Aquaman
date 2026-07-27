@@ -21,7 +21,7 @@ import json
 
 import pytest
 
-from ocean_pipeline import agents, config, graph, schemas
+from ocean_pipeline import agents, config, gitops, graph, schemas
 
 
 class Script:
@@ -57,27 +57,34 @@ def _install(script: Script, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")
     nowhere = str(tmp_path / "nonexistent.json")  # -> _load_json returns {}
 
-    async def fake_run_station(**kw):
-        station = kw["station"]
-        script.calls[station] += 1
-        if station.startswith("researcher"):
+    async def fake_run_agent(**kw):
+        node = kw["node"]
+        script.calls[node] += 1
+        if node.startswith("researcher"):
             return schemas.ResearchVerdict(route=script.route, packet_path=nowhere, target_repos=[])
-        if station.startswith("rca_agent"):
+        if node.startswith("rca_agent"):
             return schemas.RcaVerdict(report_path=nowhere, fix_needed=script.rca_fix,
                                       findings_for_coder=(["fix X in ocean-worker"] if script.rca_fix else []))
-        if station.startswith("dep_resolver") or station.startswith("reachability_gate"):
+        if node.startswith("dep_resolver") or node.startswith("reachability_gate"):
             return schemas.ReachabilityVerdict(report_path=nowhere)
-        if station.startswith("coder"):
-            return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b", pushed_sha="deadbeef")
-        if station.startswith("harsh_reviewer"):
+        if node.startswith("coder"):
+            return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b", pushed_sha="deadbeef",
+                                        repo="cloudqwest/ocean-worker", pr_title="t", pr_body="b")
+        if node.startswith("harsh_reviewer"):
             v = script.next_review()
             findings = [{"severity": "MAJOR", "file": "f.rb", "summary": "x"}] if v == "CHANGES_REQUIRED" else []
             return schemas.ReviewVerdict(verdict=v, findings=findings)
-        if station.startswith("open_pr"):
-            (config.artifacts_dir(kw["execution_id"]) / "pr_number.txt").write_text("123")
-            return schemas.CoderVerdict(branch="b", pushed_sha="sha")
-        # graph_augment / release_intel / ready-flip
+        # graph_augment / release_intel
         return schemas.CoderVerdict(branch="b", pushed_sha="sha")
+
+    # Git/PR ops are now plain code (gitops), not agent calls — stub them and count the calls
+    # under the same keys the tests already assert on (open_pr / flip_ready).
+    def fake_open_draft_pr(slug, branch, title, body):
+        script.calls["open_pr"] += 1
+        return 123
+
+    def fake_cross_link_and_ready(slug, pr_number, test_pr_url=""):
+        script.calls["flip_ready"] += 1
 
     async def fake_run_skill(**kw):
         script.calls["automation_testing"] += 1
@@ -94,8 +101,10 @@ def _install(script: Script, tmp_path, monkeypatch):
         }
         config.automation_verdict_path(kw["ticket_id"]).write_text(json.dumps(verdict))
 
-    monkeypatch.setattr(agents, "run_station", fake_run_station)
+    monkeypatch.setattr(agents, "run_agent", fake_run_agent)
     monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+    monkeypatch.setattr(gitops, "open_draft_pr", fake_open_draft_pr)
+    monkeypatch.setattr(gitops, "cross_link_and_ready", fake_cross_link_and_ready)
 
 
 def _run(ticket="MM-1"):

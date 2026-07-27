@@ -1,18 +1,22 @@
-"""Station nodes. Each is a thin wrapper: telemetry -> drive the existing station
-agent/skill via the Claude Agent SDK -> return a partial state update. No station
-logic is re-expressed here.
+"""Graph nodes.
+
+Two kinds of node:
+  * worker nodes — telemetry -> run ONE narrow agent/skill via the Claude Agent SDK ->
+    return a partial state update. The graph (graph.py) owns all sequencing/routing/loops.
+  * plain-code nodes (open_pr, flip_ready) — deterministic git/gh operations run directly
+    here via gitops.py, NOT delegated to an agent, so the process is exact and testable.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from . import agents, config, schemas, telemetry
+from . import agents, config, gitops, schemas, telemetry
 from .state import OceanState
 
 
 def _summary(state: OceanState) -> str:
-    """<=300-token ticket summary pushed to each station (CLAUDE.md dispatch rule)."""
+    """<=300-token ticket summary pushed to each worker."""
     s = (
         f"Ticket: {state['ticket_id']}\n"
         f"Context: {state.get('context', '(none)')}\n"
@@ -29,12 +33,23 @@ def _load_json(path: str) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def _service_slug(state: OceanState) -> str:
+    """The `<org>/<name>` slug of the repo whose branch we open/flip the PR on. Prefer what the
+    coder reported; fall back to the single target repo when there's exactly one."""
+    repo = state.get("service_repo") or ""
+    if not repo:
+        repos = state.get("target_repos") or []
+        if len(repos) == 1:
+            repo = repos[0].get("repo", "")
+    return gitops.repo_slug(repo)
+
+
 # ------------------------------------------------------------------ Station 0
 async def researcher(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0, "start")
-    v: schemas.ResearchVerdict = await agents.run_station(
+    v: schemas.ResearchVerdict = await agents.run_agent(
         agent_md="fk-researcher.md",
-        station="researcher",
+        node="researcher",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -53,9 +68,9 @@ async def researcher(state: OceanState) -> dict:
 # ------------------------------------------------------------------ Station 1
 async def dep_resolver(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1, "start")
-    v: schemas.ReachabilityVerdict = await agents.run_station(
+    v: schemas.ReachabilityVerdict = await agents.run_agent(
         agent_md="fk-dependency-resolver.md",
-        station="dep_resolver",
+        node="dep_resolver",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -71,9 +86,9 @@ async def dep_resolver(state: OceanState) -> dict:
 # ------------------------------------------------------------------ Station 1.5
 async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
-    v: schemas.ReachabilityVerdict = await agents.run_station(
+    v: schemas.ReachabilityVerdict = await agents.run_agent(
         agent_md="fk-reachability-gate.md",
-        station="reachability_gate",
+        node="reachability_gate",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -107,9 +122,9 @@ async def coder(state: OceanState) -> dict:
         rework += (f"\nAddress these Station 6 SIT code-fault findings (real defects a passing "
                    f"SIT would catch):\n{json.dumps(sit_findings, indent=2)}\n")
 
-    v: schemas.CoderVerdict = await agents.run_station(
+    v: schemas.CoderVerdict = await agents.run_agent(
         agent_md="fk-coder.md",
-        station="coder",
+        node="coder",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -121,17 +136,23 @@ async def coder(state: OceanState) -> dict:
     )
     telemetry.station_event(state["execution_id"], 4, "end")
     # A fresh code pass supersedes prior SIT findings; clear them once addressed.
+    # Persist WHICH repo the coder pushed to + the PR title/body it proposed, so the
+    # open_pr code node can open the PR deterministically (preserve prior values if a
+    # rework pass leaves them blank).
     return {"branch": v.branch, "pushed_sha": v.pushed_sha,
-            "files_changed": v.files_changed, "sit_findings": []}
+            "files_changed": v.files_changed, "sit_findings": [],
+            "service_repo": v.repo or state.get("service_repo", ""),
+            "pr_title": v.pr_title or state.get("pr_title", ""),
+            "pr_body": v.pr_body or state.get("pr_body", "")}
 
 
 # ------------------------------------------------------------------ Station 5
 async def harsh_reviewer(state: OceanState) -> dict:
     iteration = state.get("review_iteration", 0)
     telemetry.station_event(state["execution_id"], 5, "start", review_iteration=iteration)
-    v: schemas.ReviewVerdict = await agents.run_station(
+    v: schemas.ReviewVerdict = await agents.run_agent(
         agent_md="fk-harsh-reviewer.md",
-        station="harsh_reviewer",
+        node="harsh_reviewer",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
@@ -146,30 +167,22 @@ async def harsh_reviewer(state: OceanState) -> dict:
             "review_iteration": iteration + 1}
 
 
-# ------------------------------------------------------------------ 3.87 open PR (idempotent)
+# ------------------------------------------------------------------ 3.87 open PR (plain code, idempotent)
 async def open_pr(state: OceanState) -> dict:
+    """Open the DRAFT service PR — deterministic gh, run by the graph, NOT an agent.
+    Idempotent: reuses an existing PR for the branch (the code_fault loop re-enters here)."""
     if state.get("pr_number"):
         return {}  # PR already open (code_fault rework path re-enters here)
     telemetry.station_event(state["execution_id"], 3.87, "start")
-    pr_file = config.artifacts_dir(state["execution_id"]) / "pr_number.txt"
-    if pr_file.exists():
-        pr_file.unlink()
-    await agents.run_station(
-        agent_md="fk-coder.md",
-        station="open_pr",
-        ticket_id=state["ticket_id"],
-        execution_id=state["execution_id"],
-        task_prompt=(
-            f"Open the DRAFT service PR for {state['ticket_id']} on branch {state.get('branch')}.\n"
-            f"IDEMPOTENCY: first run `gh pr list --head {state.get('branch')} --state all "
-            f"--json number,state`. If a PR for this branch already exists, REUSE it (write its "
-            f"number) — do NOT create a second PR. Only if none exists, `gh pr create --draft`.\n"
-            f"Archive+git-rm the CLAUDE.features file before opening. "
-            f"Write ONLY the integer PR number to {pr_file}.\n\n{_summary(state)}"
-        ),
-        verdict_model=schemas.CoderVerdict,
-    )
-    pr_number = int(pr_file.read_text().strip()) if pr_file.exists() else None
+    slug, branch = _service_slug(state), state.get("branch")
+    if not slug or not branch:
+        raise gitops.GitOpError(
+            f"cannot open PR: missing repo slug ({slug!r}) or branch ({branch!r}) — the coder "
+            f"must report `repo` and `branch`, or provide a single target repo."
+        )
+    title = state.get("pr_title") or f"{state['ticket_id']}: automated pipeline change"
+    body = state.get("pr_body") or f"Automated change for {state['ticket_id']} (FK Ocean pipeline)."
+    pr_number = gitops.open_draft_pr(slug, branch, title, body)
     telemetry.station_event(state["execution_id"], 3.87, "end", pr_number=pr_number)
     return {"pr_number": pr_number}
 
@@ -180,9 +193,9 @@ async def graph_augment(state: OceanState) -> dict:
         return {"graph_augmented": False}
     telemetry.station_event(state["execution_id"], 4.5, "start")
     try:
-        await agents.run_station(
+        await agents.run_agent(
             agent_md="fk-coder.md",
-            station="graph_augment",
+            node="graph_augment",
             ticket_id=state["ticket_id"],
             execution_id=state["execution_id"],
             task_prompt=f"Run Graph Caller Chain Augmentation for PR #{state['pr_number']}.\n\n{_summary(state)}",
@@ -198,9 +211,9 @@ async def graph_augment(state: OceanState) -> dict:
 # ------------------------------------------------------------------ 4.6 release intel
 async def release_intel(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 4.6, "start")
-    await agents.run_station(
+    await agents.run_agent(
         agent_md="fk-coder.md",
-        station="release_intel",
+        node="release_intel",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=f"Run the Release Intelligence Writer for {state['ticket_id']}.\n\n{_summary(state)}",
@@ -232,7 +245,7 @@ async def automation_testing(state: OceanState) -> dict:
 
     await agents.run_skill(
         skill_name="ocean-automation-testing",
-        station="automation_testing",
+        node="automation_testing",
         ticket_id=tid,
         task_prompt=(
             f"Run ocean-automation-testing for {tid} HEADLESS (pipeline Station 6), end to end.\n"
@@ -287,28 +300,16 @@ async def prep_rework(state: OceanState) -> dict:
     return {"coding_attempts": attempt, "review_iteration": 0, "review_findings": []}
 
 
-# ------------------------------------------------------------------ ready-flip (automated on GREEN)
+# ------------------------------------------------------------------ ready-flip (plain code, on GREEN)
 async def flip_ready(state: OceanState) -> dict:
-    """On PASS: cross-link the skill's test-automation PR into the service PR and flip the
-    service PR to ready-for-review. This is the intended AUTOMATED terminal action
-    (CLAUDE.md). The human boundary is merge/deploy, which the pipeline never performs."""
+    """On PASS: cross-link the test-automation PR into the service PR and flip the service PR to
+    ready-for-review — deterministic gh, run by the graph, NOT an agent. This is the intended
+    AUTOMATED terminal action; the human boundary is merge/deploy, which the pipeline never performs."""
     telemetry.station_event(state["execution_id"], 6.5, "start")
-    await agents.run_station(
-        agent_md="fk-coder.md",
-        station="flip_ready",
-        ticket_id=state["ticket_id"],
-        execution_id=state["execution_id"],
-        task_prompt=(
-            f"SIT passed for {state['ticket_id']}. Cross-link the test-automation PR "
-            f"({state.get('test_automation_pr_url') or '(none provided)'}) into the description of "
-            f"service PR #{state.get('pr_number')}, then flip that service PR to ready-for-review "
-            f"(`gh pr ready {state.get('pr_number')}`). Do NOT merge and do NOT deploy.\n"
-            f"IDEMPOTENCY: if the test-PR link is already in the description, do not duplicate it; "
-            f"`gh pr ready` is a safe no-op if the PR is already ready.\n\n{_summary(state)}"
-        ),
-        verdict_model=schemas.CoderVerdict,
-    )
-    telemetry.station_event(state["execution_id"], 6.5, "end", ready_flipped=True)
+    slug, pr = _service_slug(state), state.get("pr_number")
+    if slug and pr:
+        gitops.cross_link_and_ready(slug, int(pr), state.get("test_automation_pr_url") or "")
+    telemetry.station_event(state["execution_id"], 6.5, "end", ready_flipped=bool(slug and pr))
     return {"ready_flipped": True, "final_status": "completed",
             "final_outcome": f"sit_passed; service PR #{state.get('pr_number')} ready-for-review"}
 
@@ -333,9 +334,9 @@ async def rca_agent(state: OceanState) -> dict:
     says whether a code fix is needed. On fix_needed the RCA brief is handed to the
     coder (diagram: RCA agent -> RCA Done -> Fix needed -> coder)."""
     telemetry.station_event(state["execution_id"], 0.1, "start", route="rca")
-    v: schemas.RcaVerdict = await agents.run_station(
+    v: schemas.RcaVerdict = await agents.run_agent(
         agent_md="fk-researcher.md",   # routes into the ocean-rca skill; standalone, no PR
-        station="rca_agent",
+        node="rca_agent",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(

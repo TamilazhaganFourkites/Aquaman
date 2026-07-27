@@ -55,6 +55,9 @@ class OceanState(TypedDict, total=False):
 
     # --- 3.87 / 4.5b / 4.6 ---
     pr_number: int
+    service_repo: str        # owner/name slug the coder pushed to; used by the git/PR code nodes
+    pr_title: str            # PR title the coder proposed; the code node opens the PR with it
+    pr_body: str             # PR body the coder proposed
     graph_augmented: bool
     release_intel_written: bool
 

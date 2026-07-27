@@ -56,6 +56,17 @@ SKILL_PERMISSION_MODE = os.environ.get("OCEAN_PIPELINE_SKILL_PERMISSION_MODE", "
 # isbu profile boards that run the full end-to-end pipeline (per CLAUDE.md).
 ISBU_PROJECTS = {"MM", "ANG", "RAIL", "INTMOD", "BAR", "ISBUETA", "ISAI", "DO"}
 
+# Node-level resilience. A single transient claude-CLI/SDK failure (e.g. a ProcessError
+# that the SDK surfaces as `Claude Code returned an error result: ...`, seen in run.log for
+# MM-14472) must NOT abort a whole run. The agent/skill driver retries with exponential
+# backoff before giving up; the checkpointer still allows a full --resume if all retries fail.
+MAX_AGENT_RETRIES = int(os.environ.get("OCEAN_PIPELINE_MAX_AGENT_RETRIES", "2"))
+AGENT_RETRY_BACKOFF_SECONDS = float(os.environ.get("OCEAN_PIPELINE_AGENT_RETRY_BACKOFF", "3"))
+
+# Default GitHub org for FK service repos. Branches are pushed to upstream, never forked
+# (see the guardrails), so the git/PR code nodes address repos as `<org>/<name>`.
+DEFAULT_REPO_ORG = os.environ.get("OCEAN_PIPELINE_REPO_ORG", "cloudqwest")
+
 
 def artifacts_dir(execution_id: str) -> Path:
     d = ARTIFACTS_ROOT / execution_id
