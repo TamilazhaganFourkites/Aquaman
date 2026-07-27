@@ -79,8 +79,10 @@ MAX_ONBOARD_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ONBOARD_ATTEMPTS",
 STATION_PERMISSION_MODE = os.environ.get("OCEAN_PIPELINE_PERMISSION_MODE", "bypassPermissions")
 SKILL_PERMISSION_MODE = os.environ.get("OCEAN_PIPELINE_SKILL_PERMISSION_MODE", "bypassPermissions")
 
-# isbu profile boards that run the full end-to-end pipeline (per CLAUDE.md).
-ISBU_PROJECTS = {"MM", "ANG", "RAIL", "INTMOD", "BAR", "ISBUETA", "ISAI", "DO"}
+# Boards the ocean-pipeline handles end-to-end. Scoped to the MM (Ocean) board only for now — the
+# other isbu boards (ANG/RAIL/INTMOD/BAR/ISBUETA/ISAI/DO) run the non-isbu coding-only default in
+# fk-execute (draft PR). Widen this set when the ocean-pipeline is rolled out to them.
+ISBU_PROJECTS = {"MM"}
 
 # Node-level resilience. A single transient claude-CLI/SDK failure (e.g. a ProcessError
 # that the SDK surfaces as `Claude Code returned an error result: ...`, seen in run.log for
