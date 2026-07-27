@@ -199,6 +199,12 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     # `claude` CLI it spawns) installed — the SDK is only needed at actual run time.
     from claude_agent_sdk import ClaudeAgentOptions, query
 
+    # Signal to worker skills that they're running UNDER the control plane (inherited by the
+    # spawned CLI subprocess). The ocean-qa-agent's learn-a-repo gate keys off this: under the
+    # control plane a normal SIT run reports-only (needs_onboarding) and the graph's learn_repo
+    # node owns onboarding; a standalone `/ocean-qa-agent` run (no Aquaman, flag unset) self-onboards.
+    os.environ["OCEAN_PIPELINE_CONTROL_PLANE"] = "1"
+
     options = ClaudeAgentOptions(
         model=config.STATION_MODEL,
         system_prompt=system_prompt,
