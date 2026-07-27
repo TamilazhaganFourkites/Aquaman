@@ -48,11 +48,19 @@ def after_review(state: OceanState) -> str:
     return "rework"
 
 
-def after_automation(state: OceanState) -> str:
+def after_sit_resolve(state: OceanState) -> str:
+    # Onboarding is detected at resolve, before any authoring/execution: branch to learn_repo
+    # (capped), stop cleanly if the budget is spent, else run the SIT.
+    if state.get("needs_onboarding"):
+        return "onboard" if state.get("onboard_attempts", 0) < config.MAX_ONBOARD_ATTEMPTS else "stop"
+    return "run"
+
+
+def after_sit_triage(state: OceanState) -> str:
     if state.get("automation_result") == "passed":
         return "pass"
     # failed:
-    # Unsupported ocean repo the graph can onboard, then re-run Station 6 (capped).
+    # A late-surfaced unsupported repo the graph can onboard, then re-run Station 6 (capped).
     if (state.get("needs_onboarding")
             and state.get("onboard_attempts", 0) < config.MAX_ONBOARD_ATTEMPTS):
         return "onboard"
@@ -82,8 +90,11 @@ def build_graph():
     g.add_node("open_pr", nodes.open_pr)
     g.add_node("graph_augment", nodes.graph_augment)
     g.add_node("release_intel", nodes.release_intel)
-    g.add_node("automation_testing", nodes.automation_testing)   # ocean-automation-testing skill, end-to-end
-    g.add_node("learn_repo", nodes.learn_repo)                    # graph-owned onboarding of an unsupported repo
+    # Station 6 decomposed into graph-owned phases (drives the skill one --only phase at a time).
+    g.add_node("sit_resolve", nodes.sit_resolve)                 # resolve changed repo + onboarding check
+    g.add_node("sit_run", nodes.sit_run)                         # author + execute the SIT (local, mock-first)
+    g.add_node("sit_triage", nodes.sit_triage)                   # parse junit, triage, verdict, open test PR
+    g.add_node("learn_repo", nodes.learn_repo)                   # graph-owned onboarding of an unsupported repo
     g.add_node("prep_rework", nodes.prep_rework)
     g.add_node("human_gate", nodes.human_gate)                   # optional approval before ready-flip
     g.add_node("flip_ready", nodes.flip_ready)
@@ -109,19 +120,24 @@ def build_graph():
 
     g.add_edge("open_pr", "graph_augment")
     g.add_edge("graph_augment", "release_intel")
-    g.add_edge("release_intel", "automation_testing")
+    g.add_edge("release_intel", "sit_resolve")
 
-    # Station 6 outcomes (branch on the skill's verdict). PASS goes through the (optional)
-    # human-approval gate before the ready-flip.
-    g.add_conditional_edges("automation_testing", after_automation, {
+    # Station 6, decomposed: resolve -> (onboard? | run) -> triage -> branch on the verdict.
+    g.add_conditional_edges("sit_resolve", after_sit_resolve, {
+        "onboard": "learn_repo",         # unsupported repo -> onboard it first (before authoring/running)
+        "run": "sit_run",
+        "stop": "stop_run",              # unsupported + onboarding budget exhausted
+    })
+    g.add_edge("sit_run", "sit_triage")
+    g.add_conditional_edges("sit_triage", after_sit_triage, {
         "pass": "human_gate",            # PASS -> optional human-approval gate -> ready-flip
-        "onboard": "learn_repo",         # unsupported repo -> graph onboards it, then re-runs Station 6
+        "onboard": "learn_repo",         # late-surfaced unsupported repo
         "code_fault": "prep_rework",
         "stop": "stop_run",
     })
     g.add_conditional_edges("human_gate", after_human_gate,
                             {"approve": "flip_ready", "reject": "stop_run"})
-    g.add_edge("learn_repo", "automation_testing")   # re-run Station 6 now that the repo is supported
+    g.add_edge("learn_repo", "sit_resolve")   # re-resolve now that the repo is (being) onboarded
     g.add_edge("prep_rework", "coder")   # full loop: coder -> review -> (open_pr no-op) -> ... -> SIT
     g.add_edge("flip_ready", END)
     g.add_edge("stop_run", END)

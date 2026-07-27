@@ -56,12 +56,14 @@ persistence — it invokes the skill's *learn-a-repo mechanic* (`local_service_e
 authorized onboarding pass (clone → profile → commit the profile), then re-runs `automation_testing`. Capped
 by `MAX_ONBOARD_ATTEMPTS`. Standalone/interactive `/ocean-automation-testing` runs still self-onboard.
 
-Station 6 is a single node driving the `ocean-automation-testing` skill end-to-end (headless). Its internal
-`write → run → pass` stages (the design diagram's boxes) belong to the skill (SKILL.md Stations 0–3), which
-owns their sequencing and failure handling and persists state to
-`memory/tickets/<TICKET>-automation-testing.json`. The node reads that verdict and the graph branches on it;
-a Docker/infra bring-up failure is the skill's own `could_not_verify`. `flip_ready` then cross-links the test
-PR into the service PR and flips it to ready.
+Station 6 is **decomposed into three graph nodes** so LangGraph owns its sequence rather than the skill
+running end-to-end: `sit_resolve → sit_run → sit_triage`. Each drives the `ocean-automation-testing` skill
+one `--only` phase at a time (`resolve` / `author`+`run` / `report`), with the skill's own
+`memory/tickets/<TICKET>-automation-testing.json` carrying state between them. The graph branches at the two
+real decision points: after `sit_resolve` (an unsupported repo → `learn_repo`, before any authoring/running)
+and after `sit_triage` (`pass` → human gate → ready-flip; `code_fault` → rework; `could_not_verify` → stop).
+A Docker/infra bring-up failure is the skill's own `could_not_verify`; a missing verdict file is treated as
+`could_not_verify` as a backstop. `flip_ready` then cross-links the test PR into the service PR and flips it to ready.
 
 ## Layout
 

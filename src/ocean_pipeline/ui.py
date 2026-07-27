@@ -30,7 +30,10 @@ _LABELS = {
     "open_pr":            "Open draft PR",
     "graph_augment":      "Code-graph augmentation",
     "release_intel":      "Release intelligence",
-    "automation_testing": "Local SIT (automation testing)",
+    "sit_resolve":        "Local SIT — resolve & gate",
+    "sit_run":            "Local SIT — author & run",
+    "sit_triage":         "Local SIT — triage & verdict",
+    "learn_repo":         "Onboarding an unsupported repo",
     "prep_rework":        "Rework — SIT found a defect",
     "human_gate":         "Awaiting human approval",
     "flip_ready":         "Flip PR to ready-for-review",
@@ -109,7 +112,7 @@ def _details(node: str, upd: dict) -> list[str]:
                 d.append(f"  … +{len(findings) - 3} more")
         else:
             d.append("no CRITICAL/MAJOR findings")
-    elif node == "automation_testing":
+    elif node == "sit_triage":
         rep = upd.get("sit_report") or {}
         tests = rep.get("tests") or []
         if tests:
@@ -152,9 +155,13 @@ def _highlight(node: str, upd: dict) -> str:
         return str(upd.get("review_verdict") or "")
     if node == "open_pr" and upd.get("pr_number"):
         return f"PR #{upd['pr_number']}"
-    if node == "automation_testing" and upd.get("automation_result"):
+    if node == "sit_resolve":
+        return f"needs onboarding: {upd.get('onboard_repo', '')}" if upd.get("needs_onboarding") else "repo resolved"
+    if node == "sit_triage" and upd.get("automation_result"):
         fc = upd.get("failure_class")
         return f"SIT {upd['automation_result']}" + (f" ({fc})" if fc else "")
+    if node == "learn_repo":
+        return f"onboarded {upd.get('repo_onboarded', '')}".strip()
     if node == "flip_ready" and upd.get("ready_flipped"):
         return "ready-for-review"
     if node == "prep_rework":

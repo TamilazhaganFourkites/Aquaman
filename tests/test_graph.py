@@ -36,6 +36,7 @@ class Script:
         self.sit_seq = list(sit_seq)
         self._review_i = 0
         self._sit_i = 0
+        self._cur = "passed"   # this attempt's SIT outcome, decided at sit_resolve, used at sit_triage
         self.calls: collections.Counter[str] = collections.Counter()
 
     def _next(self, seq, i_attr):
@@ -92,27 +93,37 @@ def _install(script: Script, tmp_path, monkeypatch):
         script.calls["flip_ready"] += 1
 
     async def fake_run_skill(**kw):
+        # Station 6 is decomposed into sit_resolve -> sit_run -> sit_triage. sit_resolve decides this
+        # attempt's outcome (onboard vs proceed); sit_triage finalizes the verdict for a proceed.
         node = kw["node"]
         script.calls[node] += 1
-        if node == "learn_repo":
-            return  # graph-owned onboarding pass writes no Station-3 verdict
-        outcome = script.next_sit()  # passed | code_fault | could_not_verify | needs_onboarding
-        needs_onboarding = outcome == "needs_onboarding"
-        # needs_onboarding surfaces as a could_not_verify failure carrying the onboarding signal.
-        failure_class = "" if outcome == "passed" else ("could_not_verify" if needs_onboarding else outcome)
-        verdict = {
-            "ticket_id": kw["ticket_id"],
-            "pr_number": 123,
-            "automation_result": "passed" if outcome == "passed" else "failed",
-            "failure_class": failure_class,
+        path = config.automation_verdict_path(kw["ticket_id"])
+        if node == "learn_repo" or node == "sit_run":
+            return  # onboarding pass / execute phase write no final verdict
+        if node == "sit_resolve":
+            script._cur = script.next_sit()  # passed | code_fault | could_not_verify | needs_onboarding
+            needs = script._cur == "needs_onboarding"
+            path.write_text(json.dumps({
+                "ticket_id": kw["ticket_id"], "pr_number": 123,
+                "automation_result": "failed" if needs else "passed",   # placeholder; triage finalizes
+                "failure_class": "could_not_verify" if needs else "",
+                "needs_onboarding": needs,
+                "onboard_repo": "ocean-newrepo" if needs else "",
+            }))
+            return
+        # node == "sit_triage": write the canonical verdict for this attempt's outcome
+        outcome = script._cur
+        result = "passed" if outcome == "passed" else "failed"
+        path.write_text(json.dumps({
+            "ticket_id": kw["ticket_id"], "pr_number": 123,
+            "automation_result": result,
+            "failure_class": "" if outcome == "passed" else outcome,
             "execution_mode": "local-mock-first",
-            "tests": [{"name": "test_x", "result": "passed" if outcome == "passed" else "failed"}],
+            "tests": [{"name": "test_x", "result": result}],
             "test_automation_pr_url": "https://github.com/cloudqwest/test-automation/pull/9" if outcome == "passed" else "",
             "findings_for_coder": [{"test": "test_x", "cause": "bug"}] if outcome == "code_fault" else [],
-            "needs_onboarding": needs_onboarding,
-            "onboard_repo": "ocean-newrepo" if needs_onboarding else "",
-        }
-        config.automation_verdict_path(kw["ticket_id"]).write_text(json.dumps(verdict))
+            "needs_onboarding": False, "onboard_repo": "",
+        }))
 
     monkeypatch.setattr(agents, "run_agent", fake_run_agent)
     monkeypatch.setattr(agents, "run_skill", fake_run_skill)
@@ -143,18 +154,26 @@ def test_after_review():
     assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 2}) == "approve"
 
 
-def test_after_automation():
-    assert graph.after_automation({"automation_result": "passed"}) == "pass"
-    assert graph.after_automation({"automation_result": "failed", "failure_class": "code_fault",
+def test_after_sit_resolve():
+    # onboarding is decided at resolve, before authoring/running
+    assert graph.after_sit_resolve({}) == "run"
+    assert graph.after_sit_resolve({"needs_onboarding": True, "onboard_attempts": 0}) == "onboard"
+    assert graph.after_sit_resolve({"needs_onboarding": True,
+                                    "onboard_attempts": config.MAX_ONBOARD_ATTEMPTS}) == "stop"
+
+
+def test_after_sit_triage():
+    assert graph.after_sit_triage({"automation_result": "passed"}) == "pass"
+    assert graph.after_sit_triage({"automation_result": "failed", "failure_class": "code_fault",
                                    "coding_attempts": 0}) == "code_fault"
-    assert graph.after_automation({"automation_result": "failed", "failure_class": "code_fault",
+    assert graph.after_sit_triage({"automation_result": "failed", "failure_class": "code_fault",
                                    "coding_attempts": 2}) == "stop"
-    assert graph.after_automation({"automation_result": "failed", "failure_class": "could_not_verify",
+    assert graph.after_sit_triage({"automation_result": "failed", "failure_class": "could_not_verify",
                                    "coding_attempts": 0}) == "stop"
-    # unsupported repo -> onboard (until the attempt budget is spent, then stop)
-    assert graph.after_automation({"automation_result": "failed", "failure_class": "could_not_verify",
+    # late-surfaced unsupported repo -> onboard (until the attempt budget is spent, then stop)
+    assert graph.after_sit_triage({"automation_result": "failed", "failure_class": "could_not_verify",
                                    "needs_onboarding": True, "onboard_attempts": 0}) == "onboard"
-    assert graph.after_automation({"automation_result": "failed", "failure_class": "could_not_verify",
+    assert graph.after_sit_triage({"automation_result": "failed", "failure_class": "could_not_verify",
                                    "needs_onboarding": True,
                                    "onboard_attempts": config.MAX_ONBOARD_ATTEMPTS}) == "stop"
 
@@ -175,7 +194,7 @@ def test_happy_path(tmp_path, monkeypatch):
     assert s.calls["sme_consult"] == 0   # no domain_bucket -> SME node is a no-op
     assert s.calls["coder"] == 1
     assert s.calls["harsh_reviewer"] == 1
-    assert s.calls["automation_testing"] == 1
+    assert s.calls["sit_triage"] == 1
     assert s.calls["flip_ready"] == 1
 
 
@@ -202,7 +221,7 @@ def test_code_fault_loop_then_pass(tmp_path, monkeypatch):
     _install(s, tmp_path, monkeypatch)
     final = _run()
     assert final["final_status"] == "completed"
-    assert s.calls["automation_testing"] == 2
+    assert s.calls["sit_triage"] == 2
     assert s.calls["coder"] == 2      # initial + one code_fault rework
     assert s.calls["open_pr"] == 1  # opened once; re-entry is a no-op
 
@@ -213,7 +232,7 @@ def test_code_fault_budget_exhausted(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "failed"
     assert "coding_attempts_exhausted" in final["final_outcome"]
-    assert s.calls["automation_testing"] == config.MAX_CODING_ATTEMPTS + 1  # initial + N reworks
+    assert s.calls["sit_triage"] == config.MAX_CODING_ATTEMPTS + 1  # initial + N reworks
 
 
 def test_onboard_then_pass(tmp_path, monkeypatch):
@@ -225,7 +244,8 @@ def test_onboard_then_pass(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "completed"
     assert s.calls["learn_repo"] == 1                 # graph onboarded the repo exactly once
-    assert s.calls["automation_testing"] == 2         # first (gap) + re-run (pass)
+    assert s.calls["sit_resolve"] == 2         # gap attempt + re-run; triage only on the pass
+    assert s.calls["sit_triage"] == 1
     assert final["repo_onboarded"] == "ocean-newrepo"
     assert s.calls["flip_ready"] == 1
 
@@ -239,7 +259,8 @@ def test_onboard_budget_exhausted(tmp_path, monkeypatch):
     assert final["final_status"] == "failed"
     assert "repo_onboarding_exhausted" in final["final_outcome"]
     assert s.calls["learn_repo"] == config.MAX_ONBOARD_ATTEMPTS
-    assert s.calls["automation_testing"] == config.MAX_ONBOARD_ATTEMPTS + 1
+    assert s.calls["sit_resolve"] == config.MAX_ONBOARD_ATTEMPTS + 1
+    assert s.calls["sit_triage"] == 0
     assert s.calls["flip_ready"] == 0
 
 
@@ -249,7 +270,7 @@ def test_could_not_verify_stops(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "failed"
     assert "could_not_verify" in final["final_outcome"]
-    assert s.calls["automation_testing"] == 1        # no rework loop on could_not_verify
+    assert s.calls["sit_triage"] == 1        # no rework loop on could_not_verify
     assert s.calls["flip_ready"] == 0
 
 

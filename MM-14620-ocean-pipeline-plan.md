@@ -154,10 +154,11 @@ Jira post) is **plain Python** — no agent.
    testable locally; treat as its own integration task.
 
 ### Phase C — Decompose Station 6 & add the human gate 🟡
-7. ⏸️ **DEFERRED** — Split `automation_testing` into `sit_author` / `sit_run` / `sit_triage` /
-   `open_test_pr` nodes. Deferred on purpose: it rewrites the same Station 6 region as the
-   in-progress `learn_repo` onboarding work (stashed for review), so it lands *after* learn_repo
-   is reviewed/merged to avoid clobbering it.
+7. ✅ **DONE** — Split `automation_testing` into `sit_resolve → sit_run → sit_triage` graph nodes
+   (driving the skill one `--only` phase at a time). Graph branches at the two real decision points:
+   `onboard` after resolve (before authoring/running) and the verdict after triage. Kept the
+   test-automation PR-open inside the report phase (no branch → no separate node). Reconciled with
+   both the `learn_repo` onboard branch and the `human_gate`. 24/24 tests green.
 8. ✅ **DONE** — Optional `human_gate` `interrupt()` before `flip_ready`, env-gated
    (`OCEAN_PIPELINE_REQUIRE_APPROVAL`, default off → auto-flip). `--resume <exe> --approve|--reject`
    injects the decision. Jira lifecycle via best-effort `jira.py` (In Progress at research start;

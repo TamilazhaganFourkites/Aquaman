@@ -289,64 +289,101 @@ async def release_intel(state: OceanState) -> dict:
     return {"release_intel_written": True}
 
 
-# ------------------------------------------------------------------ Station 6 (ocean-automation-testing)
-async def automation_testing(state: OceanState) -> dict:
-    """Drive the ocean-automation-testing skill end-to-end (headless) and read its canonical verdict.
+# ============================ Station 6 — local SIT, decomposed into graph nodes ============================
+# LangGraph owns the Station-6 sequence: sit_resolve -> sit_run -> sit_triage, driving the
+# ocean-automation-testing skill one `--only <phase>` at a time (state flows through the skill's own
+# memory/tickets/<TICKET>-automation-testing.json). The graph branches at the two real decision points:
+# after resolve (onboard an unsupported repo) and after triage (pass / code_fault / could_not_verify).
 
-    The skill owns its internal stations (SKILL.md 0/0.5/1/2/3): resolve the changed repo, gate on
-    the Station-5 APPROVED verdict, author/locate the SIT via ocean-qa-agent, run it local + mock-first
-    (only the changed ocean repo runs locally under its language-scoped build env; the rest mocked),
-    open the test-automation draft PR on pass, and write the verdict to
-    memory/tickets/<TICKET>-automation-testing.json. This node reads that file; the graph branches on it.
-    A Docker/infra bring-up failure is the skill's own could_not_verify (language-scoped Docker rule);
-    a missing verdict file is treated as could_not_verify here as a backstop.
-    """
+# ------------------------------------------------------------------ Station 6a — resolve (+ gate)
+async def sit_resolve(state: OceanState) -> dict:
+    """Resolve the narrowest changed repo + existing SIT (skill Station 0, `--only resolve`). Because
+    the control plane OWNS onboarding, this reports-only on an unsupported repo (needs_onboarding) so
+    the graph can branch to learn_repo BEFORE any authoring/execution. Clears the prior verdict first."""
     tid, exec_id = state["ticket_id"], state["execution_id"]
-    telemetry.station_event(exec_id, 6, "start", coding_attempt=state.get("coding_attempts", 0))
-
+    telemetry.station_event(exec_id, 6.0, "start", coding_attempt=state.get("coding_attempts", 0))
     verdict_path = config.automation_verdict_path(tid)
     verdict_path.parent.mkdir(parents=True, exist_ok=True)
     if verdict_path.exists():
-        verdict_path.unlink()  # avoid reading a stale verdict from a prior loop
-
+        verdict_path.unlink()  # fresh Station-6 attempt (drop a prior loop's verdict)
     await agents.run_skill(
         skill_name="ocean-automation-testing",
-        node="automation_testing",
+        node="sit_resolve",
         ticket_id=tid,
         task_prompt=(
-            f"Run ocean-automation-testing for {tid} HEADLESS (pipeline Station 6), end to end.\n"
-            f"Service PR: #{state.get('pr_number')}. Station 5 harsh-review returned APPROVED "
-            f"(zero CRITICAL/MAJOR) and review comments are addressed — Station 0.5's gate auto-passes; "
-            f"proceed without asking.\n"
-            f"Resolve the NARROWEST changed ocean repo set; author or locate the invariant-compliant SIT "
-            f"(reuse only if it still covers the current diff, else update/author); run ONLY the changed "
-            f"repo locally per its language-scoped build_env (ruby=docker) and mock the rest "
-            f"(ocean_mock_helper + route_local) — never present a native-host Ruby run as passed. Capture "
-            f"per-test pass/fail + failure root cause. Triage failures: test_fault (fix + re-run, capped) "
-            f"vs code_fault (real defect -> findings_for_coder) vs could_not_verify. On PASS, commit the SIT "
-            f"into cloudqwest/test-automation on an {tid}/… branch, open a DRAFT PR (reuse an existing "
-            f"{tid} test-automation PR if one is already open — do not duplicate), and set "
-            f"test_automation_pr_url. Write the verdict object to {verdict_path} exactly per SKILL.md "
-            f"Station 3. Do NOT flip the service PR, merge, or deploy.\n"
-            f"CONTROL-PLANE ONBOARDING (MM-14621): you are running under the Aquaman control plane, which "
-            f"OWNS repo onboarding. If the changed repo is an ocean/isbu service NOT in your supported "
-            f"local set, do NOT self-clone, profile, or commit a learned profile here — instead set "
-            f"needs_onboarding=true and onboard_repo=<repo> in the verdict, set automation_result=failed / "
-            f"failure_class=could_not_verify, and STOP. The graph's learn_repo node will onboard it and "
-            f"re-run you. (Standalone/interactive runs still self-onboard per local_service_execution.md.)"
-            f"\n\n{_summary(state)}"
+            f"Run ocean-automation-testing Station 0 (resolve) ONLY for {tid} (`--only resolve`), "
+            f"HEADLESS. Service PR #{state.get('pr_number')}; Station 5 APPROVED so Station 0.5's gate "
+            f"auto-passes. Resolve the NARROWEST changed ocean repo set, the existing SIT (reuse-aware), "
+            f"the domain bucket, and pr_number; persist them to {verdict_path}.\n"
+            f"CONTROL-PLANE ONBOARDING (MM-14621): the Aquaman control plane OWNS repo onboarding. If the "
+            f"changed repo is an ocean/isbu service NOT in your supported local set, do NOT self-clone, "
+            f"profile, or commit — set needs_onboarding=true + onboard_repo=<repo> in {verdict_path} and "
+            f"STOP. Do NOT author or run the SIT here.\n\n{_summary(state)}"
         ),
     )
+    partial = _load_json(str(verdict_path))
+    needs = bool(partial.get("needs_onboarding"))
+    telemetry.station_event(exec_id, 6.0, "end", needs_onboarding=needs)
+    return {"needs_onboarding": needs, "onboard_repo": partial.get("onboard_repo", "")}
 
+
+# ------------------------------------------------------------------ Station 6b — author + execute
+async def sit_run(state: OceanState) -> dict:
+    """Author/locate the SIT then execute it local + mock-first (skill Stations 1-2). No graph branch
+    sits between resolve and triage, so this is one linear node; it captures per-test results to junit
+    and leaves the verdict to sit_triage."""
+    tid, exec_id = state["ticket_id"], state["execution_id"]
+    telemetry.station_event(exec_id, 6.2, "start")
+    await agents.run_skill(
+        skill_name="ocean-automation-testing",
+        node="sit_run",
+        ticket_id=tid,
+        task_prompt=(
+            f"Run ocean-automation-testing Stations 1-2 for {tid}, HEADLESS. Station 0 (resolve) already "
+            f"ran — its context is in the verdict json; do NOT re-resolve. Station 1: author or locate the "
+            f"invariant-compliant SIT via ocean-qa-agent (reuse only if it still covers the current diff, "
+            f"else update/author). Station 2: EXECUTE it local + mock-first — run ONLY the changed repo "
+            f"locally per its language-scoped build_env (ruby=docker) and mock the rest (ocean_mock_helper "
+            f"+ route_local); never present a native-host Ruby run as passed. Capture per-test pass/fail to "
+            f"reports/junit.xml. Do NOT run Station 3 (report/verdict) — the graph's sit_triage node does "
+            f"that next.\n\n{_summary(state)}"
+        ),
+    )
+    telemetry.station_event(exec_id, 6.2, "end")
+    return {}
+
+
+# ------------------------------------------------------------------ Station 6c — report + triage + verdict
+async def sit_triage(state: OceanState) -> dict:
+    """Parse junit, triage the run, write the canonical verdict, and (on PASS) open the test-automation
+    draft PR (skill Station 3, `--only report`). This node reads that verdict; the graph branches on it.
+    A missing verdict file is treated as could_not_verify as a backstop."""
+    tid, exec_id = state["ticket_id"], state["execution_id"]
+    telemetry.station_event(exec_id, 6.4, "start")
+    verdict_path = config.automation_verdict_path(tid)
+    await agents.run_skill(
+        skill_name="ocean-automation-testing",
+        node="sit_triage",
+        ticket_id=tid,
+        task_prompt=(
+            f"Run ocean-automation-testing Station 3 (report) ONLY for {tid} (`--only report`): parse "
+            f"reports/junit.xml for the authoritative per-test pass/fail; TRIAGE any failure — test_fault "
+            f"(fix + re-run, capped) vs code_fault (real defect -> findings_for_coder) vs could_not_verify. "
+            f"On PASS, commit the SIT into cloudqwest/test-automation on an {tid}/… branch, open a DRAFT PR "
+            f"(reuse an existing {tid} test-automation PR — do not duplicate), and set test_automation_pr_url. "
+            f"Write the verdict object to {verdict_path} exactly per SKILL.md Station 3. Do NOT flip the "
+            f"service PR, merge, or deploy.\n\n{_summary(state)}"
+        ),
+    )
     if not verdict_path.exists():
-        telemetry.station_event(exec_id, 6, "end", automation_result="failed",
+        telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
                                 failure_class="could_not_verify")
         return {"automation_result": "failed", "failure_class": "could_not_verify",
                 "needs_onboarding": False, "sit_report": {}, "sit_findings": [],
                 "final_outcome": "sit skill wrote no verdict"}
 
     v = schemas.AutomationVerdict.model_validate_json(verdict_path.read_text())
-    telemetry.station_event(exec_id, 6, "end", automation_result=v.automation_result,
+    telemetry.station_event(exec_id, 6.4, "end", automation_result=v.automation_result,
                             failure_class=v.failure_class, execution_mode=v.execution_mode,
                             needs_onboarding=v.needs_onboarding)
     return {
@@ -376,7 +413,7 @@ async def learn_repo(state: OceanState) -> dict:
     (`local_service_execution.md` Steps N1-N5) in an explicit, authorized onboarding pass — confirm it's
     an ocean/isbu service, clone it if absent, profile it, and persist+commit the learned profile back
     into the skill references DELIBERATELY (a tracked graph step, not a hidden side effect of a test run).
-    Then it loops back to automation_testing to re-run now that the repo is supported. Capped by
+    Then it loops back to sit_resolve to re-resolve now that the repo is supported. Capped by
     MAX_ONBOARD_ATTEMPTS so a repo that still reports unsupported after profiling ends as could_not_verify.
     """
     repo = state.get("onboard_repo") or ""
