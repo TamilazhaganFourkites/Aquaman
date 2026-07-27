@@ -165,17 +165,18 @@ Jira post) is **plain Python** — no agent.
    In Review + PR-link comment at flip; no-op without `JIRA_API_TOKEN`).
 9. ✅ **DONE** — README corrected (interrupt() + telemetry claims now match reality).
 
-### Phase D — Demo hardening 🔴 (can start in parallel with A)
-10. **`--mock` mode:** run the *real graph* with canned agent outputs from a fixture (productize
-    what `tests/test_graph.py` already does). 60-second, side-effect-free, deterministic demo run.
-11. Record one **golden real run** end-to-end; archive its `run-report.md` + Langfuse trace as a
-    fallback exhibit.
-12. Expand preflight: `gh auth`, Docker daemon, MCP reachability, Langfuse creds — fail fast
-    before a demo, not mid-run.
+### Phase D — Demo hardening ❌ DROPPED (team wants a real flow)
+The team decided to demo a **real end-to-end run**, not a mock/simulated one, so the demo-safety
+scaffolding is not built:
+10. ~~`--mock` mode~~ — not needed; the demo runs the real pipeline.
+11. ~~Golden pre-recorded run as a fallback exhibit~~ — not needed.
+12. ~~Expanded preflight~~ — skipped (optional standalone nicety if ever wanted).
 
-**Sequencing for the demo:** Phases A + D are the minimum for a compelling, safe live demo
-(LangGraph visibly owns the process + git ops, and `--mock` makes it reproducible). B and C deepen
-the "fully LangGraph-controlled" story and can land after the first demo.
+**Consequence to be aware of:** with no mock/golden-run safety net, the demo depends on a real run
+working live. Everything is verified by the mocked control-flow suite (24 tests), but **no real
+end-to-end run has exercised the workers/skill wiring since these changes**. Strongly recommend one
+real rehearsal run (`ocean-pipeline MM-XXXX` on a throwaway ticket) before the demo to shake out
+real-world issues — this is prudent rehearsal, not Phase-D scaffolding.
 
 ---
 
