@@ -154,11 +154,15 @@ Jira post) is **plain Python** — no agent.
    testable locally; treat as its own integration task.
 
 ### Phase C — Decompose Station 6 & add the human gate 🟡
-7. Split `automation_testing` into `sit_author` / `sit_run` / `sit_triage` / `open_test_pr` nodes;
-   the graph owns the triage branch and the code_fault loop.
-8. Add the optional `human_gate` `interrupt()` before `flip_ready` (env-gated); add Jira
-   lifecycle touchpoints (In Progress at start, In Review + PR-link comment at flip).
-9. Update `README.md` — remove the stale "interrupt()" and "telemetry done" claims.
+7. ⏸️ **DEFERRED** — Split `automation_testing` into `sit_author` / `sit_run` / `sit_triage` /
+   `open_test_pr` nodes. Deferred on purpose: it rewrites the same Station 6 region as the
+   in-progress `learn_repo` onboarding work (stashed for review), so it lands *after* learn_repo
+   is reviewed/merged to avoid clobbering it.
+8. ✅ **DONE** — Optional `human_gate` `interrupt()` before `flip_ready`, env-gated
+   (`OCEAN_PIPELINE_REQUIRE_APPROVAL`, default off → auto-flip). `--resume <exe> --approve|--reject`
+   injects the decision. Jira lifecycle via best-effort `jira.py` (In Progress at research start;
+   In Review + PR-link comment at flip; no-op without `JIRA_API_TOKEN`).
+9. ✅ **DONE** — README corrected (interrupt() + telemetry claims now match reality).
 
 ### Phase D — Demo hardening 🔴 (can start in parallel with A)
 10. **`--mock` mode:** run the *real graph* with canned agent outputs from a fixture (productize
