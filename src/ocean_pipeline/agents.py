@@ -44,6 +44,11 @@ class StationError(RuntimeError):
 
 # Operating guardrails handed to every worker. These are SAFETY constraints, not process
 # framing — the graph decides what runs when; the worker only obeys these while doing its one job.
+# NOTE: the language-scoped Docker rule below is a HARD COPY of the canonical rule in
+# fk-aideveloper skills/_shared/ocean-knowledge/ocean-repos.md ("Language-scoped build+test rule").
+# If that canonical rule changes (a repo's language/Docker bucket moves, or a learned repo is added),
+# keep this string, the learn_repo node prompt (nodes.py), and workers/research.md in sync — the
+# ocean-repos.md frozen-contract note spells out this coupling.
 AGENT_GUARDRAILS = """\
 Operating guardrails for ticket {ticket_id}:
 - Never fork cloudqwest repos -- push branches directly to upstream
