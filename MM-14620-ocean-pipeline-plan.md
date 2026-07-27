@@ -140,12 +140,18 @@ Jira post) is **plain Python** — no agent.
    §9.1 crash). (`agents.py`, `graph.py`)
 
 ### Phase B — Vendor the narrow worker agents 🟠
-4. Create `src/ocean_pipeline/agents/*.md` — slim, one-job prompts (§5). Start with `research`,
-   `code`, `review`; migrate one node at a time, each behind a green test run.
-5. **Make SME dispatch a graph node.** Pull SME selection out of research; add a `sme_consult`
-   node that the graph routes to by `domain_bucket`, calling the fk-aideveloper SME agents as
-   *expert lookups*.
-6. Wire `telemetry._call_mcp` to the real aidev-db MCP tools (best-effort, non-blocking).
+4. ✅ **DONE** — Vendored slim, one-job workers into `src/ocean_pipeline/workers/` (`research.md`,
+   `code.md`, `review.md`), derived by trimming. `config.VENDORED_AGENTS_DIR` + `agents._agent_path`
+   resolve them first, falling back to fk-aideveloper for un-migrated nodes. Workers get inputs
+   inline via state, not by reading handoff files.
+   - Also fixed (review): `run_agent` now uses the resolver (was a real FileNotFoundError bug);
+     and the coder's clone is threaded to the reviewer via `worktree_dir` (graph-owned workspace).
+5. ✅ **DONE** — `sme_consult` graph node: research classifies `domain_bucket`; the graph picks the
+   ocean SME (fk-aideveloper `sme-*.md` as referenced expert knowledge) and feeds findings to the
+   coder. No-op when no bucket applies. RCA path skips it.
+6. ⏳ **PENDING** — Wire `telemetry._call_mcp` to the real aidev-db MCP tools (best-effort,
+   non-blocking). Needs the aidev-db endpoint + a Python-side MCP transport + creds — not
+   testable locally; treat as its own integration task.
 
 ### Phase C — Decompose Station 6 & add the human gate 🟡
 7. Split `automation_testing` into `sit_author` / `sit_run` / `sit_triage` / `open_test_pr` nodes;
