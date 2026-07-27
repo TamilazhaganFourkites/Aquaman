@@ -5,7 +5,9 @@ is now deterministic edges:
   - the Station 5 <-> Station 4 review loop (capped at MAX_REVIEW_ITERATIONS),
   - the Station 6 outcomes: PASS -> flip service PR ready; code_fault -> FULL loop
     back through coder -> review -> Station 6 (capped at MAX_CODING_ATTEMPTS);
-    could_not_verify / exhausted budget -> stop (service PR left draft).
+    unsupported ocean repo -> learn_repo (graph-owned onboarding) -> re-run Station 6
+    (capped at MAX_ONBOARD_ATTEMPTS); could_not_verify / exhausted budget -> stop
+    (service PR left draft).
 """
 from __future__ import annotations
 
@@ -50,10 +52,14 @@ def after_automation(state: OceanState) -> str:
     if state.get("automation_result") == "passed":
         return "pass"
     # failed:
+    # Unsupported ocean repo the graph can onboard, then re-run Station 6 (capped).
+    if (state.get("needs_onboarding")
+            and state.get("onboard_attempts", 0) < config.MAX_ONBOARD_ATTEMPTS):
+        return "onboard"
     if (state.get("failure_class") == "code_fault"
             and state.get("coding_attempts", 0) < config.MAX_CODING_ATTEMPTS):
         return "code_fault"        # re-enter the full coder -> review -> SIT loop
-    return "stop"                  # could_not_verify, or code_fault budget exhausted
+    return "stop"                  # could_not_verify, code_fault exhausted, or onboarding exhausted
 
 
 def after_human_gate(state: OceanState) -> str:
@@ -77,6 +83,7 @@ def build_graph():
     g.add_node("graph_augment", nodes.graph_augment)
     g.add_node("release_intel", nodes.release_intel)
     g.add_node("automation_testing", nodes.automation_testing)   # ocean-automation-testing skill, end-to-end
+    g.add_node("learn_repo", nodes.learn_repo)                    # graph-owned onboarding of an unsupported repo
     g.add_node("prep_rework", nodes.prep_rework)
     g.add_node("human_gate", nodes.human_gate)                   # optional approval before ready-flip
     g.add_node("flip_ready", nodes.flip_ready)
@@ -107,12 +114,14 @@ def build_graph():
     # Station 6 outcomes (branch on the skill's verdict). PASS goes through the (optional)
     # human-approval gate before the ready-flip.
     g.add_conditional_edges("automation_testing", after_automation, {
-        "pass": "human_gate",
+        "pass": "human_gate",            # PASS -> optional human-approval gate -> ready-flip
+        "onboard": "learn_repo",         # unsupported repo -> graph onboards it, then re-runs Station 6
         "code_fault": "prep_rework",
         "stop": "stop_run",
     })
     g.add_conditional_edges("human_gate", after_human_gate,
                             {"approve": "flip_ready", "reject": "stop_run"})
+    g.add_edge("learn_repo", "automation_testing")   # re-run Station 6 now that the repo is supported
     g.add_edge("prep_rework", "coder")   # full loop: coder -> review -> (open_pr no-op) -> ... -> SIT
     g.add_edge("flip_ready", END)
     g.add_edge("stop_run", END)

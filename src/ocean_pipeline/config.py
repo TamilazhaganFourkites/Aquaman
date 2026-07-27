@@ -55,6 +55,11 @@ REQUIRE_APPROVAL = os.environ.get("OCEAN_PIPELINE_REQUIRE_APPROVAL", "").lower()
 # (Station 6 code_fault -> fk-coder -> Station 5 re-review -> Station 6).
 MAX_CODING_ATTEMPTS = 2
 
+# How many times the graph will onboard an unsupported ocean repo (learn_repo) and re-run
+# Station 6 before giving up. 1 is enough for the normal case (learn once, re-run once); a
+# repo that still reports unsupported after being profiled is a genuine could_not_verify stop.
+MAX_ONBOARD_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ONBOARD_ATTEMPTS", "1"))
+
 # Claude Agent SDK permission mode. This pipeline runs fully headless — every
 # station shells out (git push, gh pr create/ready, docker, pytest), and "acceptEdits"
 # only auto-approves Edit/Write, NOT Bash, so a non-bypass mode would stall with no

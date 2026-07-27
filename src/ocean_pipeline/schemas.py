@@ -93,3 +93,9 @@ class AutomationVerdict(BaseModel):
     evidence: str = ""
     test_automation_pr_url: str = ""
     findings_for_coder: list = Field(default_factory=list)
+    # Graph-owned onboarding (MM-14621): under the Aquaman control plane the skill does NOT
+    # self-clone/commit an unsupported ocean repo — it reports the gap here and the graph's
+    # learn_repo node owns the decision + persistence. Absent/false on a normal run, so a skill
+    # that never emits these is fully backward-compatible.
+    needs_onboarding: bool = False
+    onboard_repo: str = ""            # the ocean repo the SIT could not run because it is unsupported

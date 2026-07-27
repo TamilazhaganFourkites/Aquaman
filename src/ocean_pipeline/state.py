@@ -72,6 +72,12 @@ class OceanState(TypedDict, total=False):
     test_automation_pr_url: str      # opened by the skill on pass
     sit_findings: list               # findings_for_coder (code_fault -> fk-coder)
 
+    # --- graph-owned repo onboarding (MM-14621): unsupported ocean repo -> learn_repo -> re-run SIT ---
+    needs_onboarding: bool           # Station 6 reported the changed repo is unsupported locally
+    onboard_repo: str                # which repo to learn
+    repo_onboarded: str              # the repo learn_repo profiled+persisted (for telemetry/report)
+    onboard_attempts: int            # capped by MAX_ONBOARD_ATTEMPTS so an un-onboardable repo can't loop
+
     # --- code_fault full-loop budget (shared across coder re-runs) ---
     coding_attempts: int
 

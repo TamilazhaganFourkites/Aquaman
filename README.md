@@ -21,6 +21,7 @@ re-express any station logic.
 | Telemetry START/END + station events | `telemetry.py` → aidev-db HTTP MCP (`Bearer $RCA_TOKEN`), best-effort |
 | AP-223 orphaned `running` rows | SQLite checkpointer → resume, not orphan |
 | Language-scoped Docker (ruby=docker, java/go=native) | carried per-repo in `state["target_repos"]` |
+| Unsupported ocean repo → learn it, don't dead-stop | `learn_repo` node + conditional edge (`MAX_ONBOARD_ATTEMPTS`) |
 
 ## Graph
 
@@ -39,11 +40,21 @@ START → researcher ─┬─(rca)────→ rca_agent ─┬─(no fix)�
    coder ◄──────────┘                                                                      │
                               passed → flip_ready (raise test PR + link it in service ─────┤ → END
                                         PR, gh pr ready)                                    │
+                    ┌── needs_onboarding & onboard_attempts<budget → learn_repo ───────────┤
+                    │       (onboards the unsupported repo, then re-enters automation_testing)
+   automation_testing ◄─────┘                                                              │
                               could_not_verify | budget exhausted → stop_run ──────────────┘ → END
 ```
 `open_pr*` is idempotent — the code_fault loop re-enters it as a no-op since the service PR is already open.
 An RCA that concludes **Fix needed** joins the coding pipeline at `dep_resolver`, so the fix gets the same
 dependency resolution and reachability gating as any coding ticket.
+
+When Station 6 finds the ticket's changed repo is an ocean service it doesn't yet support locally, it does
+**not** self-onboard (that would be a hidden write to the control-plane repo). It reports `needs_onboarding` +
+`onboard_repo` in its verdict and stops; the graph's `learn_repo` node then owns the decision and the
+persistence — it invokes the skill's *learn-a-repo mechanic* (`local_service_execution.md` Steps N1–N5) as an
+authorized onboarding pass (clone → profile → commit the profile), then re-runs `automation_testing`. Capped
+by `MAX_ONBOARD_ATTEMPTS`. Standalone/interactive `/ocean-automation-testing` runs still self-onboard.
 
 Station 6 is a single node driving the `ocean-automation-testing` skill end-to-end (headless). Its internal
 `write → run → pass` stages (the design diagram's boxes) belong to the skill (SKILL.md Stations 0–3), which

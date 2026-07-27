@@ -327,7 +327,14 @@ async def automation_testing(state: OceanState) -> dict:
             f"into cloudqwest/test-automation on an {tid}/… branch, open a DRAFT PR (reuse an existing "
             f"{tid} test-automation PR if one is already open — do not duplicate), and set "
             f"test_automation_pr_url. Write the verdict object to {verdict_path} exactly per SKILL.md "
-            f"Station 3. Do NOT flip the service PR, merge, or deploy.\n\n{_summary(state)}"
+            f"Station 3. Do NOT flip the service PR, merge, or deploy.\n"
+            f"CONTROL-PLANE ONBOARDING (MM-14621): you are running under the Aquaman control plane, which "
+            f"OWNS repo onboarding. If the changed repo is an ocean/isbu service NOT in your supported "
+            f"local set, do NOT self-clone, profile, or commit a learned profile here — instead set "
+            f"needs_onboarding=true and onboard_repo=<repo> in the verdict, set automation_result=failed / "
+            f"failure_class=could_not_verify, and STOP. The graph's learn_repo node will onboard it and "
+            f"re-run you. (Standalone/interactive runs still self-onboard per local_service_execution.md.)"
+            f"\n\n{_summary(state)}"
         ),
     )
 
@@ -335,17 +342,21 @@ async def automation_testing(state: OceanState) -> dict:
         telemetry.station_event(exec_id, 6, "end", automation_result="failed",
                                 failure_class="could_not_verify")
         return {"automation_result": "failed", "failure_class": "could_not_verify",
-                "sit_report": {}, "sit_findings": [], "final_outcome": "sit skill wrote no verdict"}
+                "needs_onboarding": False, "sit_report": {}, "sit_findings": [],
+                "final_outcome": "sit skill wrote no verdict"}
 
     v = schemas.AutomationVerdict.model_validate_json(verdict_path.read_text())
     telemetry.station_event(exec_id, 6, "end", automation_result=v.automation_result,
-                            failure_class=v.failure_class, execution_mode=v.execution_mode)
+                            failure_class=v.failure_class, execution_mode=v.execution_mode,
+                            needs_onboarding=v.needs_onboarding)
     return {
         "automation_result": v.automation_result,
         "failure_class": v.failure_class,
         "execution_mode": v.execution_mode,
         "test_automation_pr_url": v.test_automation_pr_url,
         "sit_findings": v.findings_for_coder,
+        "needs_onboarding": v.needs_onboarding,
+        "onboard_repo": v.onboard_repo,
         "sit_report": {
             "tests": [t.model_dump() for t in v.tests],
             "changed_repo": v.changed_repo.model_dump() if v.changed_repo else None,
@@ -354,6 +365,47 @@ async def automation_testing(state: OceanState) -> dict:
             "testrail_run_id": v.testrail_run_id,
         },
     }
+
+
+# ------------------------------------------------------------------ graph-owned repo onboarding
+async def learn_repo(state: OceanState) -> dict:
+    """Onboard an ocean repo Station 6 reported as unsupported — the CONTROL PLANE owns this.
+
+    Station 6 (headless) is told NOT to self-onboard: when it meets an unknown ocean repo it reports
+    needs_onboarding + onboard_repo and stops. This node then invokes the skill's learn-a-repo MECHANIC
+    (`local_service_execution.md` Steps N1-N5) in an explicit, authorized onboarding pass — confirm it's
+    an ocean/isbu service, clone it if absent, profile it, and persist+commit the learned profile back
+    into the skill references DELIBERATELY (a tracked graph step, not a hidden side effect of a test run).
+    Then it loops back to automation_testing to re-run now that the repo is supported. Capped by
+    MAX_ONBOARD_ATTEMPTS so a repo that still reports unsupported after profiling ends as could_not_verify.
+    """
+    repo = state.get("onboard_repo") or ""
+    attempt = state.get("onboard_attempts", 0) + 1
+    tid, exec_id = state["ticket_id"], state["execution_id"]
+    telemetry.station_event(exec_id, 5.95, "learn_repo_start", onboard_repo=repo, attempt=attempt)
+    await agents.run_skill(
+        skill_name="ocean-automation-testing",
+        node="learn_repo",
+        ticket_id=tid,
+        task_prompt=(
+            f"AUTHORIZED ONBOARDING PASS for the Aquaman control plane — this is NOT a test run.\n"
+            f"Repo to learn: {repo!r} (Station 6 reported it unsupported for {tid}).\n"
+            f"Follow 'Onboarding an unsupported repo (learn a new repo)' in "
+            f"skills/ocean-qa-agent/references/local_service_execution.md (Steps N1-N5): first confirm it "
+            f"is an ocean/isbu service — if it is NOT (a shared/platform lib or another team's repo), do "
+            f"NOT onboard it; write nothing and report it as out-of-scope. Otherwise auto-detect it under "
+            f"~/Documents/projects/ or clone cloudqwest/{repo} if absent, PROFILE it into the standard "
+            f"per-repo local-run anatomy, and WRITE the profile back into local_service_execution.md "
+            f"(+ this skill's Key-ocean-repos list + team-repo-manifest.yml). You ARE authorized to "
+            f"persist+commit the learned profile in the fk-aideveloper checkout (message "
+            f"'{tid}: learn {repo} local-run profile') — the control plane invoked you specifically to "
+            f"onboard. Do NOT run the SIT, open a service PR, or flip anything.\n\n{_summary(state)}"
+        ),
+    )
+    telemetry.station_event(exec_id, 5.95, "learn_repo_end", onboard_repo=repo, attempt=attempt)
+    # Record what was learned and clear the request so the Station 6 re-run starts clean.
+    return {"onboard_attempts": attempt, "repo_onboarded": repo,
+            "needs_onboarding": False, "onboard_repo": ""}
 
 
 # ------------------------------------------------------------------ code_fault rework prep
@@ -416,7 +468,9 @@ async def stop_run(state: OceanState) -> dict:
                 "final_outcome": f"human rejected the ready-flip; service PR "
                                  f"#{state.get('pr_number')} left draft"}
     fc = state.get("failure_class", "")
-    if fc == "code_fault":
+    if state.get("needs_onboarding"):
+        reason = "repo_onboarding_exhausted"   # still unsupported after MAX_ONBOARD_ATTEMPTS
+    elif fc == "code_fault":
         reason = "coding_attempts_exhausted"
     elif fc == "could_not_verify":
         reason = "could_not_verify"
