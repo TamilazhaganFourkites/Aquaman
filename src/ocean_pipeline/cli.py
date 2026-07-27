@@ -56,7 +56,8 @@ def _preflight() -> None:
 
 def _report(execution_id: str, final: dict, total: float) -> None:
     telemetry.execution_end(execution_id, final.get("ticket_id", ""),
-                            final.get("final_status", "failed"), final.get("route", "coding"))
+                            final.get("final_status", "failed"), final.get("route", "coding"),
+                            final_outcome=final.get("final_outcome", ""))
     ui.summary(final, total)
 
 
@@ -107,7 +108,8 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             final, total = await _drive_stream(app, initial, thread)
         _report(execution_id, final, total)
     except Exception as e:  # noqa: BLE001 — never leave a `running` row orphaned (AP-223)
-        telemetry.execution_end(execution_id, ticket_id, "failed", "unknown")
+        telemetry.execution_end(execution_id, ticket_id, "failed", "unknown",
+                                final_outcome=f"{type(e).__name__}: {e}")
         print(f"\n[FAILED] {type(e).__name__}: {e}")
         final = {**final, "final_status": final.get("final_status") or "failed",
                  "final_outcome": final.get("final_outcome") or f"{type(e).__name__}: {e}"}
@@ -121,6 +123,7 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             pass
         if handler is not None:
             tracing.flush()
+        telemetry.flush()   # drain best-effort aidev-db writes so the END row lands before exit
 
 
 async def _run(ticket_id: str, context: str) -> None:

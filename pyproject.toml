@@ -15,6 +15,7 @@ dependencies = [
 test = ["pytest>=8.0"]
 studio = ["langgraph-cli[inmem]>=0.1.55"]   # `langgraph dev` -> LangGraph Studio UI
 langfuse = ["langfuse>=2.53", "langchain>=0.3"]   # self-hosted tracing UI (langfuse.fourkites.com); handler needs langchain
+telemetry = ["mcp>=1.0"]   # aidev-db HTTP MCP client (usually already present via claude-agent-sdk)
 
 [project.scripts]
 ocean-pipeline = "ocean_pipeline.cli:main"
