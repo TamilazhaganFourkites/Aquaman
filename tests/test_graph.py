@@ -21,7 +21,7 @@ import json
 
 import pytest
 
-from ocean_pipeline import agents, config, gitops, graph, schemas
+from ocean_pipeline import agents, config, gitops, graph, jira, schemas
 
 
 class Script:
@@ -281,3 +281,62 @@ def test_run_agent_loads_vendored_worker(tmp_path, monkeypatch):
         task_prompt="go", verdict_model=schemas.ResearchVerdict))
     assert v.route == "coding"
     assert "Not your job" in captured["system_prompt"]  # proves it loaded workers/research.md
+
+
+# ----------------------------------------------------------------- human-approval gate (Phase C)
+def _initial(ticket="MM-1", exe="EXE-test"):
+    return {"ticket_id": ticket, "execution_id": exe, "profile": "isbu", "context": "",
+            "review_iteration": 0, "review_findings": [], "coding_attempts": 0, "sit_findings": []}
+
+
+def test_human_gate_passthrough_when_off(tmp_path, monkeypatch):
+    """Default (approval off): the gate is a no-op and the run auto-flips on green."""
+    monkeypatch.setattr(config, "REQUIRE_APPROVAL", False)
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    final = _run()
+    assert final["final_status"] == "completed"
+    assert s.calls["flip_ready"] == 1
+
+
+def test_human_gate_interrupts_then_resume_approves(tmp_path, monkeypatch):
+    """Approval on: the run pauses at the gate (no flip), then --approve resumes to the flip."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+    monkeypatch.setattr(config, "REQUIRE_APPROVAL", True)
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    app = graph.build_graph().compile(checkpointer=MemorySaver())
+    thread = {"configurable": {"thread_id": "t-approve"}, "recursion_limit": 100}
+    asyncio.run(app.ainvoke(_initial(), config=thread))
+    snap = asyncio.run(app.aget_state(thread))
+    assert snap.next                      # paused at the interrupt
+    assert s.calls["flip_ready"] == 0     # not flipped yet
+    asyncio.run(app.ainvoke(Command(resume="approve"), config=thread))
+    final = asyncio.run(app.aget_state(thread)).values
+    assert final["final_status"] == "completed"
+    assert s.calls["flip_ready"] == 1
+
+
+def test_human_gate_reject_stops(tmp_path, monkeypatch):
+    """Approval on + --reject: the PR is left draft, never flipped."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+    monkeypatch.setattr(config, "REQUIRE_APPROVAL", True)
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    app = graph.build_graph().compile(checkpointer=MemorySaver())
+    thread = {"configurable": {"thread_id": "t-reject"}, "recursion_limit": 100}
+    asyncio.run(app.ainvoke(_initial(), config=thread))
+    asyncio.run(app.ainvoke(Command(resume="reject"), config=thread))
+    final = asyncio.run(app.aget_state(thread)).values
+    assert final["final_status"] == "failed"
+    assert "rejected" in final["final_outcome"]
+    assert s.calls["flip_ready"] == 0
+
+
+def test_jira_noop_without_token(monkeypatch):
+    """Jira lifecycle updates are best-effort: no JIRA_API_TOKEN -> silent no-op, never raises."""
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "")
+    jira.transition("MM-1", "In Progress")   # must not raise or make a request
+    jira.comment("MM-1", "hi")

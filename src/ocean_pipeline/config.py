@@ -46,6 +46,11 @@ RCA_ONLY = os.environ.get("OCEAN_PIPELINE_RCA_ONLY", "").lower() in ("1", "true"
 # Hard cap on the Station 5 <-> Station 4 review loop (CLAUDE.md: max 2 iterations).
 MAX_REVIEW_ITERATIONS = 2
 
+# Optional human-approval gate before the ready-flip. Default OFF (auto-flip on green, the
+# intended terminal action). When ON, the graph interrupt()s and waits for an engineer to
+# resume with an approve/reject decision — the pipeline still never merges or deploys.
+REQUIRE_APPROVAL = os.environ.get("OCEAN_PIPELINE_REQUIRE_APPROVAL", "").lower() in ("1", "true", "yes")
+
 # Shared coding-attempts budget for the code_fault full-loop
 # (Station 6 code_fault -> fk-coder -> Station 5 re-review -> Station 6).
 MAX_CODING_ATTEMPTS = 2

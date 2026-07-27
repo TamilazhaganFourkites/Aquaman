@@ -56,6 +56,11 @@ def after_automation(state: OceanState) -> str:
     return "stop"                  # could_not_verify, or code_fault budget exhausted
 
 
+def after_human_gate(state: OceanState) -> str:
+    # Off (default) or approved -> flip; an explicit reject on resume -> stop (PR left draft).
+    return "reject" if str(state.get("approval_decision", "")).lower().startswith("reject") else "approve"
+
+
 def build_graph():
     g = StateGraph(OceanState)
 
@@ -73,6 +78,7 @@ def build_graph():
     g.add_node("release_intel", nodes.release_intel)
     g.add_node("automation_testing", nodes.automation_testing)   # ocean-automation-testing skill, end-to-end
     g.add_node("prep_rework", nodes.prep_rework)
+    g.add_node("human_gate", nodes.human_gate)                   # optional approval before ready-flip
     g.add_node("flip_ready", nodes.flip_ready)
     g.add_node("stop_run", nodes.stop_run)
 
@@ -98,12 +104,15 @@ def build_graph():
     g.add_edge("graph_augment", "release_intel")
     g.add_edge("release_intel", "automation_testing")
 
-    # Station 6 outcomes (branch on the skill's verdict)
+    # Station 6 outcomes (branch on the skill's verdict). PASS goes through the (optional)
+    # human-approval gate before the ready-flip.
     g.add_conditional_edges("automation_testing", after_automation, {
-        "pass": "flip_ready",
+        "pass": "human_gate",
         "code_fault": "prep_rework",
         "stop": "stop_run",
     })
+    g.add_conditional_edges("human_gate", after_human_gate,
+                            {"approve": "flip_ready", "reject": "stop_run"})
     g.add_edge("prep_rework", "coder")   # full loop: coder -> review -> (open_pr no-op) -> ... -> SIT
     g.add_edge("flip_ready", END)
     g.add_edge("stop_run", END)

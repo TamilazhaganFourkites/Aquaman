@@ -32,6 +32,7 @@ _LABELS = {
     "release_intel":      "Release intelligence",
     "automation_testing": "Local SIT (automation testing)",
     "prep_rework":        "Rework — SIT found a defect",
+    "human_gate":         "Awaiting human approval",
     "flip_ready":         "Flip PR to ready-for-review",
     "stop_run":           "Stopped — needs an engineer",
 }

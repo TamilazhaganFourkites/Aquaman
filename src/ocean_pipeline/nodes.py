@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import agents, config, gitops, schemas, telemetry
+from . import agents, config, gitops, jira, schemas, telemetry
 from .state import OceanState
 
 
@@ -56,6 +56,7 @@ def _service_slug(state: OceanState) -> str:
 # ------------------------------------------------------------------ Station 0
 async def researcher(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0, "start")
+    jira.transition(state["ticket_id"], "In Progress")   # best-effort; no-op without a Jira token
     v: schemas.ResearchVerdict = await agents.run_agent(
         agent_md="research.md",   # vendored slim worker (Phase B); resolves under workers/
         node="researcher",
@@ -365,22 +366,55 @@ async def prep_rework(state: OceanState) -> dict:
     return {"coding_attempts": attempt, "review_iteration": 0, "review_findings": []}
 
 
+# ------------------------------------------------------------------ human approval gate (optional)
+async def human_gate(state: OceanState) -> dict:
+    """Optional human approval before the ready-flip (OCEAN_PIPELINE_REQUIRE_APPROVAL). Default OFF
+    -> pass-through (auto-flip on green). When ON, interrupt() pauses the run until an engineer
+    resumes with a decision (`ocean-pipeline --resume <exe> --approve|--reject`). Either way the
+    pipeline still never merges or deploys — that boundary is unchanged."""
+    if not config.REQUIRE_APPROVAL:
+        return {}
+    from langgraph.types import interrupt
+    decision = interrupt({
+        "action": "flip_service_pr_ready",
+        "ticket_id": state["ticket_id"],
+        "pr_number": state.get("pr_number"),
+        "test_automation_pr_url": state.get("test_automation_pr_url"),
+        "prompt": ("SIT passed. Approve flipping the service PR to ready-for-review? "
+                   "Resume with --approve or --reject."),
+    })
+    return {"approval_decision": str(decision)}
+
+
 # ------------------------------------------------------------------ ready-flip (plain code, on GREEN)
 async def flip_ready(state: OceanState) -> dict:
     """On PASS: cross-link the test-automation PR into the service PR and flip the service PR to
-    ready-for-review — deterministic gh, run by the graph, NOT an agent. This is the intended
-    AUTOMATED terminal action; the human boundary is merge/deploy, which the pipeline never performs."""
+    ready-for-review — deterministic gh, run by the graph, NOT an agent. Also moves the ticket to
+    In Review + posts a PR-link comment (best-effort Jira). This is the intended AUTOMATED terminal
+    action; the human boundary is merge/deploy, which the pipeline never performs."""
     telemetry.station_event(state["execution_id"], 6.5, "start")
     slug, pr = _service_slug(state), state.get("pr_number")
     if slug and pr:
         gitops.cross_link_and_ready(slug, int(pr), state.get("test_automation_pr_url") or "")
+    tid = state["ticket_id"]
+    jira.transition(tid, "In Review")
+    pr_line = f"service PR #{pr}" + (f" · test PR {state['test_automation_pr_url']}"
+                                     if state.get("test_automation_pr_url") else "")
+    jira.comment(tid, f"🤖 Aquaman: SIT passed; {pr_line} flipped to ready-for-review. "
+                      f"Merge/deploy remain with the engineer.")
     telemetry.station_event(state["execution_id"], 6.5, "end", ready_flipped=bool(slug and pr))
     return {"ready_flipped": True, "final_status": "completed",
             "final_outcome": f"sit_passed; service PR #{state.get('pr_number')} ready-for-review"}
 
 
-# ------------------------------------------------------------------ stop (failed / could_not_verify / budget exhausted)
+# ------------------------------------------------------------------ stop (rejected / failed / could_not_verify / budget exhausted)
 async def stop_run(state: OceanState) -> dict:
+    if str(state.get("approval_decision", "")).lower().startswith("reject"):
+        # Human rejected the ready-flip at the approval gate — not a SIT failure.
+        telemetry.station_event(state["execution_id"], 6.5, "stop", reason="rejected_by_engineer")
+        return {"final_status": "failed", "ready_flipped": False,
+                "final_outcome": f"human rejected the ready-flip; service PR "
+                                 f"#{state.get('pr_number')} left draft"}
     fc = state.get("failure_class", "")
     if fc == "code_fault":
         reason = "coding_attempts_exhausted"

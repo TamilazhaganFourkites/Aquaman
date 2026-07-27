@@ -75,7 +75,10 @@ class OceanState(TypedDict, total=False):
     # --- code_fault full-loop budget (shared across coder re-runs) ---
     coding_attempts: int
 
+    # --- optional human-approval gate before ready-flip ---
+    approval_decision: str   # "approve" | "reject" (set on resume); "" when the gate is off
+
     # --- ready-flip / terminal ---
     ready_flipped: bool
-    final_status: str        # completed | failed | rca_report
+    final_status: str        # completed | failed | rca_report | awaiting_approval
     final_outcome: str

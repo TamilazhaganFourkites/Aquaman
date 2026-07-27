@@ -17,8 +17,8 @@ re-express any station logic.
 | Fixed sequence 0 → 1 → 1.5 → 4 → 5 → 6 | linear edges |
 | Router: RCA → stop vs coding → continue | conditional edge (`route_after_research`) |
 | Review loop 5↔4, **max 2 iterations** | conditional edge + `review_iteration` counter |
-| Never auto-merge; engineer owns the ready-flip | `interrupt()` before `gh pr ready` |
-| Telemetry START/END + station events | node hooks in `telemetry.py` |
+| Never auto-merge/deploy; auto-flip to ready on green, with an optional human gate | plain-code `flip_ready`; optional `interrupt()` in `human_gate` (`OCEAN_PIPELINE_REQUIRE_APPROVAL`) |
+| Telemetry START/END + station events | `telemetry.py` → aidev-db HTTP MCP (`Bearer $RCA_TOKEN`), best-effort |
 | AP-223 orphaned `running` rows | SQLite checkpointer → resume, not orphan |
 | Language-scoped Docker (ruby=docker, java/go=native) | carried per-repo in `state["target_repos"]` |
 
@@ -229,7 +229,12 @@ orchestrator's `flip_ready` node.
 
 ## Status
 
-MM-14615: full node/edge topology, checkpointer, telemetry hooks, the Claude Agent SDK
-bridge, the RCA→fix→coder branch, the review loop, and **Station 6 (ocean-automation-testing)
-with the code_fault full-loop** are all in place. The one remaining hook is the aidev-db MCP
-transport in `telemetry.py` (`_call_mcp`), left thin so the transport is swappable.
+MM-14615 / MM-14621: full node/edge topology, checkpointer, the Claude Agent SDK bridge, the
+RCA→fix→coder branch, the review loop, and **Station 6 (ocean-automation-testing) with the
+code_fault full-loop** are in place. MM-14621 made LangGraph the sole control plane — vendored
+slim workers (`workers/research|code|review.md`), graph-owned SME consult, deterministic
+git/PR code nodes, the coder's worktree threaded to the reviewer, an optional human-approval
+gate before the ready-flip, and Jira lifecycle transitions. **Telemetry is wired** to the
+aidev-db HTTP MCP server (`telemetry.py`, best-effort, no-op without `RCA_TOKEN`; transport
+validated live). Remaining: decompose Station 6 into per-step graph nodes (deferred behind the
+`learn_repo` onboarding work).
