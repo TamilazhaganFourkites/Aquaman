@@ -752,3 +752,16 @@ def test_preflight_passes_when_gh_authenticated(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
     cli._preflight()  # must not raise
+
+
+# ----------------------------------------------------------------- telemetry.py _STATUS mapping
+def test_learn_repo_phases_report_correct_status(monkeypatch):
+    """Regression: learn_repo_start/learn_repo_end had no entry in _STATUS, so the fallback
+    silently mapped BOTH to "completed" -- a learn_repo run still in progress (the start event)
+    reported as already done on the aidev-db dashboard."""
+    captured = []
+    monkeypatch.setattr(telemetry, "_dispatch", lambda tool, args: captured.append(args))
+    telemetry.station_event("EXE-x", 5.95, "learn_repo_start", onboard_repo="r", attempt=1)
+    telemetry.station_event("EXE-x", 5.95, "learn_repo_end", onboard_repo="r", attempt=1)
+    assert captured[0]["status"] == "started"
+    assert captured[1]["status"] == "completed"

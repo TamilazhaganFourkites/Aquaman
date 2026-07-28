@@ -47,6 +47,11 @@ _STATION_NAMES = {
 _STATUS = {
     "start": "started", "end": "completed", "stop": "failed", "done": "completed",
     "skip": "skipped", "unsupported_route": "skipped", "code_fault_rework": "started",
+    # learn_repo uses its own start/end phase names (distinct from the generic "start"/"end"
+    # above) rather than sharing them — without an entry here, the fallback below silently
+    # mapped BOTH learn_repo_start and learn_repo_end to "completed", so a learn_repo run still
+    # in progress reported as already done.
+    "learn_repo_start": "started", "learn_repo_end": "completed",
 }
 
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="aidev-telemetry")
