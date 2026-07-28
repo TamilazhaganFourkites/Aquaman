@@ -21,6 +21,7 @@ import json
 import re
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -834,3 +835,182 @@ def test_ui_highlight_shows_dep_resolver_blocking():
         == "BLOCKING: blocked on X"
     assert ui._highlight("dep_resolver", {"dependency_blocking": False,
                                           "dependency_report": {"notes": ""}}) == "no blockers"
+
+
+# ----------------------------------------------------------------- gitops.py real logic
+class _FakeGhProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_find_pr_for_branch_returns_none_when_no_pr(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeGhProc(stdout="[]"))
+    assert gitops.find_pr_for_branch("org/repo", "MM-1/b") is None
+
+
+def test_find_pr_for_branch_returns_existing_number(monkeypatch):
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **kw: _FakeGhProc(stdout='[{"number": 42, "state": "OPEN"}]'))
+    assert gitops.find_pr_for_branch("org/repo", "MM-1/b") == 42
+
+
+def test_open_draft_pr_is_idempotent_reuses_existing(monkeypatch):
+    """If a PR already exists for the branch, open_draft_pr must return it WITHOUT calling
+    `gh pr create` again — the idempotency guard its docstring promises (a rework loop or a
+    re-run must never open a second PR for the same branch)."""
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _FakeGhProc(stdout='[{"number": 7, "state": "OPEN"}]')
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = gitops.open_draft_pr("org/repo", "MM-1/b", "title", "body")
+    assert result == 7
+    assert len(calls) == 1
+    assert "create" not in calls[0]
+
+
+def test_open_draft_pr_creates_when_none_exists(monkeypatch):
+    responses = iter([
+        _FakeGhProc(stdout="[]"),                                # 1st find: no existing PR
+        _FakeGhProc(stdout=""),                                  # gh pr create (stdout unused)
+        _FakeGhProc(stdout='[{"number": 9, "state": "OPEN"}]'),  # 2nd find: the new PR
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: next(responses))
+    assert gitops.open_draft_pr("org/repo", "MM-1/b", "title", "body") == 9
+
+
+def test_open_draft_pr_raises_if_number_unreadable_after_create(monkeypatch):
+    responses = iter([
+        _FakeGhProc(stdout="[]"),
+        _FakeGhProc(stdout=""),
+        _FakeGhProc(stdout="[]"),   # still nothing after create -- real failure
+    ])
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: next(responses))
+    with pytest.raises(gitops.GitOpError, match="could not read its number back"):
+        gitops.open_draft_pr("org/repo", "MM-1/b", "title", "body")
+
+
+def test_cross_link_and_ready_adds_link_when_missing(monkeypatch):
+    calls = []
+    link = "https://github.com/x/test-automation/pull/1"
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _FakeGhProc(stdout="original body") if "view" in cmd else _FakeGhProc(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    gitops.cross_link_and_ready("org/repo", 5, link)
+    edit_calls = [c for c in calls if "edit" in c]
+    assert len(edit_calls) == 1
+    assert any(link in arg for arg in edit_calls[0])
+    assert any("ready" in c for c in calls)
+
+
+def test_cross_link_and_ready_skips_edit_when_link_already_present(monkeypatch):
+    """Idempotent: re-running against a service PR that already carries the link must not
+    append a duplicate."""
+    calls = []
+    link = "https://github.com/x/test-automation/pull/1"
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _FakeGhProc(stdout=f"original body\n{link}") if "view" in cmd else _FakeGhProc(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    gitops.cross_link_and_ready("org/repo", 5, link)
+    assert not any("edit" in c for c in calls)
+    assert any("ready" in c for c in calls)
+
+
+def test_cross_link_and_ready_no_test_pr_url_just_flips_ready(monkeypatch):
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (calls.append(cmd), _FakeGhProc(stdout=""))[1])
+    gitops.cross_link_and_ready("org/repo", 5)
+    assert not any("view" in c for c in calls)
+    assert not any("edit" in c for c in calls)
+    assert any("ready" in c for c in calls)
+
+
+# ----------------------------------------------------------------- jira.py real logic
+class _FakeJiraResponse:
+    def __init__(self, body: str):
+        self._body = body.encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_jira_transition_finds_matching_and_posts(monkeypatch):
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.get_method())
+        if req.get_method() == "GET":
+            return _FakeJiraResponse(json.dumps({"transitions": [
+                {"id": "31", "name": "In Progress"}, {"id": "41", "name": "Done"},
+            ]}))
+        return _FakeJiraResponse("")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    jira.transition("MM-1", "in progress")
+    assert calls == ["GET", "POST"]
+
+
+def test_jira_transition_no_match_skips_post(monkeypatch):
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.get_method())
+        return _FakeJiraResponse(json.dumps({"transitions": [{"id": "1", "name": "Backlog"}]}))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    jira.transition("MM-1", "in progress")
+    assert calls == ["GET"]   # no matching transition -> no POST
+
+
+def test_jira_transition_swallows_errors(monkeypatch):
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+
+    def fake_urlopen(req, timeout=None):
+        raise OSError("network down")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    jira.transition("MM-1", "in progress")  # must not raise
+
+
+def test_jira_comment_posts_body(monkeypatch):
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append((req.get_method(), req.data))
+        return _FakeJiraResponse("")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    jira.comment("MM-1", "hello world")
+    assert len(calls) == 1
+    method, data = calls[0]
+    assert method == "POST"
+    assert json.loads(data.decode())["body"] == "hello world"
+
+
+def test_jira_comment_swallows_errors(monkeypatch):
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+
+    def fake_urlopen(req, timeout=None):
+        raise OSError("network down")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    jira.comment("MM-1", "hello")  # must not raise
