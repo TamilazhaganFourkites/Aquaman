@@ -594,6 +594,27 @@ def test_ac_coverage_passthrough(tmp_path, monkeypatch):
     assert final["sit_report"]["ac_coverage"] == ac_rows
 
 
+def test_release_intel_failure_never_blocks_the_run(tmp_path, monkeypatch):
+    """Regression: release-intel.md's own worker doc says this station must never block the
+    pipeline (best-effort, like graph_augment) -- but release_intel had no try/except at all, so
+    a worker failure after retries would abort the entire run. A failing release_intel must still
+    let the run reach completed, with release_intel_written=False recording the miss."""
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    real_fake_run_agent = agents.run_agent
+
+    async def fake_run_agent_release_intel_fails(**kw):
+        if kw["node"] == "release_intel":
+            raise RuntimeError("release-intel worker crashed")
+        return await real_fake_run_agent(**kw)
+
+    monkeypatch.setattr(agents, "run_agent", fake_run_agent_release_intel_fails)
+    final = _run()
+    assert final["final_status"] == "completed"
+    assert final["ready_flipped"] is True
+    assert final["release_intel_written"] is False
+
+
 # ----------------------------------------------------------------- cli.py resume ticket_id recovery
 def test_resume_recovers_real_ticket_id_from_checkpoint(tmp_path, monkeypatch):
     """Regression: _resume used to hardcode ticket_id="" when calling _execute, even though the
