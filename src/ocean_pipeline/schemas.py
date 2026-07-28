@@ -25,7 +25,11 @@ class ResearchVerdict(BaseModel):
 class SmeVerdict(BaseModel):
     """Ocean domain SME answer: which repo/file/mechanism owns the change + reuse guidance."""
     summary: str = ""
-    findings: list = Field(default_factory=list)
+    # Free-form guidance items — the SME worker prompts don't commit to one shape (a plain string
+    # note, or a {file, note} dict), so this stays a union rather than forcing one and risking a
+    # currently-valid verdict failing validation. Still excludes the clearly-wrong element types
+    # (int/float/bool/None/nested list) bare `list` allowed.
+    findings: list[str | dict] = Field(default_factory=list)
 
 
 class ReachabilityVerdict(BaseModel):
@@ -40,7 +44,10 @@ class RcaVerdict(BaseModel):
     the evidence-cited report is the deliverable and the run ends."""
     report_path: str
     fix_needed: bool = False
-    findings_for_coder: list = Field(default_factory=list)
+    # rca-research.md describes content requirements ("a concrete implementation brief: repo,
+    # file, what to change, why") without committing to one JSON shape — stays a union rather
+    # than risking a currently-valid verdict failing validation on a real production run.
+    findings_for_coder: list[str | dict] = Field(default_factory=list)
 
 
 class CoderVerdict(BaseModel):
@@ -101,7 +108,7 @@ class AutomationVerdict(BaseModel):
     testrail_run_id: int = 0
     evidence: str = ""
     test_automation_pr_url: str = ""
-    findings_for_coder: list = Field(default_factory=list)
+    findings_for_coder: list[dict] = Field(default_factory=list)   # [{test, cause, ...}]
     # Graph-owned onboarding (MM-14621): under the Aquaman control plane the skill does NOT
     # self-clone/commit an unsupported ocean repo — it reports the gap here and the graph's
     # learn_repo node owns the decision + persistence. Absent/false on a normal run, so a skill
@@ -110,4 +117,4 @@ class AutomationVerdict(BaseModel):
     onboard_repo: str = ""            # the ocean repo the SIT could not run because it is unsupported
     # AC traceability (ocean-qa-agent-ac-driven-plan.md): which acceptance criterion each test verifies.
     # Additive + optional — a skill that doesn't emit this yet is fully backward-compatible.
-    ac_coverage: list = Field(default_factory=list)   # [{"ac": "AC3", "test": "test_...", "result": "passed"}]
+    ac_coverage: list[dict] = Field(default_factory=list)   # [{"ac": "AC3", "test": "test_...", "result": "passed"}]

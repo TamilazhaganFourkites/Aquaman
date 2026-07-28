@@ -1014,3 +1014,45 @@ def test_jira_comment_swallows_errors(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     jira.comment("MM-1", "hello")  # must not raise
+
+
+# ----------------------------------------------------------------- findings field typing
+def test_sme_verdict_findings_accepts_str_and_dict():
+    """SmeVerdict.findings used to be a bare `list` (any element type accepted). Confirm the
+    tightened list[str | dict] still accepts both real shapes seen across the codebase (plain
+    string notes and {file, note}-style dicts) while excluding clearly-wrong element types."""
+    v = schemas.SmeVerdict(findings=["reuse helper X", {"file": "x.rb", "note": "extend here"}])
+    assert v.findings[0] == "reuse helper X"
+    assert v.findings[1] == {"file": "x.rb", "note": "extend here"}
+    with pytest.raises(Exception):
+        schemas.SmeVerdict(findings=[123])   # an int is neither a str nor a dict
+
+
+def test_rca_verdict_findings_for_coder_accepts_str_and_dict():
+    v = schemas.RcaVerdict(report_path="/tmp/r.json",
+                           findings_for_coder=["fix X in ocean-worker",
+                                               {"repo": "ocean-worker", "file": "x.rb"}])
+    assert v.findings_for_coder[0] == "fix X in ocean-worker"
+    with pytest.raises(Exception):
+        schemas.RcaVerdict(report_path="/tmp/r.json", findings_for_coder=[None])
+
+
+def test_automation_verdict_findings_for_coder_requires_dicts():
+    """AutomationVerdict mirrors the ocean-automation-testing skill's own established contract
+    (test/cause-shaped dicts) -- unlike the SME/RCA findings fields, this one has unambiguous
+    evidence for a dict-only shape."""
+    v = schemas.AutomationVerdict(ticket_id="MM-1", automation_result="failed",
+                                  findings_for_coder=[{"test": "test_x", "cause": "bug"}])
+    assert v.findings_for_coder[0]["cause"] == "bug"
+    with pytest.raises(Exception):
+        schemas.AutomationVerdict(ticket_id="MM-1", automation_result="failed",
+                                  findings_for_coder=["a bare string, not a dict"])
+
+
+def test_automation_verdict_ac_coverage_requires_dicts():
+    v = schemas.AutomationVerdict(ticket_id="MM-1", automation_result="passed",
+                                  ac_coverage=[{"ac": "AC1", "test": "test_x", "result": "passed"}])
+    assert v.ac_coverage[0]["ac"] == "AC1"
+    with pytest.raises(Exception):
+        schemas.AutomationVerdict(ticket_id="MM-1", automation_result="passed",
+                                  ac_coverage=["AC1 passed"])
