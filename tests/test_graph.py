@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry, ui
+from ocean_pipeline import agents, config, gitops, graph, jira, metrics, nodes, report, schemas, telemetry, tracing, ui
 from ocean_pipeline import cli
 
 
@@ -1136,3 +1137,137 @@ def test_sit_resolve_prompt_includes_pr_number_when_set(tmp_path, monkeypatch):
     asyncio.run(nodes.sit_resolve({"ticket_id": "MM-1", "execution_id": "EXE-x", "pr_number": 42}))
     assert "Service PR #42" in captured["task_prompt"]
     assert "No PR number given" not in captured["task_prompt"]
+
+
+# ----------------------------------------------------------------- metrics.py (previously untested)
+def test_metrics_add_accumulates_across_calls():
+    metrics.reset()
+    metrics.add(input_tokens=100, output_tokens=50, tools=2)
+    metrics.add(input_tokens=200, output_tokens=25, tools=1)
+    t = metrics.totals()
+    assert t == {"input": 300, "output": 75, "tools": 3, "stations": 2}
+
+
+def test_metrics_reset_clears_all_fields():
+    metrics.add(input_tokens=999, output_tokens=999, tools=99)
+    metrics.reset()
+    assert metrics.totals() == {"input": 0, "output": 0, "tools": 0, "stations": 0}
+
+
+def test_metrics_fmt_formats_tokens_and_tool_calls():
+    assert metrics.fmt(500, 500, 3) == "1k tokens · 3 tool calls"
+    assert metrics.fmt(52000, 3000, 12) == "55k tokens · 12 tool calls"
+
+
+def test_metrics_fmt_omits_empty_parts():
+    assert metrics.fmt(0, 0, 0) == ""
+    assert metrics.fmt(100, 0, 0) == "100 tokens"
+    assert metrics.fmt(0, 0, 5) == "5 tool calls"
+
+
+# ----------------------------------------------------------------- tracing.py (previously untested)
+def _clear_langfuse_env(monkeypatch):
+    for k in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL", "LANGFUSE_HOST"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_load_fk_secrets_sets_env_without_overriding_existing(tmp_path, monkeypatch):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text(
+        "# a comment\n\nLANGFUSE_PUBLIC_KEY=pk-from-file\nLANGFUSE_SECRET_KEY='sk-from-file'\n"
+    )
+    monkeypatch.setattr(tracing, "_FK_SECRETS", secrets)
+    _clear_langfuse_env(monkeypatch)
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-already-set")  # must NOT be overridden
+
+    tracing._load_fk_secrets()
+    assert os.environ["LANGFUSE_PUBLIC_KEY"] == "pk-from-file"
+    assert os.environ["LANGFUSE_SECRET_KEY"] == "sk-already-set"  # setdefault, not overwrite
+
+
+def test_load_fk_secrets_noop_when_file_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(tracing, "_FK_SECRETS", tmp_path / "does-not-exist.env")
+    _clear_langfuse_env(monkeypatch)
+    tracing._load_fk_secrets()  # must not raise
+    assert "LANGFUSE_PUBLIC_KEY" not in os.environ
+
+
+def test_ensure_host_bridges_base_url_to_host(monkeypatch):
+    _clear_langfuse_env(monkeypatch)
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "https://custom.example.com")
+    tracing._ensure_host()
+    assert os.environ["LANGFUSE_HOST"] == "https://custom.example.com"
+
+
+def test_ensure_host_defaults_when_nothing_set(monkeypatch):
+    _clear_langfuse_env(monkeypatch)
+    tracing._ensure_host()
+    assert os.environ["LANGFUSE_HOST"] == "https://langfuse.fourkites.com"
+
+
+def test_host_returns_configured_value(monkeypatch):
+    _clear_langfuse_env(monkeypatch)
+    assert tracing.host() == "https://langfuse.fourkites.com"
+
+
+def test_callback_handler_none_without_credentials(monkeypatch):
+    monkeypatch.setattr(tracing, "_FK_SECRETS", Path("/nonexistent/does-not-exist.env"))
+    _clear_langfuse_env(monkeypatch)
+    assert tracing.callback_handler() is None
+
+
+def test_flush_swallows_errors(monkeypatch):
+    """flush() must never raise, even when langfuse isn't installed/configured (the common
+    dev/test case) -- best-effort, exactly like telemetry."""
+    tracing.flush()  # must not raise
+
+
+# ----------------------------------------------------------------- report.py (previously untested)
+def test_report_finish_returns_none_when_never_started():
+    report._meta.clear()
+    report._rows.clear()
+    assert report.finish({"final_status": "completed"}, Path("/tmp/unused")) is None
+
+
+def test_report_full_flow_writes_json_and_markdown(tmp_path, monkeypatch):
+    metrics.reset()
+    metrics.add(input_tokens=1000, output_tokens=500, tools=4)
+    report.start("MM-1", "EXE-report-test")
+    report.record("researcher", 12.3, {"route": "coding"})
+    report.record("coder", 45.6, {"branch": "MM-1/fix", "files_changed": 2})
+
+    final = {"final_status": "completed", "final_outcome": "sit_passed; PR ready",
+             "pr_number": 42, "ready_flipped": True,
+             "test_automation_pr_url": "https://github.com/x/test-automation/pull/9"}
+    md_path = report.finish(final, tmp_path)
+
+    assert md_path == tmp_path / "run-report.md"
+    doc = json.loads((tmp_path / "run-report.json").read_text())
+    assert doc["ticket"] == "MM-1"
+    assert doc["execution_id"] == "EXE-report-test"
+    assert doc["final_status"] == "completed"
+    assert doc["pr_number"] == 42
+    assert doc["usage"] == {"input_tokens": 1000, "output_tokens": 500,
+                            "tool_calls": 4, "station_runs": 1}
+    assert len(doc["timeline"]) == 2
+    assert doc["timeline"][0]["node"] == "researcher"
+
+    md = md_path.read_text()
+    assert "**Ticket:** MM-1" in md
+    assert "**Result:** COMPLETED" in md
+    assert "**Service PR:** #42 (ready-for-review)" in md
+    assert "Test-automation PR:" in md
+    assert "researcher" in md and "coder" in md
+
+
+def test_report_markdown_pr_number_without_ready_flip_shows_draft():
+    doc = {
+        "ticket": "MM-2", "execution_id": "EXE-x", "started": "2026-01-01 00:00:00",
+        "finished": "2026-01-01 00:01:00", "duration_seconds": 60.0,
+        "final_status": "failed", "final_outcome": "",
+        "pr_number": 7, "test_automation_pr_url": "", "ready_flipped": False,
+        "usage": {"input_tokens": 0, "output_tokens": 0, "tool_calls": 0, "station_runs": 0},
+        "timeline": [],
+    }
+    md = report._markdown(doc)
+    assert "**Service PR:** #7 (draft)" in md
