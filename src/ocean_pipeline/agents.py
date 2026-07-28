@@ -113,6 +113,20 @@ def _frontmatter_tools(path: Path) -> list[str] | None:
     return tools if isinstance(tools, list) else None
 
 
+def _ensure_verdict_tool_allowed(allowed: list[str] | None) -> list[str] | None:
+    """run_agent's own VERDICT_INSTRUCTION contract mandates every worker write its verdict file
+    with the Write tool, regardless of what that worker's own tools: frontmatter declares — the
+    worker file was authored before this harness-level contract existed, so it can't have opted
+    into naming Write. Without this, any worker whose frontmatter omits Write (e.g. every
+    agents/pipeline/sme-*.md file, which lists only read/query tools) would have its own
+    mandatory verdict write denied by _deny_outside_allowlist, making run_agent unusable for it.
+    None (no declared allowlist -> no restriction) passes through unchanged; every other
+    restriction the file DID declare is preserved — only Write is guaranteed on top."""
+    if allowed is None:
+        return None
+    return allowed if "Write" in allowed else [*allowed, "Write"]
+
+
 def _deny_outside_allowlist(allowed: list[str]):
     """A PreToolUse hook that denies any tool call not in `allowed`.
 
@@ -364,7 +378,7 @@ async def run_agent(
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
             permission_mode=permission_mode or config.STATION_PERMISSION_MODE,
             label=node,
-            allowed_tools=_frontmatter_tools(path),
+            allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(node, agent_md, f"agent run failed: {type(e).__name__}: {e}") from e

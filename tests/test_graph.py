@@ -371,6 +371,48 @@ def test_run_agent_loads_vendored_worker(tmp_path, monkeypatch):
     assert "Not your job" in captured["system_prompt"]  # proves it loaded workers/research.md
 
 
+def test_ensure_verdict_tool_allowed():
+    """Pure unit test of the Write-tool union: run_agent's VERDICT_INSTRUCTION contract always
+    requires Write, regardless of what a worker's own tools: frontmatter declares."""
+    assert agents._ensure_verdict_tool_allowed(None) is None
+    assert agents._ensure_verdict_tool_allowed(["Read", "Bash"]) == ["Read", "Bash", "Write"]
+    assert agents._ensure_verdict_tool_allowed(["Read", "Write"]) == ["Read", "Write"]
+
+
+def test_run_agent_allows_write_for_a_write_less_sme_file(tmp_path, monkeypatch):
+    """Regression for the PreToolUse allowlist bug: a worker file (like every real
+    agents/pipeline/sme-*.md) that declares tools: without Write must still be able to satisfy
+    run_agent's own mandatory verdict-write contract. Captures the allowed_tools run_agent
+    actually passes down to _drive_with_retry (the layer the fix operates at) rather than
+    mocking it away, so a regression that re-narrows the allowlist would be caught here."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    sme_dir = tmp_path / "agents_pipeline"
+    sme_dir.mkdir()
+    sme_file = sme_dir / "sme-no-write.md"
+    sme_file.write_text(
+        '---\nname: sme-no-write\ntools: ["Read", "Grep", "Glob", "Bash"]\n---\n\n# SME\n'
+    )
+    monkeypatch.setattr(agents, "_agent_path", lambda agent_md: sme_file)
+    captured: dict = {}
+
+    async def fake_drive(**kw):
+        captured["allowed_tools"] = kw["allowed_tools"]
+        (config.artifacts_dir("EXE-y") / "sme_consult.verdict.json").write_text(
+            json.dumps({"findings": []}))
+
+    monkeypatch.setattr(agents, "_drive_with_retry", fake_drive)
+    asyncio.run(agents.run_agent(
+        agent_md="sme-no-write.md", node="sme_consult", ticket_id="MM-1", execution_id="EXE-y",
+        task_prompt="go", verdict_model=schemas.SmeVerdict))
+    assert "Write" in captured["allowed_tools"], (
+        "run_agent must guarantee Write is allowed even when the worker's own frontmatter omits "
+        "it, since VERDICT_INSTRUCTION always requires writing the verdict file"
+    )
+    assert set(captured["allowed_tools"]) == {"Read", "Grep", "Glob", "Bash", "Write"}, (
+        "the file's OTHER declared restrictions must still be preserved — only Write is added"
+    )
+
+
 # ----------------------------------------------------------------- human-approval gate (Phase C)
 def _initial(ticket="MM-1", exe="EXE-test"):
     return {"ticket_id": ticket, "execution_id": exe, "profile": "isbu", "context": "",
