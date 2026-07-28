@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -50,6 +51,20 @@ def _preflight() -> None:
         problems.append(f"station agents dir not found: {config.AGENTS_DIR}")
     if shutil.which("claude") is None:
         problems.append("`claude` CLI not on PATH — the Claude Agent SDK spawns it (install Claude Code)")
+    # gitops.py's own docstring says "the caller is responsible for `gh auth` (preflight checks
+    # it)" — this is that check. Without it, a missing/unauthenticated `gh` surfaces as a raw
+    # GitOpError deep inside open_pr/flip_ready instead of a clean upfront message.
+    if shutil.which("gh") is None:
+        problems.append("`gh` CLI not on PATH — gitops.py shells out to it for PR create/list/ready")
+    else:
+        try:
+            proc = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True,
+                                  timeout=config.GH_TIMEOUT_SECONDS)
+            if proc.returncode != 0:
+                problems.append(f"`gh auth status` failed — run `gh auth login`: "
+                                 f"{proc.stderr.strip() or proc.stdout.strip()}")
+        except subprocess.TimeoutExpired:
+            problems.append(f"`gh auth status` timed out after {config.GH_TIMEOUT_SECONDS}s")
     if problems:
         raise SystemExit("preflight failed:\n  - " + "\n  - ".join(problems))
 

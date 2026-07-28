@@ -21,6 +21,7 @@ import json
 
 import pytest
 
+import shutil
 import subprocess
 
 from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry
@@ -684,3 +685,49 @@ def test_gh_still_raises_on_nonzero_exit(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
     with pytest.raises(gitops.GitOpError, match="not found"):
         gitops._gh(["pr", "list"])
+
+
+# ----------------------------------------------------------------- cli.py _preflight gh check
+def _preflight_ready_dirs(tmp_path, monkeypatch):
+    """Make the non-gh preflight checks pass so a test can isolate the gh-specific behavior."""
+    agents_dir = tmp_path / "fk-aideveloper" / "agents" / "pipeline"
+    agents_dir.mkdir(parents=True)
+    monkeypatch.setattr(config, "FK_AIDEVELOPER_DIR", tmp_path / "fk-aideveloper")
+    monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
+
+
+def test_preflight_fails_when_gh_missing(tmp_path, monkeypatch):
+    """gitops.py's own docstring says preflight checks `gh auth` — this is that check. Regression:
+    _preflight previously never looked for `gh` at all, so a missing/unauthenticated `gh` surfaced
+    as a raw GitOpError deep inside open_pr/flip_ready instead of a clean upfront message."""
+    _preflight_ready_dirs(tmp_path, monkeypatch)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+    with pytest.raises(SystemExit, match="gh.*not on PATH"):
+        cli._preflight()
+
+
+def test_preflight_fails_when_gh_not_authenticated(tmp_path, monkeypatch):
+    _preflight_ready_dirs(tmp_path, monkeypatch)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "You are not logged into any GitHub hosts"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    with pytest.raises(SystemExit, match="gh auth login"):
+        cli._preflight()
+
+
+def test_preflight_passes_when_gh_authenticated(tmp_path, monkeypatch):
+    _preflight_ready_dirs(tmp_path, monkeypatch)
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    class FakeProc:
+        returncode = 0
+        stdout = "Logged in to github.com"
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    cli._preflight()  # must not raise
