@@ -115,3 +115,43 @@ def test_run_one_forces_qa_review_auto_even_when_caller_left_it_off(tmp_path, mo
     result = asyncio.run(qa_batch.run_one("MM-9"))
     assert result["final_status"] == "completed"
     assert config.QA_REVIEW_AUTO is True   # run_one must have set it back
+
+
+def test_run_one_catches_a_crash_and_returns_a_failed_result(tmp_path, monkeypatch):
+    """The module docstring's own stated guarantee -- 'a crash just fails that ticket and the
+    batch moves on' -- was never directly tested; only the clean-completion paths were. Force
+    the subgraph itself to raise (not just a node returning a failed verdict) and confirm run_one
+    catches it, still returns ticket_id/execution_id, and doesn't propagate."""
+    s = Script(sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+
+    async def fake_run_skill_that_crashes(**kw):
+        raise RuntimeError("simulated ocean-automation-testing crash")
+
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill_that_crashes)
+    result = asyncio.run(qa_batch.run_one("MM-10"))
+    assert result["ticket_id"] == "MM-10"
+    assert "execution_id" in result
+    assert result["final_status"] == "failed"
+    assert "RuntimeError" in result["final_outcome"]
+    assert "simulated ocean-automation-testing crash" in result["final_outcome"]
+
+
+def test_run_batch_continues_after_one_ticket_crashes(tmp_path, monkeypatch):
+    """The batch-level guarantee: one ticket's crash must not stop the rest, and the summary must
+    still include every ticket's result (crashed or not)."""
+    s = Script(sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    real_fake_run_skill = agents.run_skill
+
+    async def fake_run_skill_crashes_for_one_ticket(**kw):
+        if kw["ticket_id"] == "MM-CRASH":
+            raise RuntimeError("boom")
+        return await real_fake_run_skill(**kw)
+
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill_crashes_for_one_ticket)
+    results = asyncio.run(qa_batch.run_batch(["MM-CRASH", "MM-OK"]))
+    assert [r["ticket_id"] for r in results] == ["MM-CRASH", "MM-OK"]
+    assert results[0]["final_status"] == "failed"
+    assert "boom" in results[0]["final_outcome"]
+    assert results[1]["final_status"] == "completed"
