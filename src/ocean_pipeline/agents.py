@@ -87,30 +87,62 @@ def _agent_path(agent_md: str) -> Path:
     return vendored if vendored.exists() else config.AGENTS_DIR / agent_md
 
 
-_FRONTMATTER_TOOLS_RE = re.compile(r'^tools:\s*(\[.*\])\s*$', re.MULTILINE)
+_FRONTMATTER_TOOLS_INLINE_RE = re.compile(r'^tools:\s*(\[.*\])\s*$', re.MULTILINE)
+# Any `tools:` key line, inline-array or bare (block-list follows on subsequent lines) — used to
+# detect "a tools: key exists but couldn't be parsed" so that case fails loudly instead of being
+# silently treated the same as "no tools: key at all" (see _frontmatter_tools' docstring).
+_FRONTMATTER_TOOLS_KEY_RE = re.compile(r'^tools:.*$', re.MULTILINE)
+_FRONTMATTER_BLOCK_ITEM_RE = re.compile(r'^\s*-\s*(.+?)\s*$')
 
 
 def _frontmatter_tools(path: Path) -> list[str] | None:
-    """Extract the `tools: [...]` allowlist from a worker/skill file's YAML frontmatter, if it
-    declares one (e.g. fk-coder.md's `tools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]`).
+    """Extract the `tools:` allowlist from a worker/skill file's YAML frontmatter, if it declares
+    one. Supports both styles: inline JSON-array (`tools: ["Read", "Write"]`, used by every real
+    fk-aideveloper station/SME file today) and YAML block-list (`tools:\\n  - Read\\n  - Write`).
 
-    Returns None when the file has no frontmatter or no `tools:` field — the vendored
+    Returns None when the file has no frontmatter or no `tools:` field at all — the vendored
     workers/*.md files in this repo don't declare one today, and callers MUST treat that as
-    "no restriction", never as an empty allowlist, or every tool call would be denied."""
+    "no restriction", never as an empty allowlist, or every tool call would be denied.
+
+    Raises ValueError when a `tools:` key IS present but neither style parses it — e.g. a
+    single-line regex that silently returned None here for an unrecognized style would make a
+    file LOOK unrestricted while its author believed it was scoped, which is worse than a loud
+    failure. run_agent/run_skill's callers already wrap this in a try/except that normalizes any
+    exception to a StationError, so this surfaces as a clear per-node failure, not a crash."""
     text = _read(path)
     if not text.startswith("---"):
         return None
     end = text.find("\n---", 3)
     if end == -1:
         return None
-    m = _FRONTMATTER_TOOLS_RE.search(text[:end])
-    if not m:
-        return None
-    try:
-        tools = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
-    return tools if isinstance(tools, list) else None
+    front = text[:end]
+
+    inline = _FRONTMATTER_TOOLS_INLINE_RE.search(front)
+    if inline:
+        try:
+            tools = json.loads(inline.group(1))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path}: tools: frontmatter is not valid JSON: {inline.group(1)!r} ({e})")
+        if not isinstance(tools, list):
+            raise ValueError(f"{path}: tools: frontmatter must be a JSON array, got {tools!r}")
+        return tools
+
+    key = _FRONTMATTER_TOOLS_KEY_RE.search(front)
+    if key:
+        items = []
+        for line in front[key.end():].splitlines():
+            if not line.strip():
+                continue
+            item = _FRONTMATTER_BLOCK_ITEM_RE.match(line)
+            if not item:
+                break  # left the block-list (a non-'-' line ends it)
+            items.append(item.group(1).strip("\"'"))
+        if not items:
+            raise ValueError(f"{path}: found a tools: key but could not parse it as an inline "
+                             f"JSON array or a YAML block-list")
+        return items
+
+    return None  # no tools: key at all -> no restriction, by design
 
 
 def _ensure_verdict_tool_allowed(allowed: list[str] | None) -> list[str] | None:

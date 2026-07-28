@@ -765,3 +765,35 @@ def test_learn_repo_phases_report_correct_status(monkeypatch):
     telemetry.station_event("EXE-x", 5.95, "learn_repo_end", onboard_repo="r", attempt=1)
     assert captured[0]["status"] == "started"
     assert captured[1]["status"] == "completed"
+
+
+# ----------------------------------------------------------------- agents.py _frontmatter_tools
+def test_frontmatter_tools_parses_inline_json_array(tmp_path):
+    p = tmp_path / "w.md"
+    p.write_text('---\nname: x\ntools: ["Read", "Write", "Bash"]\n---\n\n# X\n')
+    assert agents._frontmatter_tools(p) == ["Read", "Write", "Bash"]
+
+
+def test_frontmatter_tools_parses_yaml_block_list(tmp_path):
+    """Regression: the parser used to ONLY match single-line tools: [...] syntax. A file using
+    standard multi-line YAML block-list style would silently return None (no restriction) with
+    nothing catching the regression. Must now parse this style directly."""
+    p = tmp_path / "w.md"
+    p.write_text("---\nname: x\ntools:\n  - Read\n  - Write\n  - Bash\n---\n\n# X\n")
+    assert agents._frontmatter_tools(p) == ["Read", "Write", "Bash"]
+
+
+def test_frontmatter_tools_raises_on_unparseable_tools_key(tmp_path):
+    """A tools: key that exists but parses as neither style must fail loudly, not silently return
+    None (which would make the file LOOK unrestricted while its author believed it was scoped)."""
+    p = tmp_path / "w.md"
+    p.write_text("---\nname: x\ntools: not_a_list_or_json\n---\n\n# X\n")
+    with pytest.raises(ValueError, match="tools:"):
+        agents._frontmatter_tools(p)
+
+
+def test_frontmatter_tools_returns_none_when_no_tools_key(tmp_path):
+    """No tools: key at all is the legitimate "no restriction" case — must stay None, not raise."""
+    p = tmp_path / "w.md"
+    p.write_text("---\nname: x\ndescription: something\n---\n\n# X\n")
+    assert agents._frontmatter_tools(p) is None
