@@ -90,8 +90,8 @@ units** — each a single coherent, independently-committable change small enoug
 ## Output
 
 Commit and **push** the ticket branch, then write your verdict to the path the orchestrator gives
-you (schema appended below): `branch`, `pushed_sha`, `files_changed`, the `repo` you pushed to
-(`owner/name`), and a proposed `pr_title` + `pr_body` — the graph opens the PR itself using these.
+you (schema appended below): `branch`, `files_changed`, the `repo` you pushed to (`owner/name`),
+and a proposed `pr_title` + `pr_body` — the graph opens the PR itself using these.
 
 ## Not your job (the graph owns this)
 

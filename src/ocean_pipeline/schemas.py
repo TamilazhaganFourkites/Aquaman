@@ -53,7 +53,6 @@ class RcaVerdict(BaseModel):
 
 class CoderVerdict(BaseModel):
     branch: str
-    pushed_sha: str
     files_changed: int = 0
     # The graph opens the PR itself (deterministic code), so the coder only reports WHICH repo
     # it pushed to and the human-readable title/body to use — it never runs `gh pr create`.
@@ -61,15 +60,6 @@ class CoderVerdict(BaseModel):
     repo_dir: str = ""        # absolute path of the local clone (reviewer + rework run here)
     pr_title: str = ""        # PR title the open_pr code node will use
     pr_body: str = ""         # PR body the open_pr code node will use
-
-
-class NoOutputVerdict(BaseModel):
-    """For a best-effort node whose real output is a side effect this schema doesn't model
-    (a PR-description edit, a Jira field update) — the verdict file only exists to satisfy
-    run_agent's write-and-read-back contract, confirming the worker ran to completion. No
-    fields are required, so the worker never has to fabricate a placeholder value (unlike
-    reusing CoderVerdict, whose branch/pushed_sha have no defaults) to pass validation."""
-    note: str = ""
 
 
 class ReviewVerdict(BaseModel):

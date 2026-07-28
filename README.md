@@ -34,10 +34,9 @@ START → researcher ─┬─(rca)────→ rca_agent → rca_review_gate
                                                                                                      │       │
                                                                                               harsh_reviewer  │
                                                           ┌──(CHANGES_REQUIRED & review_iter<2)───────────────┘
-                                                          └──(APPROVE | review_iter≥2)→ open_pr* → graph_augment
-                                                                → automation_testing
-                                                                                          │
-                    ┌── code_fault & coding_attempts<budget → prep_rework ────────────────┤
+                                                          └──(APPROVE | review_iter≥2)→ open_pr* → automation_testing
+                                                                                           │
+                    ┌── code_fault & coding_attempts<budget → prep_rework ─────────────────┤
                     │                                                                      │
    coder ◄──────────┘                                                                      │
                               passed → flip_ready (raise test PR + link it in service ─────┤ → END

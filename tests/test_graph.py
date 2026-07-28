@@ -80,15 +80,14 @@ def _install(script: Script, tmp_path, monkeypatch):
         if node.startswith("dep_resolver") or node.startswith("reachability_gate"):
             return schemas.ReachabilityVerdict(report_path=nowhere)
         if node.startswith("coder"):
-            return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b", pushed_sha="deadbeef",
+            return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b",
                                         repo="cloudqwest/ocean-worker", repo_dir="/tmp/ws/ocean-worker",
                                         pr_title="t", pr_body="b")
         if node.startswith("harsh_reviewer"):
             v = script.next_review()
             findings = [{"severity": "MAJOR", "file": "f.rb", "summary": "x"}] if v == "CHANGES_REQUIRED" else []
             return schemas.ReviewVerdict(verdict=v, findings=findings)
-        # graph_augment
-        return schemas.NoOutputVerdict()
+        raise AssertionError(f"fake_run_agent has no mock branch for node {node!r}")
 
     # Git/PR ops are now plain code (gitops), not agent calls — stub them and count the calls
     # under the same keys the tests already assert on (open_pr / flip_ready).
@@ -401,8 +400,7 @@ def test_vendored_workers_resolve():
     fallback; only the ocean SME agents still fall back (referenced domain knowledge). Guards the
     control-plane decoupling — no graph node should load a heavy fk-aideveloper station file."""
     for name in ("research.md", "code.md", "review.md",           # Phase B
-                 "dep-resolve.md", "reachability.md", "rca-research.md",   # Workstream B
-                 "graph-augment.md"):
+                 "dep-resolve.md", "reachability.md", "rca-research.md"):   # Workstream B
         p = agents._agent_path(name)
         assert p == config.VENDORED_AGENTS_DIR / name and p.exists(), f"{name} not vendored"
         assert "Not your job" in p.read_text(), f"{name} missing the process-ownership boundary"
@@ -874,15 +872,6 @@ def test_frontmatter_tools_returns_none_when_no_tools_key(tmp_path):
     p = tmp_path / "w.md"
     p.write_text("---\nname: x\ndescription: something\n---\n\n# X\n")
     assert agents._frontmatter_tools(p) is None
-
-
-def test_no_output_verdict_requires_no_fields():
-    """The whole point of NoOutputVerdict: graph_augment used to reuse CoderVerdict (whose
-    branch/pushed_sha are required, no defaults) for an output neither field means anything for,
-    forcing the worker to fabricate placeholder values just to pass validation. Confirm the
-    replacement genuinely has zero required fields."""
-    schemas.NoOutputVerdict()  # must not raise a pydantic ValidationError
-    assert schemas.NoOutputVerdict(note="skipped: code graph unreachable").note.startswith("skipped")
 
 
 # ----------------------------------------------------------------- dep_resolver blocking parity

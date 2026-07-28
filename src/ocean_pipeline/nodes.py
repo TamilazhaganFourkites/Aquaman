@@ -241,7 +241,7 @@ async def coder(state: OceanState) -> dict:
     # Persist WHICH repo the coder pushed to + WHERE the clone lives + the PR title/body it
     # proposed, so the reviewer/rework run in the same tree and open_pr opens deterministically
     # (preserve prior values if a rework pass leaves them blank).
-    return {"branch": v.branch, "pushed_sha": v.pushed_sha,
+    return {"branch": v.branch,
             "files_changed": v.files_changed, "sit_findings": [],
             "service_repo": v.repo or state.get("service_repo", ""),
             "worktree_dir": v.repo_dir or state.get("worktree_dir", ""),
@@ -292,31 +292,15 @@ async def open_pr(state: OceanState) -> dict:
             f"must report `repo` and `branch`, or provide a single target repo."
         )
     title = state.get("pr_title") or f"{state['ticket_id']}: automated pipeline change"
-    body = state.get("pr_body") or f"Automated change for {state['ticket_id']} (FK Ocean pipeline)."
+    body_text = state.get("pr_body") or f"Automated change for {state['ticket_id']} (FK Ocean pipeline)."
+    # FourKites org policy: every PR body must start with `Ticket: <TICKET-ID>` on its own line.
+    # Enforced here (not left to the coder's free-text pr_body) so it's guaranteed regardless of
+    # what the coder proposed or whether the fallback text above fired.
+    ticket_line = f"Ticket: {state['ticket_id']}"
+    body = body_text if body_text.startswith(ticket_line) else f"{ticket_line}\n\n{body_text}"
     pr_number = gitops.open_draft_pr(slug, branch, title, body)
     telemetry.station_event(state["execution_id"], 3.87, "end", pr_number=pr_number)
     return {"pr_number": pr_number}
-
-
-# ------------------------------------------------------------------ 4.5b graph augment (best-effort)
-async def graph_augment(state: OceanState) -> dict:
-    if not state.get("pr_number"):
-        return {"graph_augmented": False}
-    telemetry.station_event(state["execution_id"], 4.5, "start")
-    try:
-        await agents.run_agent(
-            agent_md="graph-augment.md",   # vendored slim worker (Workstream B)
-            node="graph_augment",
-            ticket_id=state["ticket_id"],
-            execution_id=state["execution_id"],
-            task_prompt=f"Run Graph Caller Chain Augmentation for PR #{state['pr_number']}.\n\n{_summary(state)}",
-            verdict_model=schemas.NoOutputVerdict,
-        )
-        ok = True
-    except Exception:
-        ok = False  # best-effort: log, do not block
-    telemetry.station_event(state["execution_id"], 4.5, "end", graph_augmented=ok)
-    return {"graph_augmented": ok}
 
 
 # ============================ Station 6 — local SIT, decomposed into graph nodes ============================
