@@ -1101,3 +1101,38 @@ def test_docker_resources_parses_real_fields(monkeypatch):
     mem_gb, cpus = nodes._docker_resources()
     assert mem_gb == 8.0
     assert cpus == 4
+
+
+# ----------------------------------------------------------------- sit_resolve pr_number prompt
+def test_sit_resolve_prompt_omits_pr_number_when_unset(tmp_path, monkeypatch):
+    """Regression: sit_resolve is shared by the main graph (pr_number always known by now) and
+    qa_batch's subgraph (no coder/open_pr step -- pr_number never set), so the prompt used to
+    literally say "Service PR #None" for every qa-batch ticket. Must phrase truthfully instead of
+    asserting a number that doesn't exist."""
+    monkeypatch.setattr(config, "automation_verdict_path", lambda tid: tmp_path / f"{tid}.json")
+    captured = {}
+
+    async def fake_run_skill(**kw):
+        captured["task_prompt"] = kw["task_prompt"]
+        config.automation_verdict_path(kw["ticket_id"]).write_text(
+            json.dumps({"ticket_id": kw["ticket_id"], "needs_onboarding": False}))
+
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+    asyncio.run(nodes.sit_resolve({"ticket_id": "MM-1", "execution_id": "EXE-x"}))  # no pr_number key
+    assert "#None" not in captured["task_prompt"]
+    assert "No PR number given" in captured["task_prompt"]
+
+
+def test_sit_resolve_prompt_includes_pr_number_when_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "automation_verdict_path", lambda tid: tmp_path / f"{tid}.json")
+    captured = {}
+
+    async def fake_run_skill(**kw):
+        captured["task_prompt"] = kw["task_prompt"]
+        config.automation_verdict_path(kw["ticket_id"]).write_text(
+            json.dumps({"ticket_id": kw["ticket_id"], "needs_onboarding": False}))
+
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+    asyncio.run(nodes.sit_resolve({"ticket_id": "MM-1", "execution_id": "EXE-x", "pr_number": 42}))
+    assert "Service PR #42" in captured["task_prompt"]
+    assert "No PR number given" not in captured["task_prompt"]

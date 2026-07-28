@@ -358,14 +358,24 @@ async def sit_resolve(state: OceanState) -> dict:
     verdict_path.parent.mkdir(parents=True, exist_ok=True)
     if verdict_path.exists():
         verdict_path.unlink()  # fresh Station-6 attempt (drop a prior loop's verdict)
+    # This node is shared by the main graph (which always knows pr_number by now — open_pr already
+    # ran) and qa_batch's subgraph (which enters HERE with no coder/open_pr step, so pr_number is
+    # never set). Embedding "Service PR #None" in the prompt was misleading in the qa_batch case;
+    # phrase truthfully for each instead of asserting a number that doesn't exist.
+    pr_context = (
+        f"Service PR #{state['pr_number']}; Station 5 APPROVED so Station 0.5's gate auto-passes. "
+        if state.get("pr_number") else
+        "No PR number given — resolve the existing service PR for this ticket yourself "
+        "(qa-batch mode: there is no pending review, so Station 0.5's gate is not relevant here). "
+    )
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_resolve",
         ticket_id=tid,
         task_prompt=(
             f"Run ocean-automation-testing Station 0 (resolve) ONLY for {tid} (`--only resolve`), "
-            f"HEADLESS. Service PR #{state.get('pr_number')}; Station 5 APPROVED so Station 0.5's gate "
-            f"auto-passes. Resolve the NARROWEST changed ocean repo set, the existing SIT (reuse-aware), "
+            f"HEADLESS. {pr_context}"
+            f"Resolve the NARROWEST changed ocean repo set, the existing SIT (reuse-aware), "
             f"the domain bucket, and pr_number; persist them to {verdict_path}.\n"
             f"CONTROL-PLANE ONBOARDING (MM-14621): the Aquaman control plane OWNS repo onboarding. If the "
             f"changed repo is an ocean/isbu service NOT in your supported local set, do NOT self-clone, "
