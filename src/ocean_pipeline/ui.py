@@ -1,16 +1,21 @@
-"""Runner log — a clean, management-legible view of a pipeline run.
+"""Runner log — three audiences, one run (see config.LOG_LEVEL):
 
-This is the DEFAULT console surface: one line per station with a plain-English
-name, elapsed time, and outcome — readable by someone who isn't an engineer.
-Engineers add --verbose for the raw per-agent tool activity underneath.
+  management — top station headers + one-line outcome only.
+  team       — (default) headers + outcome + curated milestones/detail lines.
+  developer  — team, plus the raw per-agent tool activity (agents._drive's firehose).
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from . import metrics
+from . import config, metrics
 
 WIDTH = 64
+_LEVEL_ORDER = {"management": 0, "team": 1, "developer": 2}
+
+
+def _at_least(min_level: str) -> bool:
+    return _LEVEL_ORDER.get(config.LOG_LEVEL, 1) >= _LEVEL_ORDER[min_level]
 
 
 def _now() -> str:
@@ -52,7 +57,10 @@ def station_start(node: str) -> None:
 
 
 def milestone(text: str) -> None:
-    """One curated, human-readable action inside a running node."""
+    """One curated, human-readable action inside a running node.
+    Suppressed at management level — that tier gets headers + outcome only."""
+    if not _at_least("team"):
+        return
     print(f"     · {text}", flush=True)
 
 
@@ -187,6 +195,9 @@ def banner(ticket: str, execution_id: str) -> None:
 
 
 def step(node: str, upd: dict, elapsed: float) -> None:
+    """The station's completion line (sub-heading): icon, label, elapsed, one-line
+    outcome. Always printed, at every log level. Detail bullets underneath are the
+    team-level-and-up "additional lines" — management stops at this one line."""
     icon = "✗" if node in _STOP_NODES else "✓"
     label = _LABELS.get(node, node)
     line = f"  {icon}  {label:<38}{_fmt_elapsed(elapsed):>7}"
@@ -194,8 +205,9 @@ def step(node: str, upd: dict, elapsed: float) -> None:
     if hi:
         line += f"   {hi}"
     print(line, flush=True)
-    for det in _details(node, upd):
-        print(f"        └ {det}", flush=True)
+    if _at_least("team"):
+        for det in _details(node, upd):
+            print(f"        └ {det}", flush=True)
 
 
 def summary(final: dict, total: float) -> None:

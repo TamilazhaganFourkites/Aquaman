@@ -279,18 +279,37 @@ def _milestones(msg) -> list[str]:
 
 
 def _format_message(msg) -> list[str]:
-    """Best-effort, SDK-shape-tolerant one-liners for a streamed agent message:
-    tool calls, assistant/thinking text, and the final result."""
+    """Best-effort, SDK-shape-tolerant one-liners for a streamed agent message: tool
+    calls, tool RESULTS, assistant text, thinking, and the final result.
+
+    Previously this only matched ToolUseBlock (.name) and TextBlock (.text) — so
+    ThinkingBlock (.thinking, not .text) and ToolResultBlock (the actual tool
+    OUTPUT, e.g. command stdout/stderr) were silently dropped from every message,
+    even under --verbose. That's the "verbose isn't giving all logs" gap: developer
+    level is supposed to be the full raw firehose, and tool results/thinking are
+    most of what a developer debugging a stuck station actually needs to see."""
     out: list[str] = []
     content = getattr(msg, "content", None)
     if isinstance(content, list):
         for block in content:
-            name = getattr(block, "name", None)        # ToolUseBlock
-            text = getattr(block, "text", None)         # Text/ThinkingBlock
+            name = getattr(block, "name", None)            # ToolUseBlock
+            text = getattr(block, "text", None)             # TextBlock
+            thinking = getattr(block, "thinking", None)     # ThinkingBlock
+            tool_result = getattr(block, "tool_use_id", None) is not None  # ToolResultBlock
             if name is not None:
                 inp = getattr(block, "input", None)
                 arg = json.dumps(inp, default=str) if inp is not None else ""
                 out.append(f"⚙ {name} {arg[:200]}")
+            elif tool_result:
+                rc = getattr(block, "content", None)
+                rc_text = rc if isinstance(rc, str) else json.dumps(rc, default=str) if rc is not None else ""
+                rc_text = " ".join(rc_text.split())
+                marker = "✗" if getattr(block, "is_error", False) else "→"
+                out.append(f"{marker} result: {rc_text[:200]}")
+            elif thinking:
+                t = " ".join(str(thinking).split())
+                if t:
+                    out.append(f"💭 {t[:220]}")
             elif text:
                 t = " ".join(str(text).split())
                 if t:
@@ -344,8 +363,8 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
         i, o = _usage(message)
         in_tok += i
         out_tok += o
-        # --verbose: also dump the raw per-message activity for debugging.
-        if config.VERBOSE:
+        # developer level: also dump the raw per-message activity for debugging.
+        if config.LOG_LEVEL == "developer":
             for line in _format_message(message):
                 _emit(label, line)
     spend = metrics.fmt(in_tok, out_tok, tools)

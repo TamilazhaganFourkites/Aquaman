@@ -3,6 +3,8 @@
 Usage:
     ocean-pipeline MM-14615
     ocean-pipeline MM-14615 --context "Bug only affects SCAC=ABCD loads"
+    ocean-pipeline MM-14615 --log-level management     # top headers + one-line outcome only
+    ocean-pipeline MM-14615 --log-level developer       # == -v/--verbose, full raw agent activity
     ocean-pipeline --resume EXE-1a2b3c4d          # continue a crashed run from its last checkpoint
     ocean-pipeline --print-graph                  # print the mermaid diagram from the live graph
 
@@ -10,6 +12,11 @@ The pipeline runs end-to-end: research -> deps -> reachability -> code ->
 adversarial review loop -> local SIT (ocean-automation-testing). On SIT PASS it
 flips the service PR to ready-for-review automatically (the human boundary is
 merge/deploy, which the pipeline never performs).
+
+Console log detail has three tiers (config.LOG_LEVEL) — management (top headers +
+one-line outcome only), team (default: headers + outcome + curated milestones/details),
+developer (team, plus the full raw per-agent activity). The run-report.md written to
+the artifacts dir at the end always has full detail, regardless of console level.
 """
 from __future__ import annotations
 
@@ -81,8 +88,9 @@ async def _drive_stream(app, initial, thread) -> tuple[dict, float, bool]:
 
     One line per station (plain-English name, elapsed, outcome). Per-node elapsed is
     the wall-clock between consecutive completions — the pipeline runs sequentially,
-    so that is the station's own runtime. --verbose adds the raw agent activity above
-    each line. `paused` is True when the graph stopped at an interrupt() (the human-approval
+    so that is the station's own runtime. Everything above each line (milestones, and
+    at developer level the raw agent activity) is gated by config.LOG_LEVEL — see ui.py.
+    `paused` is True when the graph stopped at an interrupt() (the human-approval
     gate) rather than reaching an end — the run is resumable with --approve/--reject."""
     start = time.monotonic()
     last = start
@@ -230,12 +238,19 @@ def main() -> None:
     p.add_argument("--print-graph", action="store_true", help="print the mermaid diagram and exit")
     p.add_argument("--rca-only", action="store_true",
                    help="run research + ocean-rca report and STOP (no auto-coding, even if a fix is needed)")
+    p.add_argument("--log-level", choices=["management", "team", "developer"], default=None,
+                   help="console log detail: management (top headers + one-line outcome only), "
+                        "team (default — headers + outcome + curated milestones/details), "
+                        "developer (team, plus the full raw per-agent activity, i.e. --verbose)")
     p.add_argument("-v", "--verbose", action="store_true",
-                   help="stream each station agent's live activity (tool calls + text)")
+                   help="shorthand for --log-level developer (stream each station agent's "
+                        "live activity: tool calls, tool results, thinking, text)")
     args = p.parse_args()
 
-    if args.verbose:
-        config.VERBOSE = True
+    if args.log_level:
+        config.LOG_LEVEL = args.log_level
+    elif args.verbose:
+        config.LOG_LEVEL = "developer"
     if args.rca_only:
         config.RCA_ONLY = True
 

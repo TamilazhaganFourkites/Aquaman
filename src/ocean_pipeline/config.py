@@ -32,9 +32,22 @@ CHECKPOINT_DB = os.environ.get("OCEAN_PIPELINE_CHECKPOINT_DB", str(ARTIFACTS_ROO
 # Default model for station agents. Always the latest capable Opus unless overridden.
 STATION_MODEL = os.environ.get("OCEAN_PIPELINE_MODEL", "claude-opus-4-8")
 
-# When true, stream each station agent's inner activity (tool calls + text) to the log,
-# so a long-running node isn't a black box. Toggled by env or the CLI --verbose flag.
-VERBOSE = os.environ.get("OCEAN_PIPELINE_VERBOSE", "").lower() in ("1", "true", "yes")
+# Console log detail. Three audiences, one run:
+#   management  — top station headers + one-line outcome per station only (no milestones,
+#                 no per-station detail bullets, no raw agent activity). For a non-engineer
+#                 skimming progress.
+#   team        — (default) headers + outcome + the curated milestone/detail lines already
+#                 built for this log (significant tool calls, a handful of facts per station).
+#   developer   — team, plus the full raw per-message agent activity (every tool call with
+#                 its args, every tool result, every thinking/text block) — the actual
+#                 --verbose firehose, for debugging a stuck or misbehaving station.
+# Toggled by env, or the CLI --log-level flag (--verbose is shorthand for --log-level developer).
+_LOG_LEVELS = ("management", "team", "developer")
+_env_log_level = os.environ.get("OCEAN_PIPELINE_LOG_LEVEL", "").strip().lower()
+if _env_log_level not in _LOG_LEVELS:
+    # Back-compat: the old boolean OCEAN_PIPELINE_VERBOSE still selects "developer".
+    _env_log_level = "developer" if os.environ.get("OCEAN_PIPELINE_VERBOSE", "").lower() in ("1", "true", "yes") else "team"
+LOG_LEVEL = _env_log_level
 
 # RCA-only mode: run research -> ocean-rca report and STOP after the report, even when
 # the root cause needs a code fix (do NOT auto-proceed to coding). This preserves the
