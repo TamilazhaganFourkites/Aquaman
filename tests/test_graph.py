@@ -87,7 +87,7 @@ def _install(script: Script, tmp_path, monkeypatch):
             v = script.next_review()
             findings = [{"severity": "MAJOR", "file": "f.rb", "summary": "x"}] if v == "CHANGES_REQUIRED" else []
             return schemas.ReviewVerdict(verdict=v, findings=findings)
-        # graph_augment / release_intel
+        # graph_augment
         return schemas.NoOutputVerdict()
 
     # Git/PR ops are now plain code (gitops), not agent calls — stub them and count the calls
@@ -402,7 +402,7 @@ def test_vendored_workers_resolve():
     control-plane decoupling — no graph node should load a heavy fk-aideveloper station file."""
     for name in ("research.md", "code.md", "review.md",           # Phase B
                  "dep-resolve.md", "reachability.md", "rca-research.md",   # Workstream B
-                 "graph-augment.md", "release-intel.md"):
+                 "graph-augment.md"):
         p = agents._agent_path(name)
         assert p == config.VENDORED_AGENTS_DIR / name and p.exists(), f"{name} not vendored"
         assert "Not your job" in p.read_text(), f"{name} missing the process-ownership boundary"
@@ -649,27 +649,6 @@ def test_ac_coverage_passthrough(tmp_path, monkeypatch):
     assert final["sit_report"]["ac_coverage"] == ac_rows
 
 
-def test_release_intel_failure_never_blocks_the_run(tmp_path, monkeypatch):
-    """Regression: release-intel.md's own worker doc says this station must never block the
-    pipeline (best-effort, like graph_augment) -- but release_intel had no try/except at all, so
-    a worker failure after retries would abort the entire run. A failing release_intel must still
-    let the run reach completed, with release_intel_written=False recording the miss."""
-    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
-    _install(s, tmp_path, monkeypatch)
-    real_fake_run_agent = agents.run_agent
-
-    async def fake_run_agent_release_intel_fails(**kw):
-        if kw["node"] == "release_intel":
-            raise RuntimeError("release-intel worker crashed")
-        return await real_fake_run_agent(**kw)
-
-    monkeypatch.setattr(agents, "run_agent", fake_run_agent_release_intel_fails)
-    final = _run()
-    assert final["final_status"] == "completed"
-    assert final["ready_flipped"] is True
-    assert final["release_intel_written"] is False
-
-
 # ----------------------------------------------------------------- cli.py resume ticket_id recovery
 def test_resume_recovers_real_ticket_id_from_checkpoint(tmp_path, monkeypatch):
     """Regression: _resume used to hardcode ticket_id="" when calling _execute, even though the
@@ -898,9 +877,9 @@ def test_frontmatter_tools_returns_none_when_no_tools_key(tmp_path):
 
 
 def test_no_output_verdict_requires_no_fields():
-    """The whole point of NoOutputVerdict: graph_augment/release_intel used to reuse CoderVerdict
-    (whose branch/pushed_sha are required, no defaults) for outputs neither field means anything
-    for, forcing the worker to fabricate placeholder values just to pass validation. Confirm the
+    """The whole point of NoOutputVerdict: graph_augment used to reuse CoderVerdict (whose
+    branch/pushed_sha are required, no defaults) for an output neither field means anything for,
+    forcing the worker to fabricate placeholder values just to pass validation. Confirm the
     replacement genuinely has zero required fields."""
     schemas.NoOutputVerdict()  # must not raise a pydantic ValidationError
     assert schemas.NoOutputVerdict(note="skipped: code graph unreachable").note.startswith("skipped")

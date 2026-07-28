@@ -58,13 +58,12 @@ class OceanState(TypedDict, total=False):
     review_iteration: int
     review_findings: list            # replaced each review pass
 
-    # --- 3.87 / 4.5b / 4.6 ---
+    # --- 3.87 / 4.5b ---
     pr_number: int
     service_repo: str        # owner/name slug the coder pushed to; used by the git/PR code nodes
     pr_title: str            # PR title the coder proposed; the code node opens the PR with it
     pr_body: str             # PR body the coder proposed
     graph_augmented: bool
-    release_intel_written: bool
 
     # --- Station 6: local SIT (decomposed: resolve -> author -> qa gate -> run[+testrail] -> triage) ---
     automation_result: AutomationResult

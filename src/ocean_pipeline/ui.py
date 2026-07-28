@@ -35,7 +35,6 @@ _LABELS = {
     "harsh_reviewer":     "Adversarial code review",
     "open_pr":            "Open draft PR",
     "graph_augment":      "Code-graph augmentation",
-    "release_intel":      "Release intelligence",
     "sit_resolve":        "Local SIT — resolve & gate",
     "sit_author":         "Local SIT — draft test",
     "qa_review_gate":     "QA review — awaiting approval",

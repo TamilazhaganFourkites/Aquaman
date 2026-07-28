@@ -105,7 +105,6 @@ def build_graph():
     g.add_node("harsh_reviewer", nodes.harsh_reviewer)
     g.add_node("open_pr", nodes.open_pr)
     g.add_node("graph_augment", nodes.graph_augment)
-    g.add_node("release_intel", nodes.release_intel)
     # Station 6 decomposed into graph-owned phases (drives the skill one --only phase at a time).
     g.add_node("sit_resolve", nodes.sit_resolve)                 # resolve changed repo + onboarding check
     g.add_node("sit_author", nodes.sit_author)                   # draft SIT scenarios + sample test, then STOP
@@ -140,8 +139,7 @@ def build_graph():
                             {"rework": "coder", "approve": "open_pr"})
 
     g.add_edge("open_pr", "graph_augment")
-    g.add_edge("graph_augment", "release_intel")
-    g.add_edge("release_intel", "sit_resolve")
+    g.add_edge("graph_augment", "sit_resolve")
 
     # Station 6, decomposed: resolve -> (onboard? | author) -> QA review gate -> run [+ TestRail] -> triage.
     g.add_conditional_edges("sit_resolve", after_sit_resolve, {

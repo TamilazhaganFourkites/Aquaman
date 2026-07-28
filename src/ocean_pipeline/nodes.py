@@ -319,28 +319,6 @@ async def graph_augment(state: OceanState) -> dict:
     return {"graph_augmented": ok}
 
 
-# ------------------------------------------------------------------ 4.6 release intel
-async def release_intel(state: OceanState) -> dict:
-    """Best-effort, like graph_augment: release-intel.md's own worker doc says this must
-    never block the pipeline. Without a try/except here, a worker failure after retries would
-    abort the entire run, contradicting that contract."""
-    telemetry.station_event(state["execution_id"], 4.6, "start")
-    try:
-        await agents.run_agent(
-            agent_md="release-intel.md",   # vendored slim worker (Workstream B)
-            node="release_intel",
-            ticket_id=state["ticket_id"],
-            execution_id=state["execution_id"],
-            task_prompt=f"Run the Release Intelligence Writer for {state['ticket_id']}.\n\n{_summary(state)}",
-            verdict_model=schemas.NoOutputVerdict,
-        )
-        ok = True
-    except Exception:
-        ok = False  # best-effort: log, do not block
-    telemetry.station_event(state["execution_id"], 4.6, "end", release_intel_written=ok)
-    return {"release_intel_written": ok}
-
-
 # ============================ Station 6 — local SIT, decomposed into graph nodes ============================
 # LangGraph owns the Station-6 sequence: sit_resolve -> sit_run -> sit_triage, driving the
 # ocean-automation-testing skill one `--only <phase>` at a time (state flows through the skill's own
