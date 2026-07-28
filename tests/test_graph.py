@@ -21,7 +21,7 @@ import json
 
 import pytest
 
-from ocean_pipeline import agents, config, gitops, graph, jira, schemas, telemetry
+from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry
 
 
 class Script:
@@ -489,3 +489,60 @@ def test_jira_noop_without_token(monkeypatch):
     monkeypatch.setattr(jira, "JIRA_API_TOKEN", "")
     jira.transition("MM-1", "In Progress")   # must not raise or make a request
     jira.comment("MM-1", "hi")
+
+
+# ----------------------------------------------------------------- resource pre-flight (Workstream 3.4)
+def test_docker_preflight_reason_pure(monkeypatch):
+    """_docker_preflight_reason is a pure wrapper over _docker_resources — test it directly, no Docker
+    needed. Empty string = OK; non-empty = a ready-to-use could_not_verify reason."""
+    monkeypatch.setattr(nodes, "_docker_resources", lambda: (0.0, 0))
+    assert "not running" in nodes._docker_preflight_reason()
+
+    monkeypatch.setattr(config, "MIN_DOCKER_MEMORY_GB", 8.0)
+    monkeypatch.setattr(config, "MIN_DOCKER_CPUS", 4)
+    monkeypatch.setattr(nodes, "_docker_resources", lambda: (2.0, 2))
+    reason = nodes._docker_preflight_reason()
+    assert "insufficient_docker_resources" in reason and "2.0 GB" in reason
+
+    monkeypatch.setattr(nodes, "_docker_resources", lambda: (16.0, 8))
+    assert nodes._docker_preflight_reason() == ""
+
+
+def test_sit_run_preflight_short_circuit_skips_agent_calls(tmp_path, monkeypatch):
+    """When Docker resources are insufficient, sit_run must fail BEFORE calling the (expensive) agent —
+    MM-13437's real 40-minute OOM attempt is exactly the cost this gate exists to avoid — and sit_triage
+    must recognize the marker and skip its own redundant agent call too. Zero calls to either node's
+    agents.run_skill proves both money-saving properties, not just the eventual failed verdict."""
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])   # would pass if it ever ran
+    _install(s, tmp_path, monkeypatch)
+    monkeypatch.setattr(nodes, "_docker_preflight_reason",
+                        lambda: "could_not_verify: insufficient_docker_resources — have 2.0 GB / 2 CPU")
+    final = _run()
+    assert final["final_status"] == "failed"
+    assert "could_not_verify" in final["final_outcome"]
+    assert s.calls["sit_run"] == 0        # short-circuited before the agent call
+    assert s.calls["sit_triage"] == 0     # recognized the marker, skipped its own agent call
+    assert s.calls["flip_ready"] == 0
+
+
+def test_ac_coverage_passthrough(tmp_path, monkeypatch):
+    """ac_coverage is additive/optional on the verdict — when the skill emits it, it must reach the
+    final sit_report untouched (frozen-contract discipline: add, never rename/drop)."""
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    ac_rows = [{"ac": "AC3", "test": "test_x", "result": "passed"}]
+
+    real_fake_run_skill = agents.run_skill
+
+    async def fake_run_skill_with_ac(**kw):
+        await real_fake_run_skill(**kw)
+        if kw["node"] == "sit_triage":
+            path = config.automation_verdict_path(kw["ticket_id"])
+            data = json.loads(path.read_text())
+            data["ac_coverage"] = ac_rows
+            path.write_text(json.dumps(data))
+
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill_with_ac)
+    final = _run()
+    assert final["final_status"] == "completed"
+    assert final["sit_report"]["ac_coverage"] == ac_rows

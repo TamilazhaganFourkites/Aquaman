@@ -70,6 +70,24 @@ MAX_CODING_ATTEMPTS = 2
 # repo that still reports unsupported after being profiled is a genuine could_not_verify stop.
 MAX_ONBOARD_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ONBOARD_ATTEMPTS", "1"))
 
+# Local mock-first SIT: the LocalStack SQS endpoint the test-automation SQS client must target.
+# Without this exported, that client silently constructs as None and crashes on `.meta`, so the
+# SQS-driven leg of a multi-repo callback E2E (e.g. ocean-worker's TRACKING_UNIT_UPDATED consumer)
+# never assembles and the ticket lands could_not_verify (root cause of EXE-c5ec3e4c / MM-13437).
+# Exported into every worker/skill subprocess by agents._drive so the SIT pytest inherits it.
+SQS_ENDPOINT_URL = os.environ.get("OCEAN_PIPELINE_SQS_ENDPOINT_URL", "http://localhost:4566")
+SQS_LOCAL_ACCOUNT = os.environ.get("OCEAN_PIPELINE_SQS_LOCAL_ACCOUNT", "723008196684")
+
+# Docker resource pre-flight (ocean-qa-agent-ac-driven-plan.md Workstream 3.4). MM-13437's full
+# multi-repo callback E2E attempt ground for ~40 minutes before hitting the documented 8-12 GB
+# memory ceiling (local_service_execution.md "Docker memory ceiling") — this check catches that in
+# ~1s BEFORE sit_run spends an entire expensive agent invocation attempting a run that's going to
+# OOM. Conservative floor, not an exact per-ticket requirement (the skill's own resolve step is the
+# one that knows the actual repo count/complexity for THIS ticket) — it exists to catch the clear-fail
+# case fast, not to replace the skill's own judgment.
+MIN_DOCKER_MEMORY_GB = float(os.environ.get("OCEAN_PIPELINE_MIN_DOCKER_MEMORY_GB", "4"))
+MIN_DOCKER_CPUS = int(os.environ.get("OCEAN_PIPELINE_MIN_DOCKER_CPUS", "2"))
+
 # Claude Agent SDK permission mode. This pipeline runs fully headless — every
 # station shells out (git push, gh pr create/ready, docker, pytest), and "acceptEdits"
 # only auto-approves Edit/Write, NOT Bash, so a non-bypass mode would stall with no

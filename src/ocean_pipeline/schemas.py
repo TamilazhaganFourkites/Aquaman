@@ -99,3 +99,6 @@ class AutomationVerdict(BaseModel):
     # that never emits these is fully backward-compatible.
     needs_onboarding: bool = False
     onboard_repo: str = ""            # the ocean repo the SIT could not run because it is unsupported
+    # AC traceability (ocean-qa-agent-ac-driven-plan.md): which acceptance criterion each test verifies.
+    # Additive + optional — a skill that doesn't emit this yet is fully backward-compatible.
+    ac_coverage: list = Field(default_factory=list)   # [{"ac": "AC3", "test": "test_...", "result": "passed"}]

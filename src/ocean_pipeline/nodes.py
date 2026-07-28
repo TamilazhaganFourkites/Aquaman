@@ -9,10 +9,44 @@ Two kinds of node:
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 from . import agents, config, gitops, jira, schemas, telemetry
 from .state import OceanState
+
+
+def _docker_resources() -> tuple[float, int]:
+    """(mem_gb, cpus) from `docker info`, or (0, 0) if Docker isn't reachable. Plain deterministic
+    check — no agent call — so sit_run can fail fast (~1s) instead of spending an entire expensive
+    agent invocation attempting a bring-up that's going to OOM (see config.MIN_DOCKER_MEMORY_GB)."""
+    if not shutil.which("docker"):
+        return 0.0, 0
+    try:
+        out = subprocess.run(["docker", "info", "--format", "{{json .}}"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode != 0 or not out.stdout.strip():
+            return 0.0, 0
+        info = json.loads(out.stdout)
+        mem_gb = info.get("MemTotal", 0) / (1024 ** 3)
+        return mem_gb, info.get("NCPU", 0)
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        return 0.0, 0
+
+
+def _docker_preflight_reason() -> str:
+    """Empty string if Docker has enough resources per config.MIN_DOCKER_MEMORY_GB/CPUS; otherwise
+    a ready-to-use could_not_verify reason string."""
+    mem_gb, cpus = _docker_resources()
+    if mem_gb == 0.0 and cpus == 0:
+        return "could_not_verify: Docker is not running or not reachable (docker info failed)"
+    if mem_gb < config.MIN_DOCKER_MEMORY_GB or cpus < config.MIN_DOCKER_CPUS:
+        return (f"could_not_verify: insufficient_docker_resources — have {mem_gb:.1f} GB / {cpus} CPU, "
+                f"need >= {config.MIN_DOCKER_MEMORY_GB} GB / {config.MIN_DOCKER_CPUS} CPU (see "
+                f"local_service_execution.md 'Docker memory ceiling'). Raise Docker Desktop/Rancher "
+                f"Desktop memory+CPU allocation before retrying.")
+    return ""
 
 
 def _summary(state: OceanState) -> str:
@@ -390,6 +424,28 @@ async def sit_run(state: OceanState) -> dict:
     happened; this only runs the changed repo locally, mocks the rest, and captures per-test results."""
     tid, exec_id = state["ticket_id"], state["execution_id"]
     telemetry.station_event(exec_id, 6.2, "start")
+
+    # Resource pre-flight (ocean-qa-agent-ac-driven-plan.md Workstream 3.4): fail fast, deterministically,
+    # BEFORE spending an entire agent invocation on a Docker bring-up that's going to OOM (MM-13437's
+    # full-chain attempt ground for ~40 min before hitting this exact documented ceiling).
+    reason = _docker_preflight_reason()
+    if reason:
+        verdict_path = config.automation_verdict_path(tid)
+        verdict_path.parent.mkdir(parents=True, exist_ok=True)
+        # Merge onto whatever sit_resolve/sit_author already recorded (test_path, domain_bucket, ...)
+        # rather than clobbering it — `_preflight_short_circuit` is the explicit marker sit_triage
+        # checks for; it is NEVER written by the skill itself, so it can't collide with a real verdict.
+        partial = _load_json(str(verdict_path))
+        partial.update({
+            "ticket_id": tid, "automation_result": "failed", "failure_class": "could_not_verify",
+            "execution_mode": "local-mock-first", "evidence": reason,
+            "_preflight_short_circuit": True,
+        })
+        verdict_path.write_text(json.dumps(partial))
+        telemetry.station_event(exec_id, 6.2, "end", automation_result="failed",
+                                failure_class="could_not_verify", preflight="insufficient_resources")
+        return {}
+
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_run",
@@ -451,6 +507,22 @@ async def sit_triage(state: OceanState) -> dict:
     tid, exec_id = state["ticket_id"], state["execution_id"]
     telemetry.station_event(exec_id, 6.4, "start")
     verdict_path = config.automation_verdict_path(tid)
+    # The verdict file is progressively enriched across stations (sit_resolve/sit_author already wrote
+    # partial data by this point in the normal path), so mere existence isn't a safe signal. sit_run's
+    # resource-preflight short-circuit (Workstream 3.4) stamps an explicit `_preflight_short_circuit`
+    # marker that the skill itself never writes — only THAT means "pytest never ran, skip the redundant,
+    # expensive Station-3 agent call" (there's no reports/junit.xml for it to parse anyway).
+    partial = _load_json(str(verdict_path))
+    if partial.get("_preflight_short_circuit"):
+        telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
+                                failure_class="could_not_verify", preflight_short_circuit=True)
+        return {"automation_result": "failed", "failure_class": "could_not_verify",
+                "execution_mode": partial.get("execution_mode", "local-mock-first"),
+                "test_automation_pr_url": "", "sit_findings": [],
+                "needs_onboarding": False, "onboard_repo": "",
+                "sit_report": {"tests": [], "changed_repo": None, "dependencies": [],
+                               "evidence": partial.get("evidence", ""), "testrail_run_id": 0,
+                               "ac_coverage": []}}
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_triage",
@@ -491,6 +563,8 @@ async def sit_triage(state: OceanState) -> dict:
             "evidence": v.evidence,
             # prefer the id from the parallel sit_testrail branch (via state) over the skill's verdict
             "testrail_run_id": state.get("testrail_run_id") or v.testrail_run_id,
+            # AC traceability (additive, optional — [] if the skill hasn't started emitting it yet).
+            "ac_coverage": v.ac_coverage,
         },
     }
 

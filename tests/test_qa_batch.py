@@ -1,0 +1,102 @@
+"""Tests for the QA-only overnight batch sweep (ocean_pipeline.qa_batch).
+
+Reuses test_graph.py's Script/_install harness — qa_batch drives the EXACT SAME node functions
+(sit_resolve/sit_author/qa_review_gate/sit_run/sit_testrail/sit_triage/learn_repo) the main graph's
+own tests already cover, so this file only needs to test what's DIFFERENT about the batch subgraph:
+sequential multi-ticket looping, the no-coder code_fault terminus, and that it never flips a PR.
+"""
+from __future__ import annotations
+
+import asyncio
+
+from ocean_pipeline import agents, config, gitops, qa_batch, telemetry
+from test_graph import Script, _install
+
+
+def test_build_qa_subgraph_compiles():
+    assert qa_batch.build_qa_subgraph().compile() is not None
+
+
+def test_single_ticket_pass(tmp_path, monkeypatch):
+    s = Script(sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    result = asyncio.run(qa_batch.run_one("MM-1"))
+    assert result["final_status"] == "completed"
+    assert "sit_passed" in result["final_outcome"]
+    assert s.calls["sit_run"] == 1
+
+
+def test_code_fault_terminates_without_a_coder(tmp_path, monkeypatch):
+    """qa-batch has no coder node — a code_fault must terminate immediately with a clear 'needs a
+    coder re-run' outcome, never attempt to loop back and fix the code itself."""
+    s = Script(sit_seq=["code_fault"])
+    _install(s, tmp_path, monkeypatch)
+    result = asyncio.run(qa_batch.run_one("MM-2"))
+    assert result["final_status"] == "failed"
+    assert "needs a coder re-run" in result["final_outcome"]
+    assert s.calls["sit_triage"] == 1   # exactly once — no rework loop exists in this subgraph
+
+
+def test_could_not_verify_terminates(tmp_path, monkeypatch):
+    s = Script(sit_seq=["could_not_verify"])
+    _install(s, tmp_path, monkeypatch)
+    result = asyncio.run(qa_batch.run_one("MM-3"))
+    assert result["final_status"] == "failed"
+
+
+def test_batch_is_sequential_and_never_flips_a_pr(tmp_path, monkeypatch):
+    """Two tickets, one pass one fail — both must run (independent Script instances since sit_seq is
+    per-ticket), and gitops.cross_link_and_ready (the flip primitive) must NEVER be called: qa-batch
+    mode has no flip_ready node at all, so this also guards against a future accidental import of it."""
+    flip_calls = []
+    monkeypatch.setattr(gitops, "cross_link_and_ready",
+                        lambda *a, **kw: flip_calls.append((a, kw)))
+    monkeypatch.setattr(gitops, "open_draft_pr", lambda *a, **kw: 123)
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", True)
+    monkeypatch.setattr(config, "QA_TESTRAIL", False)
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    vdir = tmp_path / "verdicts"
+    vdir.mkdir()
+    monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")
+
+    import json as _json
+
+    async def fake_run_skill(**kw):
+        node, tid = kw["node"], kw["ticket_id"]
+        path = config.automation_verdict_path(tid)
+        if node in ("sit_run", "learn_repo"):
+            return
+        if node == "sit_author":
+            path.write_text(_json.dumps({"ticket_id": tid, "test_path": "test_x.py"}))
+            return
+        if node == "sit_resolve":
+            path.write_text(_json.dumps({"ticket_id": tid, "pr_number": 1, "needs_onboarding": False}))
+            return
+        # sit_triage: MM-A passes, MM-B fails could_not_verify
+        outcome = "passed" if tid == "MM-A" else "could_not_verify"
+        path.write_text(_json.dumps({
+            "ticket_id": tid, "automation_result": "passed" if outcome == "passed" else "failed",
+            "failure_class": "" if outcome == "passed" else outcome, "execution_mode": "local-mock-first",
+            "tests": [], "needs_onboarding": False, "onboard_repo": "",
+        }))
+
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(telemetry, "new_execution_id", lambda: "EXE-batch-test-" + str(id(object())))
+
+    results = asyncio.run(qa_batch.run_batch(["MM-A", "MM-B"]))
+    assert [r["ticket_id"] for r in results] == ["MM-A", "MM-B"]
+    assert results[0]["final_status"] == "completed"
+    assert results[1]["final_status"] == "failed"
+    assert flip_calls == []   # the whole point: qa-batch never flips a service PR
+
+
+def test_load_tickets_from_file(tmp_path):
+    f = tmp_path / "tickets.txt"
+    f.write_text("MM-101\n# a comment\n\nMM-102  # inline comment\n   \nMM-103\n")
+
+    class Args:
+        file = str(f)
+        tickets = []
+
+    assert qa_batch._load_tickets(Args()) == ["MM-101", "MM-102", "MM-103"]
