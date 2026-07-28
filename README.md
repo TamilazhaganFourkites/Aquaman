@@ -90,22 +90,95 @@ src/ocean_pipeline/
 
 ## Setup
 
+### 0. Do this first: fk-aideveloper
+
+Aquaman drives fk-aideveloper's station agents/skills as subprocesses — it doesn't work
+standalone. Before anything below, complete **fk-aideveloper's own README → Onboarding**
+section (GitHub/`cloudqwest` org access, Claude Code CLI license, `gh auth login`,
+`./scripts/dev-setup.sh --preflight`, cloning fk-aideveloper itself, `claude-setup.sh`).
+
+Two things that repo's onboarding won't warn you about, specific to Aquaman:
+
+- **Path mismatch:** fk-aideveloper's own onboarding clones it to `~/Dev/ai/fk-aideveloper`.
+  Aquaman's default (`FK_AIDEVELOPER_DIR` in `config.py`) is `~/Documents/projects/fk-aideveloper`.
+  These do **not** match — either clone fk-aideveloper to the `~/Documents/projects/` path
+  instead, or explicitly `export FK_AIDEVELOPER_DIR=~/Dev/ai/fk-aideveloper` (or wherever
+  you actually put it).
+- **Checkout state, not just presence:** `sme_consult` reads 4 ocean SME files
+  (`sme-callback-notification.md`, `sme-load-creation.md`, `sme-ocean-data-quality.md`,
+  `sme-ocean-milestones.md`) from whatever branch is checked out in `FK_AIDEVELOPER_DIR` at
+  run time — there's no version pinning. `origin/main` does **not** have these files yet.
+  If a ticket in the `callback_notification` / `load_creation` / `ocean_data_quality` /
+  `ocean_tracking_milestones` domain bucket fails at the SME-consult step, ask in
+  `#fk-aideveloper` Slack which branch currently carries this work (same place fk-aideveloper's
+  own README sends you for a missing `GH_TOKEN`/`RCA_TOKEN`).
+
+### 1. Clone and install
+
 Requires **Python ≥ 3.11** (LangGraph needs ≥ 3.10). On macOS the default `python3` is
 often an old 3.7/3.9 — create the venv with an explicit modern interpreter:
 
 ```bash
+git clone <this-repo-url> && cd Aquaman
 python3.12 -m venv .venv && source .venv/bin/activate   # NOT `python3` if that's 3.7/3.9
 pip install -e .                                        # add '.[studio]' for the Studio UI
-export FK_AIDEVELOPER_DIR=/path/to/fk-aideveloper       # source of the station agents
-export ANTHROPIC_API_KEY=...                            # or `ant auth login`
+export FK_AIDEVELOPER_DIR=/path/to/fk-aideveloper       # wherever you cloned it in step 0
+export ANTHROPIC_API_KEY=...                            # or just run `claude` once — it prompts to log in
 ```
 
-Prerequisites: the Claude Agent SDK spawns the `claude` CLI, so Claude Code must be
-installed and authenticated on the host. The pipeline runs fully headless
-(`permission_mode="bypassPermissions"`) so stations can push branches and open PRs
+The Claude Agent SDK spawns the `claude` CLI, so Claude Code must be installed and
+authenticated on the host (step 0 covers the license; running `claude` interactively once is
+enough to log in — there's no separate `ant`/`ai` auth command). The pipeline runs fully
+headless (`permission_mode="bypassPermissions"`) so stations can push branches and open PRs
 unattended — run it in a trusted environment (or set `OCEAN_PIPELINE_PERMISSION_MODE`
 + a tool allowlist to tighten). The checkpointer uses an async SQLite saver
 (`AsyncSqliteSaver`, backed by `aiosqlite`) at `OCEAN_PIPELINE_CHECKPOINT_DB`.
+
+### 2. Prerequisites (env vars + external tools)
+
+Nothing here is enforced by a preflight check beyond what `cli.py::_preflight()` already
+covers (dirs exist, `claude`/`gh` on PATH, `gh auth status`) — this list is deliberately just
+*documentation*, not code validation, so it stays in one place instead of scattered across
+`config.py`/`jira.py`/`telemetry.py`/`tracing.py`. Every row below is a real variable read
+somewhere in `src/ocean_pipeline/` — check the "Read in" column if you want the exact line.
+
+**Required to run anything:**
+
+| Variable | Default | Read in |
+|---|---|---|
+| `FK_AIDEVELOPER_DIR` | `~/Documents/projects/fk-aideveloper` | `config.py` |
+| `ANTHROPIC_API_KEY` (or `claude` already logged in) | — | consumed by the `claude` CLI itself |
+
+**Only needed if the ticket reaches Station 6 (local SIT)** — install/obtain these before
+running a coding ticket, not just when a run fails partway through:
+
+| Requirement | Notes | How to get it |
+|---|---|---|
+| Docker Desktop installed and running, sized `>= OCEAN_PIPELINE_MIN_DOCKER_MEMORY_GB` (default `4`) GB / `>= OCEAN_PIPELINE_MIN_DOCKER_CPUS` (default `2`) CPUs | checked at the top of `sit_run` (`nodes.py::_docker_preflight_reason`), but only once the run gets that far | [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) |
+| `pipenv` on PATH | the SIT skill runs pytest through it | `brew install pipenv` or `pip install pipenv` |
+| LocalStack reachable at `OCEAN_PIPELINE_SQS_ENDPOINT_URL` (default `http://localhost:4566`) | needed for the SQS-driven leg of a multi-repo callback E2E; not checked anywhere today | see fk-aideveloper's `skills/local-infra-setup` |
+| `cloudqwest/test-automation` cloned locally | the SIT skill `cd`s into it to run pytest | `gh repo clone cloudqwest/test-automation` — see fk-aideveloper's README for the expected path |
+| `environment-configuration` cloned locally | Ruby worker Docker builds copy settings out of it | `gh repo clone cloudqwest/environment-configuration` |
+| `test_rail_email` / `test_rail_password` env vars | only if the QA review gate is answered `--qa approve-testrail` | ask in `#fk-aideveloper` Slack |
+| `~/.aws/credentials` `[qat]` profile | only for chains that push SQS test messages | ask in `#fk-aideveloper` Slack (see fk-aideveloper's `references/sqs_local_testing.md` for the verification snippet once you have it) |
+
+**Optional, all fail open (absence = silent no-op, never blocks a run):**
+
+| Variable | Default | Read in | Effect if unset |
+|---|---|---|---|
+| `JIRA_API_TOKEN` | `""` | `jira.py` | ticket never transitions to In Review, no PR-link comment |
+| `JIRA_BASE_URL` | `https://fourkites.atlassian.net` | `jira.py` | n/a |
+| `RCA_TOKEN` | `""` | `telemetry.py` | no rows land in the team's aidev-db dashboards |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | — | `tracing.py` | no Langfuse trace (see Observability below) |
+
+**Tuning knobs (safe defaults, override only if you know why):** `OCEAN_PIPELINE_ARTIFACTS`,
+`OCEAN_PIPELINE_CHECKPOINT_DB`, `OCEAN_PIPELINE_MODEL`, `OCEAN_PIPELINE_LOG_LEVEL` (see
+`--log-level` below), `OCEAN_PIPELINE_RCA_ONLY`, `OCEAN_PIPELINE_REQUIRE_APPROVAL`,
+`OCEAN_PIPELINE_QA_AUTOAPPROVE`, `OCEAN_PIPELINE_TESTRAIL`, `OCEAN_PIPELINE_MAX_*`,
+`OCEAN_PIPELINE_PERMISSION_MODE` / `OCEAN_PIPELINE_SKILL_PERMISSION_MODE`,
+`OCEAN_PIPELINE_REPO_ORG`, `OCEAN_PIPELINE_GH_TIMEOUT_SECONDS`, `OCEAN_PIPELINE_ENGINEER`,
+`OCEAN_PIPELINE_SESSION_ENV`. Every one of these has a hardcoded default in `config.py` —
+that file is the source of truth if this list ever drifts.
 
 ## Run
 
@@ -181,9 +254,12 @@ footer totals cost / tokens / tool-calls for the whole run.
 duration and outcome. Written even if the run fails (partial timeline). The console prints
 `Full report: <path>` at the end.
 
-**`--verbose` (engineers) — the deep dive.** Adds each agent's raw tool calls + text on top
-of the milestones, for debugging. Off by default. Per-node verdicts also land in
-`$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/*.verdict.json`.
+**`--log-level {management,team,developer}` — three audiences, one run.** `team` is the
+default and is exactly what's shown above. `management` prints only the `▶` header + the
+`✓` outcome line per station — no milestones, no detail bullets. `developer` (same as the
+older `-v`/`--verbose` flag, still supported as a shorthand) adds each agent's raw tool
+calls, tool results, and thinking text on top of the milestones, for debugging. Per-node
+verdicts also land in `$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/*.verdict.json` regardless of level.
 
 **Langfuse (self-hosted run UI) — recommended.** FourKites runs open-source Langfuse at
 `https://langfuse.fourkites.com` (on FK infra), so run data stays in-house — this is the FK
