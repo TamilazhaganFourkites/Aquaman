@@ -232,9 +232,8 @@ def _count_tools(msg) -> int:
     return sum(1 for b in content if getattr(b, "name", None) is not None)
 
 
-def _usage(msg) -> tuple[float, int, int]:
-    """Best-effort (cost_usd, input_tokens, output_tokens) from a ResultMessage."""
-    cost = getattr(msg, "total_cost_usd", None) or getattr(msg, "cost_usd", None) or 0.0
+def _usage(msg) -> tuple[int, int]:
+    """Best-effort (input_tokens, output_tokens) from a ResultMessage."""
     u = getattr(msg, "usage", None)
     in_tok = out_tok = 0
     if u is not None:
@@ -243,9 +242,9 @@ def _usage(msg) -> tuple[float, int, int]:
         if in_tok is None and isinstance(u, dict):
             in_tok, out_tok = u.get("input_tokens", 0), u.get("output_tokens", 0)
     try:
-        return float(cost or 0.0), int(in_tok or 0), int(out_tok or 0)
+        return int(in_tok or 0), int(out_tok or 0)
     except (TypeError, ValueError):
-        return 0.0, 0, 0
+        return 0, 0
 
 
 def _milestones(msg) -> list[str]:
@@ -336,24 +335,23 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     )
     ui.station_start(label)   # "▶ <station>" header; milestones stream underneath
     tools = 0
-    cost = in_tok = out_tok = 0.0
+    in_tok = out_tok = 0
     async for message in query(prompt=prompt, options=options):
         # Default: curated, readable milestones (the significant actions).
         for m in _milestones(message):
             ui.milestone(m)
         tools += _count_tools(message)
-        c, i, o = _usage(message)
-        cost += c
+        i, o = _usage(message)
         in_tok += i
         out_tok += o
         # --verbose: also dump the raw per-message activity for debugging.
         if config.VERBOSE:
             for line in _format_message(message):
                 _emit(label, line)
-    spend = metrics.fmt(cost, int(in_tok), int(out_tok), tools)
+    spend = metrics.fmt(in_tok, out_tok, tools)
     if spend:
         ui.milestone(f"done — {spend}")
-    metrics.add(cost, int(in_tok), int(out_tok), tools)
+    metrics.add(in_tok, out_tok, tools)
 
 
 async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,

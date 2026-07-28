@@ -204,7 +204,7 @@ def summary(final: dict, total: float) -> None:
     if final.get("final_outcome"):
         print(f"  {final['final_outcome']}")
     t = metrics.totals()
-    usage = metrics.fmt(t["cost"], t["input"], t["output"], t["tools"])
+    usage = metrics.fmt(t["input"], t["output"], t["tools"])
     if usage:
         print(f"  usage: {usage}   across {t['stations']} station runs")
     print("═" * WIDTH + "\n", flush=True)
