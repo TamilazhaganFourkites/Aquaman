@@ -36,9 +36,10 @@ class OceanState(TypedDict, total=False):
     domain_bucket: str               # ocean domain; drives the SME-consult node
     sme_findings: dict               # ownership/reuse guidance from the consulted ocean SME
 
-    # --- RCA branch (diagram: RCA agent -> RCA Done -> Fix needed -> coder) ---
+    # --- RCA branch (diagram: RCA agent -> RCA review gate -> RCA Done -> Fix needed -> coder) ---
     rca_fix_needed: bool
     rca_findings: list               # implementation brief handed to the coder on fix_needed
+    rca_approval_decision: str       # "approve" | "reject" (set on resume); "" when auto-approved
 
     # --- Station 1 / 1.5 ---
     dependency_report: dict

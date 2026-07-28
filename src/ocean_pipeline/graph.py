@@ -30,9 +30,13 @@ def route_after_research(state: OceanState) -> str:
     return "unsupported"
 
 
-def after_rca(state: OceanState) -> str:
-    # RCA agent -> RCA Done (terminal report) | Fix needed -> deps+reachability -> coder
-    # In RCA-only mode we always stop at the report; the fix is a separate "RCA Done" run.
+def after_rca_review(state: OceanState) -> str:
+    # Human reviewed the RCA report (already posted as a Jira comment) at rca_review_gate.
+    # Reject -> stop cleanly, before any coding starts. Approve -> the same routing as before:
+    # RCA Done (terminal report) | Fix needed -> deps+reachability -> coder. In RCA-only mode
+    # we always stop at the report; the fix is a separate "RCA Done" run.
+    if str(state.get("rca_approval_decision", "")).lower().startswith("reject"):
+        return "reject"
     if config.RCA_ONLY:
         return "done"
     return "fix_needed" if state.get("rca_fix_needed") else "done"
@@ -92,6 +96,7 @@ def build_graph():
     g.add_node("researcher", nodes.researcher)
     g.add_node("sme_consult", nodes.sme_consult)
     g.add_node("rca_agent", nodes.rca_agent)
+    g.add_node("rca_review_gate", nodes.rca_review_gate)          # human review of the posted RCA before acting on it
     g.add_node("rca_done", nodes.rca_done)
     g.add_node("unsupported_route", nodes.unsupported_route)
     g.add_node("dep_resolver", nodes.dep_resolver)
@@ -121,9 +126,11 @@ def build_graph():
                              "unsupported": "unsupported_route"})
     g.add_edge("sme_consult", "dep_resolver")
     g.add_edge("unsupported_route", END)
-    # RCA agent -> RCA Done (terminal) | Fix needed -> deps + reachability gate -> coder
-    g.add_conditional_edges("rca_agent", after_rca,
-                            {"done": "rca_done", "fix_needed": "dep_resolver"})
+    # RCA agent -> human review gate -> RCA Done (terminal) | Fix needed -> deps + reachability
+    # gate -> coder. Reject at the gate -> stop, before any coding starts.
+    g.add_edge("rca_agent", "rca_review_gate")
+    g.add_conditional_edges("rca_review_gate", after_rca_review,
+                            {"reject": "stop_run", "done": "rca_done", "fix_needed": "dep_resolver"})
     g.add_edge("rca_done", END)
 
     g.add_edge("dep_resolver", "reachability_gate")

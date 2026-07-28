@@ -39,9 +39,10 @@ class ReachabilityVerdict(BaseModel):
 
 
 class RcaVerdict(BaseModel):
-    """ocean-rca outcome. If fix_needed, the RCA hands an implementation brief to
-    the coder (diagram: RCA agent -> RCA Done -> Fix needed -> coder); otherwise
-    the evidence-cited report is the deliverable and the run ends."""
+    """ocean-rca outcome. A human reviews the posted report at rca_review_gate before the graph
+    acts on it; if fix_needed (and approved), the RCA hands an implementation brief to the coder
+    (diagram: RCA agent -> RCA review gate -> RCA Done | Fix needed -> coder); otherwise the
+    evidence-cited report is the deliverable and the run ends."""
     report_path: str
     fix_needed: bool = False
     # rca-research.md describes content requirements ("a concrete implementation brief: repo,

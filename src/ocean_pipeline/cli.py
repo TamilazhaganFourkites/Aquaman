@@ -83,15 +83,18 @@ def _report(execution_id: str, final: dict, total: float) -> None:
     ui.summary(final, total)
 
 
-async def _drive_stream(app, initial, thread) -> tuple[dict, float, bool]:
-    """Stream station completions as a clean runner log, then return (state, elapsed, paused).
+async def _drive_stream(app, initial, thread) -> tuple[dict, float, tuple[str, ...]]:
+    """Stream station completions as a clean runner log, then return (state, elapsed, paused_on).
 
     One line per station (plain-English name, elapsed, outcome). Per-node elapsed is
     the wall-clock between consecutive completions — the pipeline runs sequentially,
     so that is the station's own runtime. Everything above each line (milestones, and
     at developer level the raw agent activity) is gated by config.LOG_LEVEL — see ui.py.
-    `paused` is True when the graph stopped at an interrupt() (the human-approval
-    gate) rather than reaching an end — the run is resumable with --approve/--reject."""
+    `paused_on` is `snapshot.next` — the node name(s) the graph is sitting in front of when
+    it stopped at an interrupt(), e.g. `("qa_review_gate",)` — empty when the run reached END
+    instead of pausing. There are three distinct interrupt() gates (rca_review_gate,
+    qa_review_gate, human_gate), not all with the same resume flags, so the caller needs to
+    know which one this is, not just whether the run paused at all — see _pause_message."""
     start = time.monotonic()
     last = start
     async for chunk in app.astream(initial, config=thread, stream_mode="updates"):
@@ -103,7 +106,34 @@ async def _drive_stream(app, initial, thread) -> tuple[dict, float, bool]:
             report.record(node, now - last, update)
         last = now
     snapshot = await app.aget_state(thread)
-    return snapshot.values, time.monotonic() - start, bool(snapshot.next)
+    return snapshot.values, time.monotonic() - start, snapshot.next
+
+
+def _pause_message(execution_id: str, paused_on: tuple[str, ...]) -> str:
+    """The resume hint for whichever interrupt() gate the graph is actually sitting in front
+    of. Three gates exist, not all with the same resume flags — a generic "awaiting approval,
+    use --approve/--reject" message is wrong whenever the pause is at qa_review_gate (pauses by
+    default, uses --qa) rather than rca_review_gate or human_gate (both also plain approve/reject
+    choices, and share --approve/--reject — safe because they can never both be the pending
+    interrupt at once: rca_review_gate resolves before dep_resolver/coder even start, long before
+    the run could reach human_gate)."""
+    if "rca_review_gate" in paused_on:
+        return (f"awaiting review of the RCA report already posted as a Jira comment.\n"
+                f"  approve: ocean-pipeline --resume {execution_id} --approve\n"
+                f"  reject:  ocean-pipeline --resume {execution_id} --reject")
+    if "qa_review_gate" in paused_on:
+        return (f"awaiting QA review of the drafted SIT.\n"
+                f"  approve + TestRail:    ocean-pipeline --resume {execution_id} --qa approve-testrail\n"
+                f"  approve, no TestRail:  ocean-pipeline --resume {execution_id} --qa approve-no-testrail\n"
+                f"  request changes:       ocean-pipeline --resume {execution_id} --qa changes --note '<feedback>'")
+    if "human_gate" in paused_on:
+        return (f"awaiting human approval before flipping the service PR ready.\n"
+                f"  approve: ocean-pipeline --resume {execution_id} --approve\n"
+                f"  reject:  ocean-pipeline --resume {execution_id} --reject")
+    # Any future interrupt() gate that lands here without an entry above — surface the raw
+    # node name rather than silently reusing the wrong gate's flags.
+    return (f"paused at {', '.join(paused_on)!r} — no known resume flags for this gate yet; "
+            f"resume with `ocean-pipeline --resume {execution_id}` and check nodes.py for what it expects.")
 
 
 async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
@@ -131,12 +161,15 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
     try:
         async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
             app = compile_app(saver)
-            final, total, paused = await _drive_stream(app, initial, thread)
-        if paused:
-            # Human-approval gate: leave the run 'running' (no END row) — the resume finalizes it.
-            print(f"\n[PAUSED] awaiting human approval before flipping the service PR ready.\n"
-                  f"  approve: ocean-pipeline --resume {execution_id} --approve\n"
-                  f"  reject:  ocean-pipeline --resume {execution_id} --reject")
+            final, total, paused_on = await _drive_stream(app, initial, thread)
+        if paused_on:
+            # Leave the run 'running' (no END row) — the resume finalizes it. Three DIFFERENT
+            # interrupt() gates exist (rca_review_gate, qa_review_gate, human_gate), not all
+            # with the same resume flags — printing the wrong pair here silently misroutes the
+            # resume (a bare `--approve` on a paused qa_review_gate falls through
+            # after_qa_review's default branch instead of erroring) rather than failing loudly,
+            # so getting this right matters more than it looks.
+            print(f"\n[PAUSED] {_pause_message(execution_id, paused_on)}")
         else:
             _report(execution_id, final, total)
             # Machine-readable completion line for headless runners (oas-autodev's
@@ -212,8 +245,9 @@ async def _resume(execution_id: str, resume_value=None) -> None:
     thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": RECURSION_LIMIT}
     ticket_id = await _resume_ticket_id(execution_id, thread)
     # A plain crash-resume replays from the checkpoint (input None). Resuming a paused gate injects
-    # the decision via Command(resume=...) so the pending interrupt() returns it — a string for the
-    # ready-flip gate ("approve"/"reject"), or a {decision, note} dict for the QA review gate.
+    # the decision via Command(resume=...) so the pending interrupt() returns it — a plain string
+    # ("approve"/"reject") for the rca_review_gate or ready-flip human_gate, or a {decision, note}
+    # dict for the QA review gate.
     initial = None
     if resume_value is not None:
         from langgraph.types import Command
@@ -229,9 +263,11 @@ def main() -> None:
     p.add_argument("--context", default="", help="extra context for the run")
     p.add_argument("--resume", metavar="EXECUTION_ID", help="continue a crashed run from its last checkpoint")
     p.add_argument("--approve", action="store_true",
-                   help="with --resume: approve a paused human-approval gate (proceed to ready-flip)")
+                   help="with --resume: approve a paused rca_review_gate (proceed to report/coding) "
+                        "or ready-flip human_gate (proceed to ready-flip)")
     p.add_argument("--reject", action="store_true",
-                   help="with --resume: reject a paused human-approval gate (leave the PR draft)")
+                   help="with --resume: reject a paused rca_review_gate (stop before any coding) "
+                        "or ready-flip human_gate (leave the PR draft)")
     p.add_argument("--qa", choices=["approve-testrail", "approve-no-testrail", "changes"],
                    help="with --resume: answer a paused QA review gate")
     p.add_argument("--note", default="", help="with --resume --qa changes: feedback for the redraft")

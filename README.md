@@ -18,6 +18,7 @@ re-express any station logic.
 | Router: RCA → stop vs coding → continue | conditional edge (`route_after_research`) |
 | Review loop 5↔4, **max 2 iterations** | conditional edge + `review_iteration` counter |
 | Never auto-merge/deploy; auto-flip to ready on green, with an optional human gate | plain-code `flip_ready`; optional `interrupt()` in `human_gate` (`OCEAN_PIPELINE_REQUIRE_APPROVAL`) |
+| A human reviews the RCA's own conclusion before it's acted on (report or auto-coding) | `interrupt()` in `rca_review_gate`, default ON (`OCEAN_PIPELINE_RCA_REVIEW_AUTO` to skip) |
 | Telemetry START/END + station events | `telemetry.py` → aidev-db HTTP MCP (`Bearer $RCA_TOKEN`), best-effort |
 | AP-223 orphaned `running` rows | SQLite checkpointer → resume, not orphan |
 | Language-scoped Docker (ruby=docker, java/go=native) | carried per-repo in `state["target_repos"]` |
@@ -26,9 +27,10 @@ re-express any station logic.
 ## Graph
 
 ```
-START → researcher ─┬─(rca)────→ rca_agent ─┬─(no fix)──────────→ rca_done → END
-                    │                        └─(fix needed)──┐
-                    └─(coding)──────────────────────────────►├─→ dep_resolver → reachability_gate → coder ◄─┐
+START → researcher ─┬─(rca)────→ rca_agent → rca_review_gate ─┬─(reject)────→ stop_run → END
+                    │                                          ├─(no fix)────→ rca_done → END
+                    │                                          └─(fix needed)──┐
+                    └─(coding)─────────────────────────────────────────────────┼─→ dep_resolver → reachability_gate → coder ◄─┐
                                                                                                      │       │
                                                                                               harsh_reviewer  │
                                                           ┌──(CHANGES_REQUIRED & review_iter<2)───────────────┘
@@ -48,6 +50,13 @@ START → researcher ─┬─(rca)────→ rca_agent ─┬─(no fix)�
 `open_pr*` is idempotent — the code_fault loop re-enters it as a no-op since the service PR is already open.
 An RCA that concludes **Fix needed** joins the coding pipeline at `dep_resolver`, so the fix gets the same
 dependency resolution and reachability gating as any coding ticket.
+
+`rca_agent` posts its 5-part evidence-cited report as a Jira comment itself; **`rca_review_gate`**
+(default ON) then pauses for a human to read that comment before the graph acts on the RCA's own
+conclusion — an LLM's root-cause call should not silently trigger either the terminal report or an
+autonomous coding run unread. `--resume <exe> --approve` proceeds to whichever the RCA already
+decided (report-only, or on to `dep_resolver`); `--reject` stops here, before any code is touched.
+`OCEAN_PIPELINE_RCA_REVIEW_AUTO` skips the pause for the headless `--rca-only` control-plane flow.
 
 When Station 6 finds the ticket's changed repo is an ocean service it doesn't yet support locally, it does
 **not** self-onboard (that would be a hidden write to the control-plane repo). It reports `needs_onboarding` +
@@ -173,8 +182,9 @@ running a coding ticket, not just when a run fails partway through:
 
 **Tuning knobs (safe defaults, override only if you know why):** `OCEAN_PIPELINE_ARTIFACTS`,
 `OCEAN_PIPELINE_CHECKPOINT_DB`, `OCEAN_PIPELINE_MODEL`, `OCEAN_PIPELINE_LOG_LEVEL` (see
-`--log-level` below), `OCEAN_PIPELINE_RCA_ONLY`, `OCEAN_PIPELINE_REQUIRE_APPROVAL`,
-`OCEAN_PIPELINE_QA_AUTOAPPROVE`, `OCEAN_PIPELINE_TESTRAIL`, `OCEAN_PIPELINE_MAX_*`,
+`--log-level` below), `OCEAN_PIPELINE_RCA_ONLY`, `OCEAN_PIPELINE_RCA_REVIEW_AUTO`,
+`OCEAN_PIPELINE_REQUIRE_APPROVAL`, `OCEAN_PIPELINE_QA_AUTOAPPROVE`,
+`OCEAN_PIPELINE_TESTRAIL`, `OCEAN_PIPELINE_MAX_*`,
 `OCEAN_PIPELINE_PERMISSION_MODE` / `OCEAN_PIPELINE_SKILL_PERMISSION_MODE`,
 `OCEAN_PIPELINE_REPO_ORG`, `OCEAN_PIPELINE_GH_TIMEOUT_SECONDS`, `OCEAN_PIPELINE_ENGINEER`,
 `OCEAN_PIPELINE_SESSION_ENV`. Every one of these has a hardcoded default in `config.py` —

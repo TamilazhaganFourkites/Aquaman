@@ -56,6 +56,16 @@ LOG_LEVEL = _env_log_level
 # oas-autodev spawn-aquaman.sh for the rca action) or the CLI --rca-only flag.
 RCA_ONLY = os.environ.get("OCEAN_PIPELINE_RCA_ONLY", "").lower() in ("1", "true", "yes")
 
+# RCA review gate. rca_agent already posts its 5-part evidence-cited report as a Jira comment,
+# but nothing gated on it before this — an LLM's own root-cause conclusion could silently kick
+# off an entire autonomous coding run (fix_needed=true) with no human having read the analysis
+# first. Default ON (the graph interrupt()s and waits) — unlike REQUIRE_APPROVAL below, this is
+# the FIRST checkpoint before autonomous work starts, not the last one before a already-tested
+# PR ships, so it defaults to the more conservative posture (same as QA_REVIEW_AUTO's gate).
+# Set for the headless --rca-only control-plane flow (oas-autodev spawn-aquaman.sh) if it should
+# run unattended.
+RCA_REVIEW_AUTO = os.environ.get("OCEAN_PIPELINE_RCA_REVIEW_AUTO", "").lower() in ("1", "true", "yes")
+
 # Hard cap on the Station 5 <-> Station 4 review loop (CLAUDE.md: max 2 iterations).
 MAX_REVIEW_ITERATIONS = 2
 

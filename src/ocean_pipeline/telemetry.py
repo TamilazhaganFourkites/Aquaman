@@ -36,7 +36,7 @@ _SOURCE_TAG = "source=langgraph (aquaman)"
 
 # Aquaman station-number -> the server's canonical station name (fk-execute telemetry map).
 _STATION_NAMES = {
-    0: "researcher", 0.1: "rca_router", 0.5: "sme_consult",
+    0: "researcher", 0.1: "rca_router", 0.15: "rca_review_gate", 0.5: "sme_consult",
     1: "dependency_resolver", 1.5: "reachability_gate",
     3.87: "open_pr", 4: "coder", 4.5: "graph_caller_augmentation",
     4.6: "release_intelligence_writer", 5: "harsh_review", 5.9: "code_fault_rework",

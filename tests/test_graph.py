@@ -142,10 +142,17 @@ def _install(script: Script, tmp_path, monkeypatch):
             "needs_onboarding": False, "onboard_repo": "",
         }))
 
-    # Default the QA review gate to AUTO (no human pause) + no TestRail, so the full-path tests run
-    # without interrupting. Gate-specific tests override these.
+    # Default the QA review gate and RCA review gate to AUTO (no human pause) + no TestRail, so
+    # the full-path tests run without interrupting. Gate-specific tests override these.
     monkeypatch.setattr(config, "QA_REVIEW_AUTO", True)
     monkeypatch.setattr(config, "QA_TESTRAIL", False)
+    monkeypatch.setattr(config, "RCA_REVIEW_AUTO", True)
+    # sit_run's own Docker resource preflight (_docker_preflight_reason) shells out to the REAL
+    # `docker info` unless stubbed — without this, every full-path test that reaches sit_run
+    # silently depends on Docker Desktop actually being up on whatever machine runs the suite,
+    # rather than the mocked control-flow this file's whole docstring promises ("no real work").
+    # Docker-specific tests override this back (test_sit_run_preflight_short_circuit_*).
+    monkeypatch.setattr(nodes, "_docker_preflight_reason", lambda: "")
 
     monkeypatch.setattr(agents, "run_agent", fake_run_agent)
     monkeypatch.setattr(agents, "run_skill", fake_run_skill)
@@ -200,9 +207,12 @@ def test_after_sit_triage():
                                    "onboard_attempts": config.MAX_ONBOARD_ATTEMPTS}) == "stop"
 
 
-def test_after_rca():
-    assert graph.after_rca({"rca_fix_needed": True}) == "fix_needed"
-    assert graph.after_rca({"rca_fix_needed": False}) == "done"
+def test_after_rca_review():
+    assert graph.after_rca_review({"rca_fix_needed": True}) == "fix_needed"
+    assert graph.after_rca_review({"rca_fix_needed": False}) == "done"
+    # Human rejected at the gate -> stop, regardless of what the RCA itself concluded.
+    assert graph.after_rca_review({"rca_fix_needed": True, "rca_approval_decision": "reject"}) == "reject"
+    assert graph.after_rca_review({"rca_fix_needed": False, "rca_approval_decision": "reject"}) == "reject"
 
 
 # ----------------------------------------------------------------- full paths
@@ -314,6 +324,44 @@ def test_rca_fix_runs_gates_then_codes(tmp_path, monkeypatch):
     assert s.calls["dep_resolver"] == 1          # RCA fix went THROUGH the gates
     assert s.calls["reachability_gate"] == 1
     assert s.calls["coder"] == 1
+
+
+def test_rca_review_gate_interrupts_then_resume_approves(tmp_path, monkeypatch):
+    """Default (RCA_REVIEW_AUTO off): the run pauses before acting on the RCA's own conclusion,
+    then --approve resumes to whatever routing the RCA already decided (here: no fix needed)."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+    s = Script(route="rca", rca_fix=False)
+    _install(s, tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "RCA_REVIEW_AUTO", False)   # override _install's default True
+    app = graph.build_graph().compile(checkpointer=MemorySaver())
+    thread = {"configurable": {"thread_id": "t-rca-approve"}, "recursion_limit": 100}
+    asyncio.run(app.ainvoke(_initial(), config=thread))
+    snap = asyncio.run(app.aget_state(thread))
+    assert snap.next                      # paused at the interrupt
+    assert s.calls["rca_agent"] == 1
+    asyncio.run(app.ainvoke(Command(resume="approve"), config=thread))
+    final = asyncio.run(app.aget_state(thread)).values
+    assert final["final_status"] == "rca_report"
+
+
+def test_rca_review_gate_reject_stops_before_coding(tmp_path, monkeypatch):
+    """Reject at the RCA review gate stops the run even when the RCA itself found fix_needed --
+    no code should get written off an RCA conclusion nobody has reviewed yet."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+    s = Script(route="rca", rca_fix=True)
+    _install(s, tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "RCA_REVIEW_AUTO", False)   # override _install's default True
+    app = graph.build_graph().compile(checkpointer=MemorySaver())
+    thread = {"configurable": {"thread_id": "t-rca-reject"}, "recursion_limit": 100}
+    asyncio.run(app.ainvoke(_initial(), config=thread))
+    asyncio.run(app.ainvoke(Command(resume="reject"), config=thread))
+    final = asyncio.run(app.aget_state(thread)).values
+    assert final["final_status"] == "failed"
+    assert "rejected" in final["final_outcome"]
+    assert s.calls["dep_resolver"] == 0
+    assert s.calls["coder"] == 0
 
 
 def test_unsupported_route_stops(tmp_path, monkeypatch):
@@ -759,6 +807,49 @@ def test_preflight_passes_when_gh_authenticated(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
     cli._preflight()  # must not raise
+
+
+# ----------------------------------------------------------------- cli.py _pause_message
+def test_pause_message_rca_review_gate_suggests_approve_reject():
+    """rca_review_gate shares --approve/--reject with human_gate (both a plain 2-way choice) --
+    safe because they can never both be the pending interrupt at once (the RCA gate resolves
+    long before the run could reach dep_resolver/coder/.../human_gate). Regression coverage for
+    this branch specifically, since it was added without its own test the first time around."""
+    msg = cli._pause_message("EXE-abc123", ("rca_review_gate",))
+    assert "--resume EXE-abc123 --approve" in msg
+    assert "--resume EXE-abc123 --reject" in msg
+    assert "--qa" not in msg
+
+
+def test_pause_message_qa_review_gate_suggests_qa_flag_not_approve():
+    """Regression: the [PAUSED] message used to hardcode 'awaiting human approval ... --approve/
+    --reject' regardless of which interrupt() gate actually paused. qa_review_gate pauses by
+    DEFAULT (human_gate only pauses if OCEAN_PIPELINE_REQUIRE_APPROVAL is set), so that generic
+    message pointed at the wrong flags in the common case — --approve isn't a decision
+    after_qa_review recognizes, so it silently fell through to that function's default branch
+    instead of doing what the user actually asked for."""
+    msg = cli._pause_message("EXE-abc123", ("qa_review_gate",))
+    assert "--qa approve-testrail" in msg
+    assert "--qa approve-no-testrail" in msg
+    assert "--qa changes" in msg
+    assert "--approve" not in msg.replace("approve-testrail", "").replace("approve-no-testrail", "")
+    assert "EXE-abc123" in msg
+
+
+def test_pause_message_human_gate_suggests_approve_reject():
+    msg = cli._pause_message("EXE-abc123", ("human_gate",))
+    assert "--resume EXE-abc123 --approve" in msg
+    assert "--resume EXE-abc123 --reject" in msg
+    assert "--qa" not in msg
+
+
+def test_pause_message_unknown_gate_does_not_claim_a_known_gate():
+    """An interrupt() gate added later without an entry in _pause_message must surface its
+    real node name rather than silently reusing qa_review_gate's or human_gate's flags."""
+    msg = cli._pause_message("EXE-abc123", ("some_new_gate",))
+    assert "some_new_gate" in msg
+    assert "--qa" not in msg
+    assert "--approve" not in msg
 
 
 # ----------------------------------------------------------------- telemetry.py _STATUS mapping

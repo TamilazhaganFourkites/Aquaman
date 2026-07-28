@@ -26,6 +26,7 @@ _LABELS = {
     "researcher":         "Research & routing",
     "sme_consult":        "Ocean SME consult",
     "rca_agent":          "Root-cause analysis (RCA)",
+    "rca_review_gate":    "RCA review — awaiting approval",
     "rca_done":           "RCA report delivered",
     "unsupported_route":  "Unsupported ticket — stopped",
     "dep_resolver":       "Dependency resolution",
@@ -161,6 +162,8 @@ def _highlight(node: str, upd: dict) -> str:
         return "BLOCKING claim found" if upd.get("reachability_blocking") else "all claims verified"
     if node == "rca_agent":
         return "code fix needed" if upd.get("rca_fix_needed") else "no code fix"
+    if node == "rca_review_gate" and upd.get("rca_approval_decision"):
+        return str(upd["rca_approval_decision"])
     if node == "coder":
         return "branch pushed"
     if node == "harsh_reviewer":

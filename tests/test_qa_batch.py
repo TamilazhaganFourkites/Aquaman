@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 
-from ocean_pipeline import agents, config, gitops, qa_batch, telemetry
+from ocean_pipeline import agents, config, gitops, nodes, qa_batch, telemetry
 from test_graph import Script, _install
 
 
@@ -55,6 +55,10 @@ def test_batch_is_sequential_and_never_flips_a_pr(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "QA_REVIEW_AUTO", True)
     monkeypatch.setattr(config, "QA_TESTRAIL", False)
     monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    # This test doesn't go through test_graph.py's _install, so it needs its own Docker stub —
+    # see _install's comment: without it, sit_run's real `docker info` call depends on Docker
+    # Desktop actually being up on whatever machine runs the suite.
+    monkeypatch.setattr(nodes, "_docker_preflight_reason", lambda: "")
     vdir = tmp_path / "verdicts"
     vdir.mkdir()
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")

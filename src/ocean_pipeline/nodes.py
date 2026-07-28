@@ -693,6 +693,11 @@ async def flip_ready(state: OceanState) -> dict:
 
 # ------------------------------------------------------------------ stop (rejected / failed / could_not_verify / budget exhausted)
 async def stop_run(state: OceanState) -> dict:
+    if str(state.get("rca_approval_decision", "")).lower().startswith("reject"):
+        # Human rejected the RCA at its review gate — before any coding started.
+        telemetry.station_event(state["execution_id"], 0.15, "stop", reason="rca_rejected_by_engineer")
+        return {"final_status": "failed",
+                "final_outcome": "human rejected the RCA report at the review gate; no action taken"}
     if str(state.get("approval_decision", "")).lower().startswith("reject"):
         # Human rejected the ready-flip at the approval gate — not a SIT failure.
         telemetry.station_event(state["execution_id"], 6.5, "stop", reason="rejected_by_engineer")
@@ -716,8 +721,9 @@ async def stop_run(state: OceanState) -> dict:
 # ------------------------------------------------------------------ RCA agent
 async def rca_agent(state: OceanState) -> dict:
     """Run ocean-rca. Deliverable is the evidence-cited report; the outcome also
-    says whether a code fix is needed. On fix_needed the RCA brief is handed to the
-    coder (diagram: RCA agent -> RCA Done -> Fix needed -> coder)."""
+    says whether a code fix is needed. A human reviews the posted comment at rca_review_gate
+    next, before the graph acts on it (diagram: RCA agent -> RCA review gate -> RCA Done |
+    Fix needed -> coder). On fix_needed the RCA brief is handed to the coder."""
     telemetry.station_event(state["execution_id"], 0.1, "start", route="rca")
     v: schemas.RcaVerdict = await agents.run_agent(
         agent_md="rca-research.md",   # vendored slim worker (Workstream B); drives the ocean-rca approach
@@ -741,6 +747,30 @@ async def rca_agent(state: OceanState) -> dict:
     )
     telemetry.station_event(state["execution_id"], 0.1, "end", fix_needed=v.fix_needed)
     return {"rca_fix_needed": v.fix_needed, "rca_findings": v.findings_for_coder}
+
+
+# ------------------------------------------------------------------ RCA review gate (human, before acting on the RCA)
+async def rca_review_gate(state: OceanState) -> dict:
+    """Human review of the RCA report rca_agent already posted as a Jira comment, before the
+    graph acts on its own conclusion — either ending at the terminal report (no fix) or
+    proceeding into autonomous coding (fix needed). Default ON (interrupt() + wait).
+    OCEAN_PIPELINE_RCA_REVIEW_AUTO skips the pause and auto-approves, for the headless
+    --rca-only control-plane flow."""
+    exec_id = state["execution_id"]
+    if config.RCA_REVIEW_AUTO:
+        telemetry.station_event(exec_id, 0.15, "auto", decision="approve")
+        return {"rca_approval_decision": "approve"}
+    from langgraph.types import interrupt
+    decision = interrupt({
+        "action": "rca_review",
+        "ticket_id": state["ticket_id"],
+        "fix_needed": state.get("rca_fix_needed", False),
+        "prompt": ("Review the RCA report just posted as a Jira comment, then resume with "
+                   "--approve to proceed (report-only if no fix was needed, or on to coding if "
+                   "one was) or --reject to stop here without acting on it."),
+    })
+    telemetry.station_event(exec_id, 0.15, "decision", decision=str(decision))
+    return {"rca_approval_decision": str(decision)}
 
 
 # ------------------------------------------------------------------ unsupported route (terminal)
