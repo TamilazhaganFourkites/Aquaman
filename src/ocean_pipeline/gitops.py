@@ -31,7 +31,12 @@ def repo_slug(repo: str) -> str:
 
 
 def _gh(args: list[str]) -> str:
-    proc = subprocess.run(["gh", *args], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["gh", *args], capture_output=True, text=True,
+                              timeout=config.GH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise GitOpError(f"`gh {' '.join(args)}` timed out after "
+                         f"{config.GH_TIMEOUT_SECONDS}s (hung process or network stall)")
     if proc.returncode != 0:
         raise GitOpError(f"`gh {' '.join(args)}` failed (exit {proc.returncode}): "
                          f"{proc.stderr.strip() or proc.stdout.strip()}")

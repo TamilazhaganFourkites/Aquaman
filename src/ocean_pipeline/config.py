@@ -113,6 +113,11 @@ AGENT_RETRY_BACKOFF_SECONDS = float(os.environ.get("OCEAN_PIPELINE_AGENT_RETRY_B
 # (see the guardrails), so the git/PR code nodes address repos as `<org>/<name>`.
 DEFAULT_REPO_ORG = os.environ.get("OCEAN_PIPELINE_REPO_ORG", "cloudqwest")
 
+# gitops.py's `gh` subprocess timeout. Without one, a hung/stalled `gh` call (auth prompt,
+# network stall) blocks its node — and the whole run — forever, with no way to recover short
+# of a hard kill. 30s comfortably covers a real PR create/list/edit/ready round-trip.
+GH_TIMEOUT_SECONDS = float(os.environ.get("OCEAN_PIPELINE_GH_TIMEOUT_SECONDS", "30"))
+
 
 def artifacts_dir(execution_id: str) -> Path:
     d = ARTIFACTS_ROOT / execution_id

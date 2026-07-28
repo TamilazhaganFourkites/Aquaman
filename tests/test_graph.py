@@ -21,6 +21,8 @@ import json
 
 import pytest
 
+import subprocess
+
 from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry
 from ocean_pipeline import cli
 
@@ -656,3 +658,29 @@ def test_resume_passes_recovered_ticket_id_to_execute(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_execute", fake_execute)
     asyncio.run(cli._resume("EXE-resume-e2e", resume_value="approve"))
     assert captured["ticket_id"] == "MM-8888"
+
+
+# ----------------------------------------------------------------- gitops.py _gh() timeout
+def test_gh_raises_git_op_error_on_timeout(monkeypatch):
+    """Regression: a hung/stalled `gh` call used to block its node (and the whole run) forever —
+    no subprocess timeout at all. A TimeoutExpired must now surface as a clean GitOpError instead
+    of an uncaught exception, so the caller's existing except-and-report handling covers it."""
+    def fake_run(*args, **kwargs):
+        assert kwargs.get("timeout") == config.GH_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(gitops.GitOpError, match="timed out"):
+        gitops._gh(["pr", "list"])
+
+
+def test_gh_still_raises_on_nonzero_exit(monkeypatch):
+    """The pre-existing exit-code-check behavior must survive the timeout-handling refactor."""
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "not found"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    with pytest.raises(gitops.GitOpError, match="not found"):
+        gitops._gh(["pr", "list"])
