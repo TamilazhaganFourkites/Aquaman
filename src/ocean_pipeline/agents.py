@@ -427,7 +427,6 @@ async def run_skill(
     node: str,
     ticket_id: str,
     task_prompt: str,
-    execution_id: str = "",   # optional; some nodes (e.g. sit_testrail) address their per-run artifacts dir
     cwd: Path | None = None,
     permission_mode: str | None = None,
 ) -> None:

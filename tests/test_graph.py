@@ -18,11 +18,12 @@ from __future__ import annotations
 import asyncio
 import collections
 import json
-
-import pytest
-
+import re
 import shutil
 import subprocess
+from pathlib import Path
+
+import pytest
 
 from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry
 from ocean_pipeline import cli
@@ -108,7 +109,11 @@ def _install(script: Script, tmp_path, monkeypatch):
             path.write_text(json.dumps({"ticket_id": kw["ticket_id"], "test_path": "test_MM_1_ocean.py"}))
             return
         if node == "sit_testrail":
-            (config.artifacts_dir(kw["execution_id"]) / "testrail_run.txt").write_text("555")
+            # run_skill has no execution_id parameter -- the real skill only ever sees the target
+            # path embedded literally in the prompt text (nodes.py's sit_testrail interpolates
+            # `tr_path` there), so the mock reads it out the same way a real skill would have to.
+            m = re.search(r"TestRail run id to (\S+)\.", kw["task_prompt"])
+            Path(m.group(1)).write_text("555")
             return
         if node == "sit_resolve":
             script._cur = script.next_sit()  # passed | code_fault | could_not_verify | needs_onboarding

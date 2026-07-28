@@ -486,7 +486,6 @@ async def sit_testrail(state: OceanState) -> dict:
         skill_name="ocean-automation-testing",
         node="sit_testrail",
         ticket_id=tid,
-        execution_id=exec_id,
         task_prompt=(
             f"Create the TestRail cases for the SIT already authored + approved for {tid} via "
             f"ocean-qa-agent (Project 22 / Suite 197 — its Steps 6/6a). Do ONLY TestRail case creation "
