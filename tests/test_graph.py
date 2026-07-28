@@ -22,6 +22,7 @@ import json
 import pytest
 
 from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry
+from ocean_pipeline import cli
 
 
 class Script:
@@ -588,3 +589,70 @@ def test_ac_coverage_passthrough(tmp_path, monkeypatch):
     final = _run()
     assert final["final_status"] == "completed"
     assert final["sit_report"]["ac_coverage"] == ac_rows
+
+
+# ----------------------------------------------------------------- cli.py resume ticket_id recovery
+def test_resume_recovers_real_ticket_id_from_checkpoint(tmp_path, monkeypatch):
+    """Regression: _resume used to hardcode ticket_id="" when calling _execute, even though the
+    checkpoint has held the real value all along — blanking the Ticket field in run-report.md on
+    every resume, and telemetrizing a failed resume with an empty ticket_id. _resume_ticket_id must
+    recover the real value from the persisted graph state before _execute runs."""
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    monkeypatch.setattr(config, "CHECKPOINT_DB", str(tmp_path / "checkpoints.sqlite"))
+    monkeypatch.setattr(config, "REQUIRE_APPROVAL", True)
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+
+    thread = {"configurable": {"thread_id": "EXE-resume-test"}, "recursion_limit": 100}
+
+    async def _pause_at_gate():
+        async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
+            app = graph.compile_app(saver)
+            await app.ainvoke(_initial(ticket="MM-9999", exe="EXE-resume-test"), config=thread)
+
+    asyncio.run(_pause_at_gate())
+
+    recovered = asyncio.run(cli._resume_ticket_id("EXE-resume-test", thread))
+    assert recovered == "MM-9999"
+
+
+def test_resume_ticket_id_best_effort_on_missing_checkpoint(tmp_path, monkeypatch):
+    """A resume against an unknown/corrupt execution_id must not raise here — _execute's own error
+    handling is the right place for that to surface, not the ticket_id recovery helper."""
+    monkeypatch.setattr(config, "CHECKPOINT_DB", str(tmp_path / "checkpoints.sqlite"))
+    thread = {"configurable": {"thread_id": "EXE-does-not-exist"}, "recursion_limit": 100}
+    recovered = asyncio.run(cli._resume_ticket_id("EXE-does-not-exist", thread))
+    assert recovered == ""
+
+
+def test_resume_passes_recovered_ticket_id_to_execute(tmp_path, monkeypatch):
+    """End-to-end regression: _resume itself (not just the helper in isolation) must pass the
+    recovered ticket_id through to _execute — catches the class of bug where the helper exists but
+    the call site still passes "" directly. Mocks _execute (and _preflight, so the test doesn't
+    need FK_AIDEVELOPER_DIR/`claude` on PATH) to capture exactly what it was called with."""
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    monkeypatch.setattr(config, "CHECKPOINT_DB", str(tmp_path / "checkpoints.sqlite"))
+    monkeypatch.setattr(config, "REQUIRE_APPROVAL", True)
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+
+    thread = {"configurable": {"thread_id": "EXE-resume-e2e"}, "recursion_limit": 100}
+
+    async def _pause_at_gate():
+        async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
+            app = graph.compile_app(saver)
+            await app.ainvoke(_initial(ticket="MM-8888", exe="EXE-resume-e2e"), config=thread)
+
+    asyncio.run(_pause_at_gate())
+
+    captured: dict = {}
+
+    async def fake_execute(execution_id, ticket_id, initial, thread):
+        captured["ticket_id"] = ticket_id
+
+    monkeypatch.setattr(cli, "_preflight", lambda: None)
+    monkeypatch.setattr(cli, "_execute", fake_execute)
+    asyncio.run(cli._resume("EXE-resume-e2e", resume_value="approve"))
+    assert captured["ticket_id"] == "MM-8888"

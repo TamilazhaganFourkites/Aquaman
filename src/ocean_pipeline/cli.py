@@ -166,9 +166,28 @@ async def _run(ticket_id: str, context: str) -> None:
     await _execute(execution_id, ticket_id, initial, thread)
 
 
+async def _resume_ticket_id(execution_id: str, thread: dict) -> str:
+    """Recover the real ticket_id from the checkpointed graph state before _execute runs.
+
+    Without this, a resume hardcoded ticket_id="" — even though the checkpoint has held the
+    real value all along (proven by _report()'s own use of final.get("ticket_id", "") on the
+    clean-finish path). That blanked the Ticket field in run-report.md on every resume, and a
+    failed resume would telemetrize execution_end with an empty ticket_id too. Best-effort: a
+    missing/corrupt checkpoint falls back to "" rather than raising, so a resume of a truly
+    unknown execution_id still surfaces _execute's own errors instead of a new one here."""
+    try:
+        async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
+            app = compile_app(saver)
+            snapshot = await app.aget_state(thread)
+            return snapshot.values.get("ticket_id", "")
+    except Exception:  # noqa: BLE001 — best-effort recovery only, never block the resume
+        return ""
+
+
 async def _resume(execution_id: str, resume_value=None) -> None:
     _preflight()
     thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": RECURSION_LIMIT}
+    ticket_id = await _resume_ticket_id(execution_id, thread)
     # A plain crash-resume replays from the checkpoint (input None). Resuming a paused gate injects
     # the decision via Command(resume=...) so the pending interrupt() returns it — a string for the
     # ready-flip gate ("approve"/"reject"), or a {decision, note} dict for the QA review gate.
@@ -178,7 +197,7 @@ async def _resume(execution_id: str, resume_value=None) -> None:
         initial = Command(resume=resume_value)
     print(f"[ocean-pipeline] resuming execution={execution_id}"
           + (f" ({resume_value})" if resume_value else ""))
-    await _execute(execution_id, "", initial, thread)
+    await _execute(execution_id, ticket_id, initial, thread)
 
 
 def main() -> None:
