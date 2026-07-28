@@ -21,8 +21,9 @@ human reviewer sees what else depends on the changed surface.
 
 ## Output
 
-Write your verdict to the path in the orchestration contract appended below (the coder verdict shape;
-values are nominal — this station's real output is the PR-description edit).
+Write your verdict to the path in the orchestration contract appended below — a bare
+`{"note": "..."}` is fine (a one-line summary of what you did or why you skipped). This station's
+real output is the PR-description edit; the verdict file only confirms you ran to completion.
 
 ## Not your job (the graph owns this)
 

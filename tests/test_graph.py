@@ -86,7 +86,7 @@ def _install(script: Script, tmp_path, monkeypatch):
             findings = [{"severity": "MAJOR", "file": "f.rb", "summary": "x"}] if v == "CHANGES_REQUIRED" else []
             return schemas.ReviewVerdict(verdict=v, findings=findings)
         # graph_augment / release_intel
-        return schemas.CoderVerdict(branch="b", pushed_sha="sha")
+        return schemas.NoOutputVerdict()
 
     # Git/PR ops are now plain code (gitops), not agent calls — stub them and count the calls
     # under the same keys the tests already assert on (open_pr / flip_ready).
@@ -802,3 +802,12 @@ def test_frontmatter_tools_returns_none_when_no_tools_key(tmp_path):
     p = tmp_path / "w.md"
     p.write_text("---\nname: x\ndescription: something\n---\n\n# X\n")
     assert agents._frontmatter_tools(p) is None
+
+
+def test_no_output_verdict_requires_no_fields():
+    """The whole point of NoOutputVerdict: graph_augment/release_intel used to reuse CoderVerdict
+    (whose branch/pushed_sha are required, no defaults) for outputs neither field means anything
+    for, forcing the worker to fabricate placeholder values just to pass validation. Confirm the
+    replacement genuinely has zero required fields."""
+    schemas.NoOutputVerdict()  # must not raise a pydantic ValidationError
+    assert schemas.NoOutputVerdict(note="skipped: code graph unreachable").note.startswith("skipped")

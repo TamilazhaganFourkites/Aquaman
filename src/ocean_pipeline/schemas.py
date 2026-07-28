@@ -55,6 +55,15 @@ class CoderVerdict(BaseModel):
     pr_body: str = ""         # PR body the open_pr code node will use
 
 
+class NoOutputVerdict(BaseModel):
+    """For a best-effort node whose real output is a side effect this schema doesn't model
+    (a PR-description edit, a Jira field update) — the verdict file only exists to satisfy
+    run_agent's write-and-read-back contract, confirming the worker ran to completion. No
+    fields are required, so the worker never has to fabricate a placeholder value (unlike
+    reusing CoderVerdict, whose branch/pushed_sha have no defaults) to pass validation."""
+    note: str = ""
+
+
 class ReviewVerdict(BaseModel):
     verdict: Literal["APPROVE", "CHANGES_REQUIRED"]
     findings: list[dict] = Field(default_factory=list)   # [{severity, file, summary}]

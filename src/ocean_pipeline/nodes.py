@@ -300,7 +300,7 @@ async def graph_augment(state: OceanState) -> dict:
             ticket_id=state["ticket_id"],
             execution_id=state["execution_id"],
             task_prompt=f"Run Graph Caller Chain Augmentation for PR #{state['pr_number']}.\n\n{_summary(state)}",
-            verdict_model=schemas.CoderVerdict,
+            verdict_model=schemas.NoOutputVerdict,
         )
         ok = True
     except Exception:
@@ -322,7 +322,7 @@ async def release_intel(state: OceanState) -> dict:
             ticket_id=state["ticket_id"],
             execution_id=state["execution_id"],
             task_prompt=f"Run the Release Intelligence Writer for {state['ticket_id']}.\n\n{_summary(state)}",
-            verdict_model=schemas.CoderVerdict,
+            verdict_model=schemas.NoOutputVerdict,
         )
         ok = True
     except Exception:
