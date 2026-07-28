@@ -239,15 +239,18 @@ Only RCA posts a comment. Add In Progress / In Review touchpoints. **Phase C.8.*
 
 ## 10. Success criteria (definition of done for the demo)
 
-- [ ] `--print-graph` shows SME-consult, git/PR ops, and the four SIT nodes as **graph nodes** (proof LangGraph owns the process).
-- [ ] No `UNIVERSAL_PREFIX` / "Station X" framing reaches any agent; workers get typed state only.
-- [ ] `open_pr` / `flip_ready` run as plain code (no agent), and are idempotent + unit-tested.
-- [ ] Node-level retry proven — a single transient agent error no longer aborts the run.
-- [ ] `ocean-pipeline --mock MM-XXXX` completes the full graph in <90s with zero side effects.
-- [ ] One real run completes end-to-end; its `run-report.md` + Langfuse trace archived (golden run).
-- [ ] `tests/test_graph.py` green after every phase; new nodes covered.
-- [ ] README has no false claims (interrupt / telemetry).
-- [ ] Demo runbook (§8) rehearsed once end-to-end.
+_Updated 2026-07-28 against the current code (not just the phase checkmarks above) — see the note
+on each item for what was actually checked before ticking it._
+
+- [x] `--print-graph` shows SME-consult, git/PR ops, and the four SIT nodes as **graph nodes** (proof LangGraph owns the process). _`graph.py`'s `build_graph()` registers `sme_consult`, `open_pr`/`flip_ready` (plain code), and `sit_resolve`/`sit_author`/`sit_run`/`sit_triage` (+ `sit_testrail`/`learn_repo`) as real nodes; `--print-graph` renders `build_graph().compile().get_graph().draw_mermaid()` directly from that live graph._
+- [ ] No `UNIVERSAL_PREFIX` / "Station X" framing reaches any agent; workers get typed state only. _Partial: the old `UNIVERSAL_PREFIX` boilerplate itself is gone, but several `nodes.py` task prompts still say "Station 0 (resolve)", "Station 5 APPROVED", etc. as human-readable phase labels sent to the ocean-automation-testing skill. Left unchecked pending a decision on whether that counts as the framing this item means to exclude._
+- [x] `open_pr` / `flip_ready` run as plain code (no agent), and are idempotent + unit-tested. _Confirmed: both are plain `gitops.py` calls with no `run_agent`; `open_draft_pr`'s idempotent reuse and `cross_link_and_ready`'s idempotent link-dedup are directly unit-tested (`tests/test_graph.py`)._
+- [ ] Node-level retry proven — a single transient agent error no longer aborts the run. _`_drive_with_retry` exists and is used by every `run_agent`/`run_skill` call, but no test directly proves a transient failure is retried-and-recovered rather than propagated. Left unchecked until that test exists._
+- [ ] `ocean-pipeline --mock MM-XXXX` completes the full graph in <90s with zero side effects. _No `--mock` flag exists in `cli.py` today — not yet implemented, not merely unverified._
+- [ ] One real run completes end-to-end; its `run-report.md` + Langfuse trace archived (golden run). _Requires an actual live run artifact — can't be verified from source; needs a human to confirm/attach one._
+- [x] `tests/test_graph.py` green after every phase; new nodes covered. _73/73 passing as of this update; coverage has grown substantially (gitops.py, jira.py, telemetry status mapping, the PreToolUse allowlist, cli.py's preflight/resume paths are now directly tested, not just exercised via the full-graph mocks)._
+- [x] README has no false claims (interrupt / telemetry). _Verified both claims are real, not aspirational: `human_gate`'s `interrupt()` exists and is exercised by `test_human_gate_interrupts_then_resume_approves`; `telemetry.py`'s `_call_async` is a real `mcp.client.streamable_http` call against the aidev-db MCP server, not a stub._
+- [ ] Demo runbook (§8) rehearsed once end-to-end. _Requires a human to actually run it — can't be verified from source._
 
 ---
 
