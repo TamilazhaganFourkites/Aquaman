@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from typing import Type, TypeVar
 
@@ -84,6 +85,62 @@ def _agent_path(agent_md: str) -> Path:
     incremental — one node at a time points at a vendored file here)."""
     vendored = config.VENDORED_AGENTS_DIR / agent_md
     return vendored if vendored.exists() else config.AGENTS_DIR / agent_md
+
+
+_FRONTMATTER_TOOLS_RE = re.compile(r'^tools:\s*(\[.*\])\s*$', re.MULTILINE)
+
+
+def _frontmatter_tools(path: Path) -> list[str] | None:
+    """Extract the `tools: [...]` allowlist from a worker/skill file's YAML frontmatter, if it
+    declares one (e.g. fk-coder.md's `tools: ["Read", "Write", "Edit", "Bash", "Grep", "Glob"]`).
+
+    Returns None when the file has no frontmatter or no `tools:` field — the vendored
+    workers/*.md files in this repo don't declare one today, and callers MUST treat that as
+    "no restriction", never as an empty allowlist, or every tool call would be denied."""
+    text = _read(path)
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None
+    m = _FRONTMATTER_TOOLS_RE.search(text[:end])
+    if not m:
+        return None
+    try:
+        tools = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    return tools if isinstance(tools, list) else None
+
+
+def _deny_outside_allowlist(allowed: list[str]):
+    """A PreToolUse hook that denies any tool call not in `allowed`.
+
+    Deliberately a hook, not `can_use_tool`: the SDK only ever consults `can_use_tool` for a
+    call that would otherwise hit an interactive "ask" prompt, and this pipeline's stations run
+    under permission_mode="bypassPermissions" (config.STATION_PERMISSION_MODE /
+    SKILL_PERMISSION_MODE) — bypassPermissions auto-approves every tool call before
+    `can_use_tool` is ever consulted (the SDK emits CanUseToolShadowedWarning if you wire it up
+    alongside bypassPermissions for exactly this reason). A PreToolUse hook is the one
+    mechanism the SDK documents as running regardless of permission_mode."""
+    allowed_set = set(allowed)
+
+    async def _hook(input_data, tool_use_id, context):  # noqa: ARG001 — SDK hook signature
+        tool_name = input_data.get("tool_name", "")
+        if tool_name in allowed_set:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"'{tool_name}' is not in this station's declared tools: allowlist "
+                    f"({sorted(allowed_set)})."
+                ),
+            }
+        }
+
+    return _hook
 
 
 def _emit(label: str, line: str) -> None:
@@ -201,10 +258,15 @@ def _format_message(msg) -> list[str]:
 
 
 async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str,
-                 label: str = "station") -> None:
+                 label: str = "station", allowed_tools: list[str] | None = None) -> None:
     # Imported lazily so the graph/routing test suite runs without the SDK (or the
     # `claude` CLI it spawns) installed — the SDK is only needed at actual run time.
-    from claude_agent_sdk import ClaudeAgentOptions, query
+    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
+
+    # Enforce the worker's own tools: frontmatter (if it declared one) via a PreToolUse hook —
+    # see _deny_outside_allowlist for why this has to be a hook and not can_use_tool.
+    hooks = ({"PreToolUse": [HookMatcher(hooks=[_deny_outside_allowlist(allowed_tools)])]}
+             if allowed_tools is not None else None)
 
     # Signal to worker skills that they're running UNDER the control plane (inherited by the
     # spawned CLI subprocess). The ocean-qa-agent's learn-a-repo gate keys off this: under the
@@ -212,11 +274,19 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     # node owns onboarding; a standalone `/ocean-qa-agent` run (no Aquaman, flag unset) self-onboards.
     os.environ["OCEAN_PIPELINE_CONTROL_PLANE"] = "1"
 
+    # Local mock-first SIT wiring (MM-13437 / EXE-c5ec3e4c fix): the test-automation SQS client keys
+    # off SQS_ENDPOINT_URL to target LocalStack; unset -> it builds as None and crashes on `.meta`,
+    # so the SQS-driven leg of a multi-repo callback E2E never assembles (could_not_verify). setdefault
+    # so an explicit override still wins. The spawned CLI subprocess (and its pytest) inherits os.environ.
+    os.environ.setdefault("SQS_ENDPOINT_URL", config.SQS_ENDPOINT_URL)
+    os.environ.setdefault("SQS_LOCAL_ACCOUNT", config.SQS_LOCAL_ACCOUNT)
+
     options = ClaudeAgentOptions(
         model=config.STATION_MODEL,
         system_prompt=system_prompt,
         cwd=str(cwd),
         permission_mode=permission_mode,
+        hooks=hooks,
     )
     ui.station_start(label)   # "▶ <station>" header; milestones stream underneath
     tools = 0
@@ -241,7 +311,8 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
 
 
 async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
-                            permission_mode: str, label: str) -> None:
+                            permission_mode: str, label: str,
+                            allowed_tools: list[str] | None = None) -> None:
     """Run the worker, retrying on any transient SDK/CLI failure with exponential backoff.
 
     A single claude-CLI ProcessError (e.g. the `Claude Code returned an error result: ...`
@@ -250,7 +321,7 @@ async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
     last: Exception | None = None
     for attempt in range(config.MAX_AGENT_RETRIES + 1):
         try:
-            await _drive(system_prompt, prompt, cwd, permission_mode, label)
+            await _drive(system_prompt, prompt, cwd, permission_mode, label, allowed_tools)
             return
         except Exception as e:  # noqa: BLE001 — retry ANY transport/SDK failure
             last = e
@@ -280,6 +351,7 @@ async def run_agent(
     if verdict_path.exists():
         verdict_path.unlink()
 
+    path = _agent_path(agent_md)
     guardrails = AGENT_GUARDRAILS.format(ticket_id=ticket_id)
     contract = VERDICT_INSTRUCTION.format(
         verdict_path=verdict_path,
@@ -287,11 +359,12 @@ async def run_agent(
     )
     try:
         await _drive_with_retry(
-            system_prompt=_read(_agent_path(agent_md)),
+            system_prompt=_read(path),
             prompt=f"{guardrails}\n\n{task_prompt}\n{contract}",
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
             permission_mode=permission_mode or config.STATION_PERMISSION_MODE,
             label=node,
+            allowed_tools=_frontmatter_tools(path),
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(node, agent_md, f"agent run failed: {type(e).__name__}: {e}") from e
@@ -328,6 +401,7 @@ async def run_skill(
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
             permission_mode=permission_mode or config.SKILL_PERMISSION_MODE,
             label=node,
+            allowed_tools=_frontmatter_tools(skill_md),
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}") from e
