@@ -1,0 +1,25 @@
+name: Claude Auto Review
+
+# Security Note: Permissions are managed by the reusable workflow, which follows
+# security best practices with explicit deny-all at root (permissions: {}) and
+# minimal grants at job level. Setting permissions here would restrict what the
+# reusable workflow can request, causing workflow failures.
+# See: https://github.com/cloudqwest/isbu-gh-actions/blob/main/.github/workflows/claude-auto-review.yml#L71-L85
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    branches:
+      - main
+
+jobs:
+  review:
+    uses: cloudqwest/isbu-gh-actions/.github/workflows/claude-auto-review.yml@v1
+    with:
+      target_branches: '["main"]'
+      enable_cleanup: true
+      timeout_minutes: 30
+      track_progress: true
+    secrets:
+      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+      gh_token: ${{ secrets.CI_GITHUB_TOKEN }}

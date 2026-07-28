@@ -33,6 +33,8 @@ class OceanState(TypedDict, total=False):
     route: Route
     research_packet: dict
     target_repos: list[TargetRepo]   # carries the language-scoped Docker decision
+    domain_bucket: str               # ocean domain; drives the SME-consult node
+    sme_findings: dict               # ownership/reuse guidance from the consulted ocean SME
 
     # --- RCA branch (diagram: RCA agent -> RCA Done -> Fix needed -> coder) ---
     rca_fix_needed: bool
@@ -47,6 +49,7 @@ class OceanState(TypedDict, total=False):
     branch: str
     pushed_sha: str
     files_changed: int
+    worktree_dir: str        # absolute path of the coder's local clone; reviewer + rework cwd here
 
     # --- Station 5: review loop (gated at MAX_REVIEW_ITERATIONS) ---
     review_verdict: ReviewVerdict
@@ -55,10 +58,13 @@ class OceanState(TypedDict, total=False):
 
     # --- 3.87 / 4.5b / 4.6 ---
     pr_number: int
+    service_repo: str        # owner/name slug the coder pushed to; used by the git/PR code nodes
+    pr_title: str            # PR title the coder proposed; the code node opens the PR with it
+    pr_body: str             # PR body the coder proposed
     graph_augmented: bool
     release_intel_written: bool
 
-    # --- Station 6: local SIT (ocean-automation-testing skill, run end-to-end) ---
+    # --- Station 6: local SIT (decomposed: resolve -> author -> qa gate -> run[+testrail] -> triage) ---
     automation_result: AutomationResult
     failure_class: FailureClass
     execution_mode: str              # local-mock-first | qat-fallback
@@ -66,10 +72,26 @@ class OceanState(TypedDict, total=False):
     test_automation_pr_url: str      # opened by the skill on pass
     sit_findings: list               # findings_for_coder (code_fault -> fk-coder)
 
+    # --- QA review gate (human 3-way: approve+TestRail / approve / changes) ---
+    qa_test_path: str                # drafted SIT file, shown to the reviewer
+    qa_decision: str                 # approve_testrail | approve_no_testrail | changes
+    qa_note: str                     # reviewer feedback carried back to sit_author on "changes"
+    qa_review_iteration: int         # capped by MAX_QA_REVIEW_ITERATIONS
+    testrail_run_id: int             # from the parallel sit_testrail branch (via state, not the verdict file)
+
+    # --- graph-owned repo onboarding (MM-14621): unsupported ocean repo -> learn_repo -> re-run SIT ---
+    needs_onboarding: bool           # Station 6 reported the changed repo is unsupported locally
+    onboard_repo: str                # which repo to learn
+    repo_onboarded: str              # the repo learn_repo profiled+persisted (for telemetry/report)
+    onboard_attempts: int            # capped by MAX_ONBOARD_ATTEMPTS so an un-onboardable repo can't loop
+
     # --- code_fault full-loop budget (shared across coder re-runs) ---
     coding_attempts: int
 
+    # --- optional human-approval gate before ready-flip ---
+    approval_decision: str   # "approve" | "reject" (set on resume); "" when the gate is off
+
     # --- ready-flip / terminal ---
     ready_flipped: bool
-    final_status: str        # completed | failed | rca_report
+    final_status: str        # completed | failed | rca_report | awaiting_approval
     final_outcome: str

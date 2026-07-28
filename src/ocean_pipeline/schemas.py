@@ -1,6 +1,6 @@
 """Structured verdicts.
 
-Most stations write to <artifacts>/<station>.verdict.json (see agents.run_station).
+Most worker nodes write to <artifacts>/<node>.verdict.json (see agents.run_agent).
 Station 6 is the exception: the ocean-automation-testing skill already defines its
 own machine-readable contract (SKILL.md Station 3) and writes it to the canonical
 memory/tickets/<TICKET>-automation-testing.json. AutomationVerdict mirrors that
@@ -13,11 +13,19 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-# ---- generic per-station verdicts (written via run_station's contract) -------
+# ---- generic per-node verdicts (written via run_agent's contract) -------
 class ResearchVerdict(BaseModel):
     route: Literal["coding", "rca", "sop", "loft", "ff_onboarding", "unclassified"]
     packet_path: str
     target_repos: list[dict]              # [{repo, language, build_env, branch}]
+    # Ocean domain the ticket touches, so the graph can consult the right SME node.
+    domain_bucket: str = ""               # callback_notification | load_creation | ocean_tracking_milestones | ""
+
+
+class SmeVerdict(BaseModel):
+    """Ocean domain SME answer: which repo/file/mechanism owns the change + reuse guidance."""
+    summary: str = ""
+    findings: list = Field(default_factory=list)
 
 
 class ReachabilityVerdict(BaseModel):
@@ -39,6 +47,12 @@ class CoderVerdict(BaseModel):
     branch: str
     pushed_sha: str
     files_changed: int = 0
+    # The graph opens the PR itself (deterministic code), so the coder only reports WHICH repo
+    # it pushed to and the human-readable title/body to use — it never runs `gh pr create`.
+    repo: str = ""            # owner/name (or bare name) of the repo the branch was pushed to
+    repo_dir: str = ""        # absolute path of the local clone (reviewer + rework run here)
+    pr_title: str = ""        # PR title the open_pr code node will use
+    pr_body: str = ""         # PR body the open_pr code node will use
 
 
 class ReviewVerdict(BaseModel):
@@ -79,3 +93,9 @@ class AutomationVerdict(BaseModel):
     evidence: str = ""
     test_automation_pr_url: str = ""
     findings_for_coder: list = Field(default_factory=list)
+    # Graph-owned onboarding (MM-14621): under the Aquaman control plane the skill does NOT
+    # self-clone/commit an unsupported ocean repo — it reports the gap here and the graph's
+    # learn_repo node owns the decision + persistence. Absent/false on a normal run, so a skill
+    # that never emits these is fully backward-compatible.
+    needs_onboarding: bool = False
+    onboard_repo: str = ""            # the ocean repo the SIT could not run because it is unsupported

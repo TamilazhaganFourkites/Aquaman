@@ -17,10 +17,11 @@ re-express any station logic.
 | Fixed sequence 0 → 1 → 1.5 → 4 → 5 → 6 | linear edges |
 | Router: RCA → stop vs coding → continue | conditional edge (`route_after_research`) |
 | Review loop 5↔4, **max 2 iterations** | conditional edge + `review_iteration` counter |
-| Never auto-merge; engineer owns the ready-flip | `interrupt()` before `gh pr ready` |
-| Telemetry START/END + station events | node hooks in `telemetry.py` |
+| Never auto-merge/deploy; auto-flip to ready on green, with an optional human gate | plain-code `flip_ready`; optional `interrupt()` in `human_gate` (`OCEAN_PIPELINE_REQUIRE_APPROVAL`) |
+| Telemetry START/END + station events | `telemetry.py` → aidev-db HTTP MCP (`Bearer $RCA_TOKEN`), best-effort |
 | AP-223 orphaned `running` rows | SQLite checkpointer → resume, not orphan |
 | Language-scoped Docker (ruby=docker, java/go=native) | carried per-repo in `state["target_repos"]` |
+| Unsupported ocean repo → learn it, don't dead-stop | `learn_repo` node + conditional edge (`MAX_ONBOARD_ATTEMPTS`) |
 
 ## Graph
 
@@ -39,18 +40,39 @@ START → researcher ─┬─(rca)────→ rca_agent ─┬─(no fix)�
    coder ◄──────────┘                                                                      │
                               passed → flip_ready (raise test PR + link it in service ─────┤ → END
                                         PR, gh pr ready)                                    │
+                    ┌── needs_onboarding & onboard_attempts<budget → learn_repo ───────────┤
+                    │       (onboards the unsupported repo, then re-enters automation_testing)
+   automation_testing ◄─────┘                                                              │
                               could_not_verify | budget exhausted → stop_run ──────────────┘ → END
 ```
 `open_pr*` is idempotent — the code_fault loop re-enters it as a no-op since the service PR is already open.
 An RCA that concludes **Fix needed** joins the coding pipeline at `dep_resolver`, so the fix gets the same
 dependency resolution and reachability gating as any coding ticket.
 
-Station 6 is a single node driving the `ocean-automation-testing` skill end-to-end (headless). Its internal
-`write → run → pass` stages (the design diagram's boxes) belong to the skill (SKILL.md Stations 0–3), which
-owns their sequencing and failure handling and persists state to
-`memory/tickets/<TICKET>-automation-testing.json`. The node reads that verdict and the graph branches on it;
-a Docker/infra bring-up failure is the skill's own `could_not_verify`. `flip_ready` then cross-links the test
-PR into the service PR and flips it to ready.
+When Station 6 finds the ticket's changed repo is an ocean service it doesn't yet support locally, it does
+**not** self-onboard (that would be a hidden write to the control-plane repo). It reports `needs_onboarding` +
+`onboard_repo` in its verdict and stops; the graph's `learn_repo` node then owns the decision and the
+persistence — it invokes the skill's *learn-a-repo mechanic* (`local_service_execution.md` Steps N1–N5) as an
+authorized onboarding pass (clone → profile → commit the profile), then re-runs `automation_testing`. Capped
+by `MAX_ONBOARD_ATTEMPTS`. Standalone/interactive `/ocean-automation-testing` runs still self-onboard.
+
+Station 6 is **decomposed into graph nodes** so LangGraph owns its sequence rather than the skill running
+end-to-end: `sit_resolve → sit_author → qa_review_gate → sit_run [‖ sit_testrail] → sit_triage`. Each drives
+the `ocean-automation-testing` skill one `--only` phase at a time, with the skill's own
+`memory/tickets/<TICKET>-automation-testing.json` carrying state between them.
+
+- **`sit_resolve`** resolves the changed repo; an unsupported repo branches to `learn_repo` *before* any
+  authoring/running.
+- **`sit_author`** drafts the SIT scenarios + sample test and **stops** (no TestRail, no run).
+- **`qa_review_gate`** is a **human 3-way review** (default ON) — the same choice `ocean-qa-agent` offers
+  interactively, surfaced as an `interrupt()` so it works headless: `--qa approve-testrail` |
+  `approve-no-testrail` | `changes` (loops back to redraft). `OCEAN_PIPELINE_QA_AUTOAPPROVE` skips the pause.
+- **`sit_run`** executes the approved SIT local + mock-first; on *approve-testrail*, **`sit_testrail`** writes
+  the TestRail cases **in parallel** (the API is slow + rate-limited, so it never blocks the functional run).
+- **`sit_triage`** parses junit, triages (`pass` → human gate → ready-flip; `code_fault` → rework;
+  `could_not_verify` → stop), and opens the test-automation PR on pass.
+
+`flip_ready` then cross-links the test PR into the service PR and flips it to ready.
 
 ## Layout
 
@@ -229,7 +251,12 @@ orchestrator's `flip_ready` node.
 
 ## Status
 
-MM-14615: full node/edge topology, checkpointer, telemetry hooks, the Claude Agent SDK
-bridge, the RCA→fix→coder branch, the review loop, and **Station 6 (ocean-automation-testing)
-with the code_fault full-loop** are all in place. The one remaining hook is the aidev-db MCP
-transport in `telemetry.py` (`_call_mcp`), left thin so the transport is swappable.
+MM-14615 / MM-14621: full node/edge topology, checkpointer, the Claude Agent SDK bridge, the
+RCA→fix→coder branch, the review loop, and **Station 6 (ocean-automation-testing) with the
+code_fault full-loop** are in place. MM-14621 made LangGraph the sole control plane — vendored
+slim workers (`workers/research|code|review.md`), graph-owned SME consult, deterministic
+git/PR code nodes, the coder's worktree threaded to the reviewer, an optional human-approval
+gate before the ready-flip, and Jira lifecycle transitions. **Telemetry is wired** to the
+aidev-db HTTP MCP server (`telemetry.py`, best-effort, no-op without `RCA_TOKEN`; transport
+validated live). Remaining: decompose Station 6 into per-step graph nodes (deferred behind the
+`learn_repo` onboarding work).

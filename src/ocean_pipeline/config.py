@@ -17,6 +17,12 @@ FK_AIDEVELOPER_DIR = Path(
 
 AGENTS_DIR = FK_AIDEVELOPER_DIR / "agents" / "pipeline"
 
+# Slim, single-job worker prompts VENDORED into this repo (Phase B onward): the graph owns
+# these workers, stripped of the fk-aideveloper station process. run_agent resolves an
+# agent_md here FIRST, falling back to AGENTS_DIR for nodes not yet migrated. Named "workers"
+# (not "agents") to avoid clashing with the agents.py module in the same package.
+VENDORED_AGENTS_DIR = Path(__file__).resolve().parent / "workers"
+
 # Per-run artifact root (reachability-report.json, per-station verdict.json, etc.)
 ARTIFACTS_ROOT = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline"))
 
@@ -40,9 +46,29 @@ RCA_ONLY = os.environ.get("OCEAN_PIPELINE_RCA_ONLY", "").lower() in ("1", "true"
 # Hard cap on the Station 5 <-> Station 4 review loop (CLAUDE.md: max 2 iterations).
 MAX_REVIEW_ITERATIONS = 2
 
+# Optional human-approval gate before the ready-flip. Default OFF (auto-flip on green, the
+# intended terminal action). When ON, the graph interrupt()s and waits for an engineer to
+# resume with an approve/reject decision — the pipeline still never merges or deploys.
+REQUIRE_APPROVAL = os.environ.get("OCEAN_PIPELINE_REQUIRE_APPROVAL", "").lower() in ("1", "true", "yes")
+
+# SIT QA review gate. After the SIT scenarios + sample test are drafted, a human reviews them and
+# makes the same 3-way call ocean-qa-agent offers interactively: approve-with-TestRail /
+# approve-without-TestRail / changes-needed. Default ON (the graph interrupt()s and waits). Set
+# QA_REVIEW_AUTO for a hands-off run (no pause) — it then auto-approves, creating TestRail cases
+# only if QA_TESTRAIL is on. The TestRail branch runs in PARALLEL with the local run (TestRail's
+# API is slow + rate-limited, so it must not block the functional gate).
+QA_REVIEW_AUTO = os.environ.get("OCEAN_PIPELINE_QA_AUTOAPPROVE", "").lower() in ("1", "true", "yes")
+QA_TESTRAIL = os.environ.get("OCEAN_PIPELINE_TESTRAIL", "").lower() in ("1", "true", "yes")
+MAX_QA_REVIEW_ITERATIONS = int(os.environ.get("OCEAN_PIPELINE_MAX_QA_REVIEW_ITERATIONS", "3"))
+
 # Shared coding-attempts budget for the code_fault full-loop
 # (Station 6 code_fault -> fk-coder -> Station 5 re-review -> Station 6).
 MAX_CODING_ATTEMPTS = 2
+
+# How many times the graph will onboard an unsupported ocean repo (learn_repo) and re-run
+# Station 6 before giving up. 1 is enough for the normal case (learn once, re-run once); a
+# repo that still reports unsupported after being profiled is a genuine could_not_verify stop.
+MAX_ONBOARD_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ONBOARD_ATTEMPTS", "1"))
 
 # Claude Agent SDK permission mode. This pipeline runs fully headless — every
 # station shells out (git push, gh pr create/ready, docker, pytest), and "acceptEdits"
@@ -53,12 +79,34 @@ MAX_CODING_ATTEMPTS = 2
 STATION_PERMISSION_MODE = os.environ.get("OCEAN_PIPELINE_PERMISSION_MODE", "bypassPermissions")
 SKILL_PERMISSION_MODE = os.environ.get("OCEAN_PIPELINE_SKILL_PERMISSION_MODE", "bypassPermissions")
 
-# isbu profile boards that run the full end-to-end pipeline (per CLAUDE.md).
-ISBU_PROJECTS = {"MM", "ANG", "RAIL", "INTMOD", "BAR", "ISBUETA", "ISAI", "DO"}
+# Boards the ocean-pipeline handles end-to-end. Scoped to the MM (Ocean) board only for now — the
+# other isbu boards (ANG/RAIL/INTMOD/BAR/ISBUETA/ISAI/DO) run the non-isbu coding-only default in
+# fk-execute (draft PR). Widen this set when the ocean-pipeline is rolled out to them.
+ISBU_PROJECTS = {"MM"}
+
+# Node-level resilience. A single transient claude-CLI/SDK failure (e.g. a ProcessError
+# that the SDK surfaces as `Claude Code returned an error result: ...`, seen in run.log for
+# MM-14472) must NOT abort a whole run. The agent/skill driver retries with exponential
+# backoff before giving up; the checkpointer still allows a full --resume if all retries fail.
+MAX_AGENT_RETRIES = int(os.environ.get("OCEAN_PIPELINE_MAX_AGENT_RETRIES", "2"))
+AGENT_RETRY_BACKOFF_SECONDS = float(os.environ.get("OCEAN_PIPELINE_AGENT_RETRY_BACKOFF", "3"))
+
+# Default GitHub org for FK service repos. Branches are pushed to upstream, never forked
+# (see the guardrails), so the git/PR code nodes address repos as `<org>/<name>`.
+DEFAULT_REPO_ORG = os.environ.get("OCEAN_PIPELINE_REPO_ORG", "cloudqwest")
 
 
 def artifacts_dir(execution_id: str) -> Path:
     d = ARTIFACTS_ROOT / execution_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def workspace_dir(execution_id: str) -> Path:
+    """Per-run workspace the coder clones the target repo into. The graph owns this location
+    (rather than letting the worker pick an opaque sandbox) so the reviewer and a rework coder
+    run against the SAME working tree — the coder reports the clone path back as repo_dir."""
+    d = ARTIFACTS_ROOT / execution_id / "workspace"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

@@ -56,27 +56,31 @@ def _preflight() -> None:
 
 def _report(execution_id: str, final: dict, total: float) -> None:
     telemetry.execution_end(execution_id, final.get("ticket_id", ""),
-                            final.get("final_status", "failed"), final.get("route", "coding"))
+                            final.get("final_status", "failed"), final.get("route", "coding"),
+                            final_outcome=final.get("final_outcome", ""))
     ui.summary(final, total)
 
 
-async def _drive_stream(app, initial, thread) -> tuple[dict, float]:
-    """Stream station completions as a clean runner log, then return (state, elapsed).
+async def _drive_stream(app, initial, thread) -> tuple[dict, float, bool]:
+    """Stream station completions as a clean runner log, then return (state, elapsed, paused).
 
     One line per station (plain-English name, elapsed, outcome). Per-node elapsed is
     the wall-clock between consecutive completions — the pipeline runs sequentially,
     so that is the station's own runtime. --verbose adds the raw agent activity above
-    each line."""
+    each line. `paused` is True when the graph stopped at an interrupt() (the human-approval
+    gate) rather than reaching an end — the run is resumable with --approve/--reject."""
     start = time.monotonic()
     last = start
     async for chunk in app.astream(initial, config=thread, stream_mode="updates"):
         now = time.monotonic()
         for node, update in chunk.items():
+            if node == "__interrupt__":   # human-approval gate paused the run — not a real node
+                continue
             ui.step(node, update, now - last)
             report.record(node, now - last, update)
         last = now
     snapshot = await app.aget_state(thread)
-    return snapshot.values, time.monotonic() - start
+    return snapshot.values, time.monotonic() - start, bool(snapshot.next)
 
 
 async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
@@ -104,10 +108,24 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
     try:
         async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
             app = compile_app(saver)
-            final, total = await _drive_stream(app, initial, thread)
-        _report(execution_id, final, total)
+            final, total, paused = await _drive_stream(app, initial, thread)
+        if paused:
+            # Human-approval gate: leave the run 'running' (no END row) — the resume finalizes it.
+            print(f"\n[PAUSED] awaiting human approval before flipping the service PR ready.\n"
+                  f"  approve: ocean-pipeline --resume {execution_id} --approve\n"
+                  f"  reject:  ocean-pipeline --resume {execution_id} --reject")
+        else:
+            _report(execution_id, final, total)
+            # Machine-readable completion line for headless runners (oas-autodev's
+            # reconcile matches `pr=#<n>` / a PR URL in the log tail). Emitting the PR
+            # number on a clean finish means a green run is tracked as ready-for-merge
+            # instead of being mis-classified as blocked (exit 0 + no PR string).
+            pr = final.get("pr_number")
+            print(f"[DONE] {ticket_id} status={final.get('final_status') or 'completed'}"
+                  + (f" pr=#{pr}" if pr else ""))
     except Exception as e:  # noqa: BLE001 — never leave a `running` row orphaned (AP-223)
-        telemetry.execution_end(execution_id, ticket_id, "failed", "unknown")
+        telemetry.execution_end(execution_id, ticket_id, "failed", "unknown",
+                                final_outcome=f"{type(e).__name__}: {e}")
         print(f"\n[FAILED] {type(e).__name__}: {e}")
         final = {**final, "final_status": final.get("final_status") or "failed",
                  "final_outcome": final.get("final_outcome") or f"{type(e).__name__}: {e}"}
@@ -121,6 +139,7 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             pass
         if handler is not None:
             tracing.flush()
+        telemetry.flush()   # drain best-effort aidev-db writes so the END row lands before exit
 
 
 async def _run(ticket_id: str, context: str) -> None:
@@ -147,11 +166,19 @@ async def _run(ticket_id: str, context: str) -> None:
     await _execute(execution_id, ticket_id, initial, thread)
 
 
-async def _resume(execution_id: str) -> None:
+async def _resume(execution_id: str, resume_value=None) -> None:
     _preflight()
     thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": RECURSION_LIMIT}
-    print(f"[ocean-pipeline] resuming execution={execution_id}")
-    await _execute(execution_id, "", None, thread)  # None -> resume from checkpoint
+    # A plain crash-resume replays from the checkpoint (input None). Resuming a paused gate injects
+    # the decision via Command(resume=...) so the pending interrupt() returns it — a string for the
+    # ready-flip gate ("approve"/"reject"), or a {decision, note} dict for the QA review gate.
+    initial = None
+    if resume_value is not None:
+        from langgraph.types import Command
+        initial = Command(resume=resume_value)
+    print(f"[ocean-pipeline] resuming execution={execution_id}"
+          + (f" ({resume_value})" if resume_value else ""))
+    await _execute(execution_id, "", initial, thread)
 
 
 def main() -> None:
@@ -159,6 +186,13 @@ def main() -> None:
     p.add_argument("ticket", nargs="?", help="Jira ticket id, e.g. MM-14615")
     p.add_argument("--context", default="", help="extra context for the run")
     p.add_argument("--resume", metavar="EXECUTION_ID", help="continue a crashed run from its last checkpoint")
+    p.add_argument("--approve", action="store_true",
+                   help="with --resume: approve a paused human-approval gate (proceed to ready-flip)")
+    p.add_argument("--reject", action="store_true",
+                   help="with --resume: reject a paused human-approval gate (leave the PR draft)")
+    p.add_argument("--qa", choices=["approve-testrail", "approve-no-testrail", "changes"],
+                   help="with --resume: answer a paused QA review gate")
+    p.add_argument("--note", default="", help="with --resume --qa changes: feedback for the redraft")
     p.add_argument("--print-graph", action="store_true", help="print the mermaid diagram and exit")
     p.add_argument("--rca-only", action="store_true",
                    help="run research + ocean-rca report and STOP (no auto-coding, even if a fix is needed)")
@@ -174,7 +208,15 @@ def main() -> None:
     if args.print_graph:
         print(build_graph().compile().get_graph().draw_mermaid())
     elif args.resume:
-        asyncio.run(_resume(args.resume))
+        if args.qa:   # QA review gate: {decision, note}
+            resume_value = {"decision": args.qa.replace("-", "_"), "note": args.note}
+        elif args.approve:
+            resume_value = "approve"
+        elif args.reject:
+            resume_value = "reject"
+        else:
+            resume_value = None
+        asyncio.run(_resume(args.resume, resume_value))
     elif args.ticket:
         asyncio.run(_run(args.ticket, args.context))
     else:
