@@ -100,3 +100,18 @@ def test_load_tickets_from_file(tmp_path):
         tickets = []
 
     assert qa_batch._load_tickets(Args()) == ["MM-101", "MM-102", "MM-103"]
+
+
+def test_run_one_forces_qa_review_auto_even_when_caller_left_it_off(tmp_path, monkeypatch):
+    """Regression: QA_REVIEW_AUTO used to be set only in main(), so a caller that imports run_one/
+    run_batch directly (this module's own docstring documents `python -m ocean_pipeline.qa_batch`
+    as supported usage) would hit qa_review_gate's interrupt() with nobody watching -- the run
+    never resumes (no checkpointer here), silently defeating the unattended-sweep purpose. Force
+    QA_REVIEW_AUTO back to its real default (False) AFTER _install's own override, proving run_one
+    itself restores the invariant rather than relying on the caller to have set it."""
+    s = Script(sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", False)   # override _install's own default back off
+    result = asyncio.run(qa_batch.run_one("MM-9"))
+    assert result["final_status"] == "completed"
+    assert config.QA_REVIEW_AUTO is True   # run_one must have set it back

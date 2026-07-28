@@ -89,7 +89,16 @@ def build_qa_subgraph():
 
 async def run_one(ticket_id: str) -> dict:
     """Run the QA-only subgraph for ONE ticket (no checkpointer needed — a batch item is one shot,
-    never resumed mid-run; a crash just fails that ticket and the batch moves on)."""
+    never resumed mid-run; a crash just fails that ticket and the batch moves on).
+
+    Sets config.QA_REVIEW_AUTO here, not just in main() — this is the actual function that builds
+    and runs the graph, so it's the one place that can guarantee the invariant regardless of
+    whether the caller went through main()/run_batch or imported run_one directly (this module's
+    own docstring documents `python -m ocean_pipeline.qa_batch` as a supported usage, and a direct
+    import is just as plausible). Without this, a caller that bypasses main() would hit
+    qa_review_gate's interrupt() with nobody watching — the run never resumes (no checkpointer;
+    "never resumed mid-run" above), silently defeating the entire unattended-sweep purpose."""
+    config.QA_REVIEW_AUTO = True
     execution_id = telemetry.new_execution_id()
     telemetry.station_event(execution_id, 6, "qa_batch_start", ticket_id=ticket_id)
     app = build_qa_subgraph().compile()
@@ -151,8 +160,7 @@ def main() -> None:
     tickets = _load_tickets(args)
     if not tickets:
         p.error("provide ticket ids, or -f tickets.txt")
-    config.QA_REVIEW_AUTO = True   # unattended — cannot pause on a human review interrupt overnight
-    results = asyncio.run(run_batch(tickets))
+    results = asyncio.run(run_batch(tickets))  # run_one sets config.QA_REVIEW_AUTO -- see its docstring
     _print_summary(results)
     sys.exit(0 if all(r.get("final_status") == "completed" for r in results) else 1)
 
