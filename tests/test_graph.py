@@ -547,7 +547,7 @@ def test_jira_noop_without_token(monkeypatch):
 def test_docker_preflight_reason_pure(monkeypatch):
     """_docker_preflight_reason is a pure wrapper over _docker_resources — test it directly, no Docker
     needed. Empty string = OK; non-empty = a ready-to-use could_not_verify reason."""
-    monkeypatch.setattr(nodes, "_docker_resources", lambda: (0.0, 0))
+    monkeypatch.setattr(nodes, "_docker_resources", lambda: None)
     assert "not running" in nodes._docker_preflight_reason()
 
     monkeypatch.setattr(config, "MIN_DOCKER_MEMORY_GB", 8.0)
@@ -1056,3 +1056,48 @@ def test_automation_verdict_ac_coverage_requires_dicts():
     with pytest.raises(Exception):
         schemas.AutomationVerdict(ticket_id="MM-1", automation_result="passed",
                                   ac_coverage=["AC1 passed"])
+
+
+# ----------------------------------------------------------------- nodes._docker_resources real logic
+def test_docker_resources_none_when_docker_not_on_path(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert nodes._docker_resources() is None
+
+
+def test_docker_resources_none_when_docker_info_fails(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/docker")
+
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    assert nodes._docker_resources() is None
+
+
+def test_docker_resources_none_when_expected_fields_missing(monkeypatch):
+    """Regression: an alternate Docker backend (colima/Podman/Rancher Desktop) whose `docker info
+    --format '{{json .}}'` omits MemTotal/NCPU used to silently produce (0.0, 0) -- the SAME tuple
+    used for "Docker isn't running" -- misreporting a genuinely running environment as down. Must
+    now return None distinctly, same as the not-reachable case, rather than a misleading 0.0 GB."""
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/docker")
+
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps({"SomeOtherField": 123})   # no MemTotal/NCPU at all
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    assert nodes._docker_resources() is None
+
+
+def test_docker_resources_parses_real_fields(monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/docker")
+
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps({"MemTotal": 8 * 1024 ** 3, "NCPU": 4})
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    mem_gb, cpus = nodes._docker_resources()
+    assert mem_gb == 8.0
+    assert cpus == 4

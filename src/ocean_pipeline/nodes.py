@@ -17,30 +17,39 @@ from . import agents, config, gitops, jira, schemas, telemetry
 from .state import OceanState
 
 
-def _docker_resources() -> tuple[float, int]:
-    """(mem_gb, cpus) from `docker info`, or (0, 0) if Docker isn't reachable. Plain deterministic
-    check — no agent call — so sit_run can fail fast (~1s) instead of spending an entire expensive
-    agent invocation attempting a bring-up that's going to OOM (see config.MIN_DOCKER_MEMORY_GB)."""
+def _docker_resources() -> tuple[float, int] | None:
+    """(mem_gb, cpus) from `docker info`, or None if Docker isn't reachable OR its output doesn't
+    expose the fields we need. Returning None (rather than (0, 0)) for BOTH cases matters: an
+    alternate Docker backend (colima/Podman/Rancher Desktop) that omits MemTotal/NCPU from
+    `docker info --format '{{json .}}'` is genuinely running, just not introspectable this way —
+    conflating that with "Docker isn't running" would misreport a real environment as down.
+    Plain deterministic check — no agent call — so sit_run can fail fast (~1s) instead of
+    spending an entire expensive agent invocation attempting a bring-up that's going to OOM
+    (see config.MIN_DOCKER_MEMORY_GB)."""
     if not shutil.which("docker"):
-        return 0.0, 0
+        return None
     try:
         out = subprocess.run(["docker", "info", "--format", "{{json .}}"],
                              capture_output=True, text=True, timeout=10)
         if out.returncode != 0 or not out.stdout.strip():
-            return 0.0, 0
+            return None
         info = json.loads(out.stdout)
-        mem_gb = info.get("MemTotal", 0) / (1024 ** 3)
-        return mem_gb, info.get("NCPU", 0)
+        if "MemTotal" not in info or "NCPU" not in info:
+            return None
+        return info["MemTotal"] / (1024 ** 3), info["NCPU"]
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        return 0.0, 0
+        return None
 
 
 def _docker_preflight_reason() -> str:
     """Empty string if Docker has enough resources per config.MIN_DOCKER_MEMORY_GB/CPUS; otherwise
     a ready-to-use could_not_verify reason string."""
-    mem_gb, cpus = _docker_resources()
-    if mem_gb == 0.0 and cpus == 0:
-        return "could_not_verify: Docker is not running or not reachable (docker info failed)"
+    resources = _docker_resources()
+    if resources is None:
+        return ("could_not_verify: Docker is not running, not reachable, or `docker info` didn't "
+                 "expose memory/CPU (an alternate backend like colima/Podman may need a different "
+                 "check) — could not determine available resources.")
+    mem_gb, cpus = resources
     if mem_gb < config.MIN_DOCKER_MEMORY_GB or cpus < config.MIN_DOCKER_CPUS:
         return (f"could_not_verify: insufficient_docker_resources — have {mem_gb:.1f} GB / {cpus} CPU, "
                 f"need >= {config.MIN_DOCKER_MEMORY_GB} GB / {config.MIN_DOCKER_CPUS} CPU (see "
