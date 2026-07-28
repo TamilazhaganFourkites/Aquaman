@@ -19,7 +19,7 @@ class ResearchVerdict(BaseModel):
     packet_path: str
     target_repos: list[dict]              # [{repo, language, build_env, branch}]
     # Ocean domain the ticket touches, so the graph can consult the right SME node.
-    domain_bucket: str = ""               # callback_notification | load_creation | ocean_tracking_milestones | ""
+    domain_bucket: str = ""               # callback_notification | load_creation | ocean_tracking_milestones | ocean_data_quality | ""
 
 
 class SmeVerdict(BaseModel):

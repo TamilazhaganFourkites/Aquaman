@@ -80,6 +80,7 @@ _SME_BY_BUCKET = {
     "callback_notification": "sme-callback-notification.md",
     "load_creation": "sme-load-creation.md",
     "ocean_tracking_milestones": "sme-ocean-milestones.md",
+    "ocean_data_quality": "sme-ocean-data-quality.md",
 }
 
 

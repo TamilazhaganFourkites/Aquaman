@@ -67,6 +67,8 @@ right domain SME next:
 - `callback_notification` — callbacks/webhooks triggered, computed, delivered.
 - `load_creation` — loads created / enriched / deduplicated / mode-classified.
 - `ocean_tracking_milestones` — milestone events (AX/PX/X2/AG/C1/UV/VA/VD/OA/D), ETA.
+- `ocean_data_quality` — wrong/stale/missing DATA: crawled JT/eRPA payloads, port/stop identity &
+  sequencing, vessel identity, export/report/dashboard number mismatches, D&D/LFD charges.
 - `""` — none clearly applies.
 
 ## Output
