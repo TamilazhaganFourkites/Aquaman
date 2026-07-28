@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry
+from ocean_pipeline import agents, config, gitops, graph, jira, nodes, schemas, telemetry, ui
 from ocean_pipeline import cli
 
 
@@ -811,3 +811,26 @@ def test_no_output_verdict_requires_no_fields():
     replacement genuinely has zero required fields."""
     schemas.NoOutputVerdict()  # must not raise a pydantic ValidationError
     assert schemas.NoOutputVerdict(note="skipped: code graph unreachable").note.startswith("skipped")
+
+
+# ----------------------------------------------------------------- dep_resolver blocking parity
+def test_dep_resolver_surfaces_its_own_blocking_claim(monkeypatch):
+    """Regression: dep_resolver and reachability_gate both use ReachabilityVerdict, but
+    dep_resolver silently dropped v.blocking from its return dict while reachability_gate
+    surfaced it as reachability_blocking -- same schema, inconsistent treatment. dep_resolver
+    must surface its own claim the same way, as dependency_blocking."""
+    async def fake_run_agent(**kw):
+        return schemas.ReachabilityVerdict(report_path="/tmp/x.json", blocking=True, notes="blocked on X")
+
+    monkeypatch.setattr(agents, "run_agent", fake_run_agent)
+    result = asyncio.run(nodes.dep_resolver({"ticket_id": "MM-1", "execution_id": "EXE-x"}))
+    assert result["dependency_blocking"] is True
+    assert result["dependency_report"]["notes"] == "blocked on X"
+
+
+def test_ui_highlight_shows_dep_resolver_blocking():
+    assert ui._highlight("dep_resolver", {"dependency_blocking": True,
+                                          "dependency_report": {"notes": "blocked on X"}}) \
+        == "BLOCKING: blocked on X"
+    assert ui._highlight("dep_resolver", {"dependency_blocking": False,
+                                          "dependency_report": {"notes": ""}}) == "no blockers"

@@ -147,7 +147,8 @@ def _highlight(node: str, upd: dict) -> str:
         return f"→ routed to {upd.get('route', '')}"
     if node == "dep_resolver":
         notes = (upd.get("dependency_report") or {}).get("notes") or ""
-        return (notes[:48] + "…") if len(notes) > 49 else (notes or "no blockers")
+        body = (notes[:48] + "…") if len(notes) > 49 else (notes or "no blockers")
+        return f"BLOCKING: {body}" if upd.get("dependency_blocking") else body
     if node == "reachability_gate":
         return "BLOCKING claim found" if upd.get("reachability_blocking") else "all claims verified"
     if node == "rca_agent":

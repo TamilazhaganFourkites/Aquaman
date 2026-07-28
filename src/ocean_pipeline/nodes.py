@@ -160,8 +160,9 @@ async def dep_resolver(state: OceanState) -> dict:
         ),
         verdict_model=schemas.ReachabilityVerdict,
     )
-    telemetry.station_event(state["execution_id"], 1, "end")
-    return {"dependency_report": {"report_path": v.report_path, "notes": v.notes}}
+    telemetry.station_event(state["execution_id"], 1, "end", blocking=v.blocking)
+    return {"dependency_report": {"report_path": v.report_path, "notes": v.notes},
+            "dependency_blocking": v.blocking}
 
 
 # ------------------------------------------------------------------ Station 1.5

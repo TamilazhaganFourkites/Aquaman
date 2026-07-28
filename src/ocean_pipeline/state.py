@@ -42,6 +42,7 @@ class OceanState(TypedDict, total=False):
 
     # --- Station 1 / 1.5 ---
     dependency_report: dict
+    dependency_blocking: bool        # dep_resolver's own blocking claim; surfaced in the runner log
     reachability_report: dict        # binding artifact fk-coder must obey
     reachability_blocking: bool      # surfaced in the runner log
 
