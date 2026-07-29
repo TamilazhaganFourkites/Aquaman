@@ -12,7 +12,7 @@ from typing import Literal, TypedDict
 Route = Literal["coding", "rca", "sop", "loft", "ff_onboarding", "unclassified"]
 ReviewVerdict = Literal["APPROVE", "CHANGES_REQUIRED"]
 AutomationResult = Literal["passed", "failed"]
-FailureClass = Literal["", "code_fault", "could_not_verify"]
+FailureClass = Literal["", "code_fault", "could_not_verify", "environment_failure"]
 
 
 class TargetRepo(TypedDict):
@@ -93,6 +93,11 @@ class OceanState(TypedDict, total=False):
 
     # --- code_fault full-loop budget (shared across coder re-runs) ---
     coding_attempts: int
+
+    # --- environment_failure retry budget (sit_run only, NOT the full coder loop) ---
+    # capped by MAX_ENV_RETRY_ATTEMPTS; only bumped for agent-diagnosed environment_failure, never
+    # for the deterministic preflight_failed short-circuit (that never retries, see graph.py)
+    env_retry_attempts: int
 
     # --- optional human-approval gate before ready-flip ---
     approval_decision: str   # "approve" | "reject" (set on resume); "" when the gate is off

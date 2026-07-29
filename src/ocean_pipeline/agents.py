@@ -56,9 +56,14 @@ class StationError(RuntimeError):
 AGENT_GUARDRAILS = """\
 Operating guardrails for ticket {ticket_id}:
 - Never fork cloudqwest repos -- push branches directly to upstream
+- Clone over HTTPS with the gh token: `git clone https://$(gh auth token)@github.com/cloudqwest/<repo>.git`
+  -- never `git@github.com:` (SSH keys are not configured; it fails `Permission denied (publickey)`)
 - Every commit must include {ticket_id} in the message
 - Never write FK service code into fk-aideveloper -- clone the target repo
 - Parameterized queries only -- no SQL string concatenation
+- Any settings/config you materialize into the workspace (e.g. a copy of an environment-configuration
+  `settings.yml`) holds LIVE credentials -- write it mode 0600, never commit it, and never echo its
+  contents to logs or the transcript
 - This pipeline never auto-merges or auto-deploys; the engineer owns final merge, sign-off, deploy
 
 Ocean/MM build+test rule (LANGUAGE-SCOPED — decided by the repo's LANGUAGE, not a fixed repo list,
@@ -369,6 +374,13 @@ def _format_message(msg) -> list[str]:
         if subtype == "task_updated":
             patch = getattr(msg, "patch", None) or {}
             return [f"⚡ sub-agent task update: {json.dumps(patch, default=str)[:200]}"]
+        if subtype == "thinking_tokens":
+            # A live "still thinking, ~N tokens so far" progress ping the CLI fires roughly
+            # every ~50 thinking-tokens — not a discrete event like a tool call or task
+            # completion. A single long thinking burst emits dozens of these; printing each
+            # one is pure noise (the actual thinking CONTENT still shows via the 💭 line
+            # above, from ThinkingBlock — this only ever duplicates the running token count).
+            return []
         # Any other `system` subtype (hook events, rate limits, mirror errors, a future
         # kind we haven't named) — surface the raw payload rather than dropping it
         # silently; "developer level" means ALL logs, not just the ones we anticipated.

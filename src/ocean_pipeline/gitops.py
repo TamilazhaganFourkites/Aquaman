@@ -43,6 +43,51 @@ def _gh(args: list[str]) -> str:
     return proc.stdout.strip()
 
 
+def sync_local_checkout(slug: str) -> str:
+    """G2: fast-forward the sibling local checkout at `<PROJECTS_ROOT>/<name>` to origin's
+    default-branch tip, ONCE, before the analysis stations read it — so researcher/SME/dep-resolver/
+    reachability all analyze current code instead of a stale base. (The coder never depends on this;
+    it clones fresh into its own workspace.)
+
+    Best-effort and deterministic: returns a short status string, never raises. Skips cleanly if the
+    checkout is absent (coder clones fresh), is not a git repo, has a dirty tree, or is on a feature
+    branch — we only fast-forward the default branch, never clobber local work.
+    """
+    name = slug.split("/")[-1]
+    repo_dir = config.PROJECTS_ROOT / name
+    if not (repo_dir / ".git").exists():
+        return f"skip: no local checkout at {repo_dir}"
+
+    def _git(args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(repo_dir), *args],
+                              capture_output=True, text=True, timeout=config.GH_TIMEOUT_SECONDS)
+    try:
+        if _git(["status", "--porcelain"]).stdout.strip():
+            return f"skip: {name} checkout has uncommitted changes (left as-is)"
+        # origin's default branch (e.g. develop/main), e.g. "origin/develop"
+        head = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).stdout.strip()
+        default = head.rsplit("/", 1)[-1] if head else ""
+        if _git(["fetch", "--quiet", "origin"]).returncode != 0:
+            return f"skip: {name} fetch failed"
+        if not default:  # HEAD ref not set locally; resolve it from the remote once
+            _git(["remote", "set-head", "origin", "--auto"])
+            default = (_git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+                       .stdout.strip().rsplit("/", 1)[-1])
+        if not default:
+            return f"skip: {name} default branch unresolved"
+        current = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+        if current != default:
+            return f"skip: {name} on '{current}', not default '{default}' (left as-is)"
+        ff = _git(["merge", "--ff-only", f"origin/{default}"])
+        if ff.returncode != 0:
+            return f"skip: {name} not fast-forwardable to origin/{default}"
+        return f"synced {name} → origin/{default} tip"
+    except subprocess.TimeoutExpired:
+        return f"skip: {name} git sync timed out"
+    except OSError as e:
+        return f"skip: {name} git sync error ({e})"
+
+
 def find_pr_for_branch(slug: str, branch: str) -> int | None:
     """Return an existing PR number for `branch` (any state), or None. Idempotency guard so a
     rework loop or a re-run never opens a second PR for the same branch."""

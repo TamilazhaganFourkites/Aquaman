@@ -79,7 +79,11 @@ def _markdown(doc: dict) -> str:
         f"- **Run:** `{doc['execution_id']}`",
         f"- **Started:** {doc['started']}  •  **Finished:** {doc['finished']}  •  "
         f"**Duration:** {_fmt(doc['duration_seconds'])}",
-        f"- **Result:** {str(doc['final_status'] or 'unknown').upper()}",
+        # A null final_status means the run did not reach a terminal node -- almost always a PAUSE at
+        # an approval gate (e.g. qa_review_gate awaiting `--qa`), not a completed run. Don't mislabel it
+        # "UNKNOWN" (reads like a completed-but-unclassified run); say it's paused/incomplete and how to
+        # resume. (O1: a real pause report showed "Result: UNKNOWN".)
+        f"- **Result:** {str(doc['final_status']).upper() if doc.get('final_status') else 'PAUSED / INCOMPLETE — awaiting the next gate (resume with `--resume ' + str(doc.get('execution_id') or '<EXE>') + '`)'}",
     ]
     if doc.get("final_outcome"):
         out.append(f"- **Outcome:** {doc['final_outcome']}")

@@ -6,8 +6,11 @@ is now deterministic edges:
   - the Station 6 outcomes: PASS -> flip service PR ready; code_fault -> FULL loop
     back through coder -> review -> Station 6 (capped at MAX_CODING_ATTEMPTS);
     unsupported ocean repo -> learn_repo (graph-owned onboarding) -> re-run Station 6
-    (capped at MAX_ONBOARD_ATTEMPTS); could_not_verify / exhausted budget -> stop
-    (service PR left draft).
+    (capped at MAX_ONBOARD_ATTEMPTS); AGENT-DIAGNOSED environment_failure -> prep_env_retry
+    -> re-run sit_run ONLY, not the full loop (capped at MAX_ENV_RETRY_ATTEMPTS) -- the
+    deterministic resource-insufficient preflight short-circuit never retries here, since
+    more Docker memory doesn't appear between attempts; could_not_verify / exhausted budget
+    -> stop (service PR left draft).
 """
 from __future__ import annotations
 
@@ -82,7 +85,17 @@ def after_sit_triage(state: OceanState) -> str:
     if (state.get("failure_class") == "code_fault"
             and state.get("coding_attempts", 0) < config.MAX_CODING_ATTEMPTS):
         return "code_fault"        # re-enter the full coder -> review -> SIT loop
-    return "stop"                  # could_not_verify, code_fault exhausted, or onboarding exhausted
+    # environment_failure: only an AGENT-DIAGNOSED harness/infra issue retries (image rebuild, fresh
+    # infra bring-up may fix it) -- sit_run only, not the full coder loop, since this isn't a code
+    # problem. The deterministic resource-insufficient preflight short-circuit (preflight_failed=True)
+    # NEVER retries here: more Docker memory doesn't appear between attempts, so retrying that specific
+    # case is pure waste, not a fix (see nodes.py::_docker_preflight_reason).
+    if (state.get("failure_class") == "environment_failure"
+            and not state.get("preflight_failed")
+            and state.get("env_retry_attempts", 0) < config.MAX_ENV_RETRY_ATTEMPTS):
+        return "environment_failure"
+    return "stop"                  # could_not_verify, environment_failure (non-retriable or
+                                    # exhausted), code_fault exhausted, or onboarding exhausted
 
 
 def after_human_gate(state: OceanState) -> str:
@@ -114,6 +127,7 @@ def build_graph():
     g.add_node("sit_triage", nodes.sit_triage)                   # parse junit, triage, verdict, open test PR
     g.add_node("learn_repo", nodes.learn_repo)                   # graph-owned onboarding of an unsupported repo
     g.add_node("prep_rework", nodes.prep_rework)
+    g.add_node("prep_env_retry", nodes.prep_env_retry)
     g.add_node("human_gate", nodes.human_gate)                   # optional approval before ready-flip
     g.add_node("flip_ready", nodes.flip_ready)
     g.add_node("stop_run", nodes.stop_run)
@@ -160,12 +174,20 @@ def build_graph():
         "pass": "human_gate",            # PASS -> optional human-approval gate -> ready-flip
         "onboard": "learn_repo",         # late-surfaced unsupported repo
         "code_fault": "prep_rework",
+        "environment_failure": "prep_env_retry",  # agent-diagnosed harness/infra issue, sit_run only
         "stop": "stop_run",
     })
     g.add_conditional_edges("human_gate", after_human_gate,
                             {"approve": "flip_ready", "reject": "stop_run"})
     g.add_edge("learn_repo", "sit_resolve")   # re-resolve now that the repo is (being) onboarded
     g.add_edge("prep_rework", "coder")   # full loop: coder -> review -> (open_pr no-op) -> ... -> SIT
+    # environment_failure retry re-enters at sit_run ONLY (not sit_resolve/sit_author/coder) --
+    # authoring + human review already happened and aren't implicated; only re-execution is needed.
+    # A single-source trigger into sit_run alone is already a proven pattern here (after_qa_review's
+    # "approve_no_testrail" path does the same, skipping sit_testrail), so this doesn't depend on any
+    # unverified fan-in/join behavior at sit_triage -- the existing sit_run -> sit_triage edge fires
+    # exactly as it does on a first attempt.
+    g.add_edge("prep_env_retry", "sit_run")
     g.add_edge("flip_ready", END)
     g.add_edge("stop_run", END)
 

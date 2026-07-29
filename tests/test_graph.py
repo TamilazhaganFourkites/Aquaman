@@ -268,6 +268,55 @@ def test_code_fault_budget_exhausted(tmp_path, monkeypatch):
     assert s.calls["sit_triage"] == config.MAX_CODING_ATTEMPTS + 1  # initial + N reworks
 
 
+def test_environment_failure_retries_sit_run_only_then_passes(tmp_path, monkeypatch):
+    """environment_failure re-enters at sit_run ONLY (prep_env_retry -> sit_run), unlike code_fault's
+    full coder loop -- sit_resolve/sit_author/coder must NOT be re-called. Because the retry skips
+    sit_resolve, script._cur (which sit_resolve's own mock call advances via next_sit()) never moves on
+    its own for this loop, so this test drives the outcome directly off the sit_triage call count
+    instead of reusing the Script/_cur convention the other loop tests rely on."""
+    s = Script(review_seq=["APPROVE"], sit_seq=["passed"])   # sit_resolve's own outcome; irrelevant here
+    _install(s, tmp_path, monkeypatch)
+    real_fake_run_skill = agents.run_skill
+
+    async def fake_run_skill_env_retry(**kw):
+        if kw["node"] == "sit_triage":
+            first_attempt = s.calls["sit_triage"] == 0
+            s.calls["sit_triage"] += 1
+            outcome = "environment_failure" if first_attempt else "passed"
+            path = config.automation_verdict_path(kw["ticket_id"])
+            path.write_text(json.dumps({
+                "ticket_id": kw["ticket_id"], "pr_number": 123,
+                "automation_result": "failed" if first_attempt else "passed",
+                "failure_class": outcome if first_attempt else "",
+                "execution_mode": "local-mock-first",
+                "tests": [{"name": "test_x", "result": "failed" if first_attempt else "passed"}],
+                "test_automation_pr_url": "" if first_attempt else "https://github.com/cloudqwest/test-automation/pull/9",
+                "findings_for_coder": [], "needs_onboarding": False, "onboard_repo": "",
+            }))
+            return
+        await real_fake_run_skill(**kw)
+
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill_env_retry)
+    final = _run()
+    assert final["final_status"] == "completed"
+    assert s.calls["sit_triage"] == 2
+    assert s.calls["sit_run"] == 2          # retried once
+    assert s.calls["sit_resolve"] == 1      # NOT re-resolved -- retry skips straight to sit_run
+    assert s.calls["sit_author"] == 1       # NOT re-authored -- the draft/review already happened
+    assert s.calls["coder"] == 1            # NOT the code_fault loop -- this isn't a code problem
+
+
+def test_environment_failure_budget_exhausted(tmp_path, monkeypatch):
+    s = Script(review_seq=["APPROVE"], sit_seq=["environment_failure"])  # always environment_failure
+    _install(s, tmp_path, monkeypatch)
+    final = _run()
+    assert final["final_status"] == "failed"
+    assert "environment_failure_retries_exhausted" in final["final_outcome"]
+    assert s.calls["sit_triage"] == config.MAX_ENV_RETRY_ATTEMPTS + 1  # initial + N retries
+    assert s.calls["sit_resolve"] == 1   # never re-resolved -- only sit_run repeats
+    assert s.calls["coder"] == 1         # never the code_fault loop
+
+
 def test_onboard_then_pass(tmp_path, monkeypatch):
     """Station 6 reports an unsupported repo -> graph onboards it (learn_repo) -> re-runs
     Station 6, which now passes -> ready flip. The onboarding decision + persistence is the
@@ -725,10 +774,13 @@ def test_sit_run_preflight_short_circuit_skips_agent_calls(tmp_path, monkeypatch
     s = Script(review_seq=["APPROVE"], sit_seq=["passed"])   # would pass if it ever ran
     _install(s, tmp_path, monkeypatch)
     monkeypatch.setattr(nodes, "_docker_preflight_reason",
-                        lambda: "could_not_verify: insufficient_docker_resources — have 2.0 GB / 2 CPU")
+                        lambda: "environment_failure: insufficient_docker_resources — have 2.0 GB / 2 CPU")
     final = _run()
     assert final["final_status"] == "failed"
-    assert "could_not_verify" in final["final_outcome"]
+    # environment_failure (not could_not_verify) -- this IS a harness/infra limit, but the
+    # deterministic resource-insufficient case specifically never auto-retries (more Docker
+    # memory doesn't appear between attempts), so stop_run reports it non-retriable.
+    assert "environment_failure_non_retriable" in final["final_outcome"]
     assert s.calls["sit_run"] == 0        # short-circuited before the agent call
     assert s.calls["sit_triage"] == 0     # recognized preflight_failed in typed state, skipped its own agent call
     assert s.calls["flip_ready"] == 0
@@ -1575,6 +1627,17 @@ def test_format_message_surfaces_unknown_system_subtype_rather_than_dropping_it(
     msg = _task_message("SystemMessage", subtype="rate_limit_notice", data={"remaining": 10})
     lines = agents._format_message(msg)
     assert any("rate_limit_notice" in l for l in lines)
+
+
+def test_format_message_suppresses_thinking_tokens_progress_pings():
+    """thinking_tokens is a live "still thinking, ~N tokens so far" progress ping the CLI
+    fires roughly every ~50 thinking-tokens -- not a discrete event, pure noise (a single
+    long thinking burst emits dozens). Deliberately suppressed, unlike the generic unknown-
+    subtype fallback: the actual thinking CONTENT still surfaces via the separate 💭
+    ThinkingBlock line, so nothing is lost, just the redundant running token count."""
+    msg = _task_message("SystemMessage", subtype="thinking_tokens",
+                        data={"estimated_tokens": 300, "estimated_tokens_delta": 50})
+    assert agents._format_message(msg) == []
 
 
 def test_format_message_result_message_still_shows_result_text_not_swallowed_by_subtype_check():

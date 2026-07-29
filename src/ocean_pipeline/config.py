@@ -17,6 +17,12 @@ FK_AIDEVELOPER_DIR = Path(
 
 AGENTS_DIR = FK_AIDEVELOPER_DIR / "agents" / "pipeline"
 
+# Root that holds the sibling target-repo checkouts the analysis stations (researcher/SME/
+# dep-resolver/reachability) read at `<PROJECTS_ROOT>/<repo>` (the coder clones fresh into its own
+# per-run workspace instead). The orchestrator re-syncs this checkout to the default-branch tip once
+# before the analysis stations (G2), so they all analyze current code rather than a stale base.
+PROJECTS_ROOT = Path(os.environ.get("FK_PROJECTS_ROOT", str(FK_AIDEVELOPER_DIR.parent)))
+
 # Ocean coding WORKERS now live in fk-aideveloper's `ocean-coding-agent` skill — the single home for
 # the slim, single-job ocean coding worker prompts (MM-14620 Q1: the control plane holds NO worker
 # content, it references them). run_agent resolves a worker `agent_md` here FIRST, then falls back to
@@ -43,18 +49,17 @@ STATION_MODEL = os.environ.get("OCEAN_PIPELINE_MODEL", "claude-opus-4-8")
 #   management  — top station headers + one-line outcome per station only (no milestones,
 #                 no per-station detail bullets, no raw agent activity). For a non-engineer
 #                 skimming progress.
-#   team        — (default) headers + outcome + the curated milestone/detail lines already
-#                 built for this log (significant tool calls, a handful of facts per station).
-#   developer   — team, plus the full raw per-message agent activity (every tool call with
-#                 its args, every tool result, every thinking/text block) — the actual
-#                 --verbose firehose, for debugging a stuck or misbehaving station.
-# Toggled by env, or the CLI --log-level flag (--verbose is shorthand for --log-level developer).
+#   team        — headers + outcome + the curated milestone/detail lines already built for
+#                 this log (significant tool calls, a handful of facts per station).
+#   developer   — (DEFAULT) team, plus the full raw per-message agent activity (every tool
+#                 call with its args, every tool result, every thinking/text block, every
+#                 sub-agent lifecycle event) — the full firehose, on by default so nothing
+#                 is silently missing; --log-level management/team opt into LESS detail.
+# Toggled by env, or the CLI --log-level flag (--verbose is a no-op shorthand for the
+# already-default --log-level developer, kept for back-compat).
 _LOG_LEVELS = ("management", "team", "developer")
 _env_log_level = os.environ.get("OCEAN_PIPELINE_LOG_LEVEL", "").strip().lower()
-if _env_log_level not in _LOG_LEVELS:
-    # Back-compat: the old boolean OCEAN_PIPELINE_VERBOSE still selects "developer".
-    _env_log_level = "developer" if os.environ.get("OCEAN_PIPELINE_VERBOSE", "").lower() in ("1", "true", "yes") else "team"
-LOG_LEVEL = _env_log_level
+LOG_LEVEL = _env_log_level if _env_log_level in _LOG_LEVELS else "developer"
 
 # RCA-only mode: run research -> ocean-rca report and STOP after the report, even when
 # the root cause needs a code fix (do NOT auto-proceed to coding). This preserves the
@@ -99,6 +104,13 @@ MAX_CODING_ATTEMPTS = 2
 # Station 6 before giving up. 1 is enough for the normal case (learn once, re-run once); a
 # repo that still reports unsupported after being profiled is a genuine could_not_verify stop.
 MAX_ONBOARD_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ONBOARD_ATTEMPTS", "1"))
+
+# How many times the graph will retry Station 6 (sit_run only, not the full loop) after an
+# AGENT-DIAGNOSED environment_failure (Docker/mock/network broke, an image was stale, infra didn't
+# come up cleanly) before giving up. Does NOT apply to the deterministic resource-insufficient
+# preflight short-circuit (preflight_failed=True) -- more Docker memory doesn't appear between
+# attempts, so that case never retries regardless of this budget (see graph.py::after_sit_triage).
+MAX_ENV_RETRY_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ENV_RETRY_ATTEMPTS", "1"))
 
 # Local mock-first SIT: the LocalStack SQS endpoint the test-automation SQS client must target.
 # Without this exported, that client silently constructs as None and crashes on `.meta`, so the

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 # ---- generic per-node verdicts (written via run_agent's contract) -------
@@ -75,6 +75,29 @@ class ReviewVerdict(BaseModel):
     verdict: Literal["APPROVE", "CHANGES_REQUIRED"]
     findings: list[dict] = Field(default_factory=list)   # [{severity, file, summary}]
 
+    # R3: the review worker emits critical_count/major_count/minor_count but often leaves them
+    # null even when findings[] is non-empty, so telemetry/gating that reads counts sees nothing.
+    # Derive them here from findings[] (the single source of truth) so they are ALWAYS populated
+    # and can never disagree with the findings list — whatever the worker emitted is ignored.
+    def _sev_count(self, sev: str) -> int:
+        return sum(1 for f in self.findings
+                   if isinstance(f, dict) and str(f.get("severity", "")).upper() == sev)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def critical_count(self) -> int:
+        return self._sev_count("CRITICAL")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def major_count(self) -> int:
+        return self._sev_count("MAJOR")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def minor_count(self) -> int:
+        return self._sev_count("MINOR")
+
 
 # ---- Station 6: mirrors ocean-automation-testing SKILL.md Station 3 verdict --
 class AutomationTest(BaseModel):
@@ -100,7 +123,14 @@ class AutomationVerdict(BaseModel):
     ticket_id: str
     pr_number: int = 0
     automation_result: Literal["passed", "failed"]
-    failure_class: Literal["", "code_fault", "could_not_verify"] = ""
+    # "environment_failure" (Docker/mock/network infra broke, retriable) is distinct from
+    # "could_not_verify" (structurally undiscriminable by SIT, e.g. additive defensive code) —
+    # see fk-aideveloper skills/ocean-automation-testing/SKILL.md for the classification contract.
+    # graph.py::after_sit_triage branches on this: an AGENT-DIAGNOSED environment_failure retries
+    # sit_run once (capped by MAX_ENV_RETRY_ATTEMPTS); the deterministic resource-insufficient
+    # preflight short-circuit (preflight_failed=True) never retries, since more Docker memory
+    # doesn't appear between attempts.
+    failure_class: Literal["", "code_fault", "could_not_verify", "environment_failure"] = ""
     execution_mode: str = "local-mock-first"
     tests: list[AutomationTest] = Field(default_factory=list)
     changed_repo: ChangedRepo | None = None

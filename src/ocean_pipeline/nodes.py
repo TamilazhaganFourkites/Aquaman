@@ -43,15 +43,19 @@ def _docker_resources() -> tuple[float, int] | None:
 
 def _docker_preflight_reason() -> str:
     """Empty string if Docker has enough resources per config.MIN_DOCKER_MEMORY_GB/CPUS; otherwise
-    a ready-to-use could_not_verify reason string."""
+    a ready-to-use environment_failure reason string. This is the deterministic resource-insufficient
+    case specifically -- NEVER auto-retried (see graph.py::after_sit_triage's preflight_failed check),
+    because more Docker memory doesn't appear between attempts. Still classified as environment_failure
+    (not could_not_verify) because it IS a harness/infra limit, not a structural test limitation --
+    it's just a non-retriable one."""
     resources = _docker_resources()
     if resources is None:
-        return ("could_not_verify: Docker is not running, not reachable, or `docker info` didn't "
+        return ("environment_failure: Docker is not running, not reachable, or `docker info` didn't "
                  "expose memory/CPU (an alternate backend like colima/Podman may need a different "
                  "check) — could not determine available resources.")
     mem_gb, cpus = resources
     if mem_gb < config.MIN_DOCKER_MEMORY_GB or cpus < config.MIN_DOCKER_CPUS:
-        return (f"could_not_verify: insufficient_docker_resources — have {mem_gb:.1f} GB / {cpus} CPU, "
+        return (f"environment_failure: insufficient_docker_resources — have {mem_gb:.1f} GB / {cpus} CPU, "
                 f"need >= {config.MIN_DOCKER_MEMORY_GB} GB / {config.MIN_DOCKER_CPUS} CPU (see "
                 f"local_service_execution.md 'Docker memory ceiling'). Raise Docker Desktop/Rancher "
                 f"Desktop memory+CPU allocation before retrying.")
@@ -85,6 +89,26 @@ def _brief(obj, limit: int = 6000) -> str:
     return s if len(s) <= limit else s[:limit] + "\n… (truncated)"
 
 
+def _reachability_for_coder(report: dict) -> str:
+    """The coder MUST act on the reachability verdicts + overrides IN FULL — never truncate these
+    (R2: a real run truncated the whole report at 12k in the coder prompt, so the binding
+    `overrides_for_coder` were cut off and the coder had to Read the file). Serialize just the binding
+    slice (verdicts + overrides + advisories) untruncated — it is small (~a dozen entries); the full
+    report with audits/provenance stays on disk if the coder wants more."""
+    if not report:
+        return "(none)"
+    slim = {
+        "blocking": report.get("blocking"),
+        "verified_claims": [
+            {"verdict": c.get("verdict"), "claim": c.get("source_claim") or c.get("claim_summary")}
+            for c in (report.get("verified_claims") or []) if isinstance(c, dict)
+        ],
+        "overrides_for_coder": report.get("overrides_for_coder") or [],
+        "advisory_findings": report.get("advisory_findings") or [],
+    }
+    return json.dumps(slim, indent=2, default=str)
+
+
 def _service_slug(state: OceanState) -> str:
     """The `<org>/<name>` slug of the repo whose branch we open/flip the PR on. Prefer what the
     coder reported; fall back to the single target repo when there's exactly one."""
@@ -112,8 +136,15 @@ async def researcher(state: OceanState) -> dict:
         ),
         verdict_model=schemas.ResearchVerdict,
     )
+    # G2: re-sync each target repo's sibling local checkout to the default-branch tip ONCE here,
+    # before the analysis stations (SME/dep-resolver/reachability) read it — so they all analyze
+    # current code instead of a stale base (the runs showed 4 stations each telling the coder to
+    # re-sync while nobody actually did). Deterministic, best-effort, never blocks the run.
+    sync_status = [gitops.sync_local_checkout(gitops.repo_slug(r.get("repo", "")))
+                   for r in (v.target_repos or []) if r.get("repo")]
     telemetry.station_event(state["execution_id"], 0, "end", route=v.route,
-                            domain_bucket=v.domain_bucket)
+                            domain_bucket=v.domain_bucket,
+                            checkout_sync="; ".join(sync_status) or "no target repo to sync")
     return {"route": v.route, "research_packet": _load_json(v.packet_path),
             "target_repos": v.target_repos, "domain_bucket": v.domain_bucket}
 
@@ -423,10 +454,31 @@ async def sit_run(state: OceanState) -> dict:
         # (That Python-into-skill-file mutation was the multi-writer fragility G3 removes: sit_triage
         # now reads `preflight_failed` from state, not a `_preflight_short_circuit` file marker, so no
         # cross-phase reliance on a hand-merged JSON. The skill's verdict file is written only by the
-        # skill.)
+        # skill.) failure_class is environment_failure, not could_not_verify -- see
+        # _docker_preflight_reason's docstring for why this specific case never auto-retries.
         telemetry.station_event(exec_id, 6.2, "end", automation_result="failed",
-                                failure_class="could_not_verify", preflight="insufficient_resources")
+                                failure_class="environment_failure", preflight="insufficient_resources")
         return {"preflight_failed": True, "preflight_reason": reason}
+
+    # Retry-aware prompt: prep_env_retry bumped env_retry_attempts before re-entering here. Without
+    # this, a retry would just re-run identical steps and fail identically -- the point of a retry is
+    # remediation (rebuild a stale image, bring infra up fresh), not repetition.
+    env_retry_attempt = state.get("env_retry_attempts", 0)
+    retry_note = ""
+    if env_retry_attempt > 0:
+        prior_evidence = state.get("sit_report", {}).get("evidence", "")
+        retry_note = (
+            f"\n\nRETRY {env_retry_attempt}/{config.MAX_ENV_RETRY_ATTEMPTS} after an environment_failure "
+            f"on the previous attempt (a harness/infra issue, NOT a code defect). Prior evidence:\n"
+            f"{prior_evidence}\n"
+            f"Before re-running, attempt remediation for the SPECIFIC issue above -- e.g. if a Ruby "
+            f"worker image looks stale/corrupt, rebuild it with `tools/ruby_image_cache.py --repo <repo> "
+            f"--worktree <path> --force-rebuild`; if infra (LocalStack/Kafka/Redis) didn't come up "
+            f"cleanly last time, tear it down and bring it up fresh; if a mock/network dependency was "
+            f"unreachable, verify it's actually running before proceeding. Do not just re-run identical "
+            f"steps expecting a different result -- fix the specific thing that broke, or this retry "
+            f"will fail the same way and exhaust the budget for nothing."
+        )
 
     await agents.run_skill(
         skill_name="ocean-automation-testing",
@@ -439,6 +491,7 @@ async def sit_run(state: OceanState) -> dict:
             f"(ruby=docker) and mock the rest (ocean_mock_helper + route_local); never present a "
             f"native-host Ruby run as passed. Capture per-test pass/fail to reports/junit.xml. Do NOT "
             f"run Station 3 (report/verdict) — the graph's sit_triage node does that next."
+            f"{retry_note}"
             f"\n\n{_summary(state)}"
         ),
     )
@@ -492,11 +545,13 @@ async def sit_triage(state: OceanState) -> dict:
     # sit_run's resource-preflight short-circuit (Workstream 3.4) is carried in TYPED STATE
     # (`preflight_failed`), not a marker Python wrote into the skill's verdict file — when set,
     # pytest never ran (no reports/junit.xml to parse), so skip the redundant, expensive Station-3
-    # skill call and emit the could_not_verify verdict directly from state.
+    # skill call and emit the environment_failure verdict directly from state. Not could_not_verify --
+    # this IS a harness/infra limit, just a non-retriable one (after_sit_triage checks preflight_failed
+    # separately and never routes this specific case to the environment_failure retry).
     if state.get("preflight_failed"):
         telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
-                                failure_class="could_not_verify", preflight_short_circuit=True)
-        return {"automation_result": "failed", "failure_class": "could_not_verify",
+                                failure_class="environment_failure", preflight_short_circuit=True)
+        return {"automation_result": "failed", "failure_class": "environment_failure",
                 "execution_mode": "local-mock-first",
                 "test_automation_pr_url": "", "sit_findings": [],
                 "needs_onboarding": False, "onboard_repo": "",
@@ -598,10 +653,28 @@ async def learn_repo(state: OceanState) -> dict:
 async def prep_rework(state: OceanState) -> dict:
     """On a Station-6 code_fault, re-enter the FULL loop (coder -> Station 5 -> Station 6).
     Bump the shared coding-attempts budget, reset the per-attempt review counter, and
-    clear stale review findings (SIT findings are carried in sit_findings for the coder)."""
+    clear stale review findings (SIT findings are carried in sit_findings for the coder).
+    Also reset env_retry_attempts: the SIT run that follows this code fix is a FRESH attempt that
+    deserves its own environment-retry budget, not one already exhausted by an earlier, unrelated
+    SIT run before this code fault was even diagnosed."""
     attempt = state.get("coding_attempts", 0) + 1
     telemetry.station_event(state["execution_id"], 5.9, "code_fault_rework", coding_attempt=attempt)
-    return {"coding_attempts": attempt, "review_iteration": 0, "review_findings": []}
+    return {"coding_attempts": attempt, "review_iteration": 0, "review_findings": [],
+            "env_retry_attempts": 0}
+
+
+# ------------------------------------------------------------------ environment_failure retry prep
+async def prep_env_retry(state: OceanState) -> dict:
+    """On a Station-6 AGENT-DIAGNOSED environment_failure (harness/infra broke -- NOT the deterministic
+    resource-insufficient preflight short-circuit, which after_sit_triage routes straight to stop_run,
+    never here), retry Station 2 (sit_run) ONLY -- not the full coder/review loop, since this isn't a
+    code problem. Bump the env-retry budget so sit_run's own task_prompt knows to include remediation
+    instructions (rebuild a stale image, bring infra up fresh) instead of blindly repeating the same
+    steps. Clears preflight_failed/preflight_reason in case either was set on the SAME attempt for an
+    unrelated reason, so a stale flag can't leak into the retry."""
+    attempt = state.get("env_retry_attempts", 0) + 1
+    telemetry.station_event(state["execution_id"], 6.45, "environment_failure_retry", env_retry_attempt=attempt)
+    return {"env_retry_attempts": attempt, "preflight_failed": False, "preflight_reason": ""}
 
 
 # ------------------------------------------------------------------ human approval gate (optional)
@@ -663,6 +736,10 @@ async def stop_run(state: OceanState) -> dict:
         reason = "repo_onboarding_exhausted"   # still unsupported after MAX_ONBOARD_ATTEMPTS
     elif fc == "code_fault":
         reason = "coding_attempts_exhausted"
+    elif fc == "environment_failure" and state.get("preflight_failed"):
+        reason = "environment_failure_non_retriable"   # resource-insufficient; retrying can't help
+    elif fc == "environment_failure":
+        reason = "environment_failure_retries_exhausted"
     elif fc == "could_not_verify":
         reason = "could_not_verify"
     else:

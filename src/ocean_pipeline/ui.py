@@ -47,6 +47,7 @@ _LABELS = {
     "sit_triage":         "Local SIT — triage & verdict",
     "learn_repo":         "Onboarding an unsupported repo",
     "prep_rework":        "Rework — SIT found a defect",
+    "prep_env_retry":     "Retry — SIT hit an environment issue",
     "human_gate":         "Awaiting human approval",
     "flip_ready":         "Flip PR to ready-for-review",
     "stop_run":           "Stopped — needs an engineer",
@@ -191,6 +192,8 @@ def _highlight(node: str, upd: dict) -> str:
         return "ready-for-review"
     if node == "prep_rework":
         return "looping back to Coding"
+    if node == "prep_env_retry" and upd.get("env_retry_attempts"):
+        return f"retry {upd['env_retry_attempts']}, looping back to Local SIT — run"
     return ""
 
 

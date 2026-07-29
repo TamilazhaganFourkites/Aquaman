@@ -41,12 +41,14 @@ _STATION_NAMES = {
     3.87: "open_pr", 4: "coder",
     5: "harsh_review", 5.9: "code_fault_rework",
     5.95: "learn_repo", 6.0: "sit_resolve", 6.1: "sit_author", 6.15: "qa_review_gate",
-    6.2: "sit_run", 6.3: "sit_testrail", 6.4: "sit_triage", 6.5: "flip_ready",
+    6.2: "sit_run", 6.3: "sit_testrail", 6.4: "sit_triage", 6.45: "environment_failure_rework",
+    6.5: "flip_ready",
 }
 # Aquaman phase label -> the server's station status enum.
 _STATUS = {
     "start": "started", "end": "completed", "stop": "failed", "done": "completed",
     "skip": "skipped", "unsupported_route": "skipped", "code_fault_rework": "started",
+    "environment_failure_retry": "started",
     # learn_repo uses its own start/end phase names (distinct from the generic "start"/"end"
     # above) rather than sharing them — without an entry here, the fallback below silently
     # mapped BOTH learn_repo_start and learn_repo_end to "completed", so a learn_repo run still
