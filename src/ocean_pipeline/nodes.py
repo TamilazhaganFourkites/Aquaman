@@ -469,8 +469,9 @@ async def sit_testrail(state: OceanState) -> dict:
         node="sit_testrail",
         ticket_id=tid,
         task_prompt=(
-            f"Create the TestRail cases for the SIT already authored + approved for {tid} via "
-            f"ocean-qa-agent (Project 22 / Suite 197 — its Steps 6/6a). Do ONLY TestRail case creation "
+            f"Run ocean-automation-testing Station 1b (testrail) ONLY for {tid} (`--only testrail`): "
+            f"create the TestRail cases for the SIT already authored + approved via ocean-qa-agent "
+            f"(Project 22 / Suite 197 — its Steps 6/6a). Do ONLY TestRail case creation "
             f"for the EXISTING authored test at {state.get('qa_test_path') or '(the ticket SIT)'} — do "
             f"NOT re-author, execute, or open any PR. This runs in parallel with the local SIT run, so "
             f"touch ONLY TestRail (respect its rate limits). Write ONLY the integer TestRail run id to "
