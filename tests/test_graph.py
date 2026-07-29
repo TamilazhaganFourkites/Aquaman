@@ -409,8 +409,9 @@ def test_ocean_workers_resolve():
         p = agents._agent_path(name)
         assert p == config.OCEAN_WORKERS_DIR / name and p.exists(), f"{name} not in ocean-coding-agent/workers"
         assert "Not your job" in p.read_text(), f"{name} missing the process-ownership boundary"
-    # ocean SME agents still resolve to the fk-aideveloper station dir (referenced domain knowledge)
-    assert agents._agent_path("sme-load-creation.md") == config.AGENTS_DIR / "sme-load-creation.md"
+    # ocean SME agents resolve to the ocean-coding-agent agents dir (MM-14620: ocean-introduced ->
+    # ocean home, no longer in the generic agents/pipeline)
+    assert agents._agent_path("sme-load-creation.md") == config.OCEAN_AGENTS_DIR / "sme-load-creation.md"
 
 
 def test_run_agent_loads_ocean_worker(tmp_path, monkeypatch):
@@ -854,18 +855,20 @@ def _preflight_ready_dirs(tmp_path, monkeypatch):
     """Make the non-gh preflight checks pass so a test can isolate the gh-specific behavior."""
     agents_dir = tmp_path / "fk-aideveloper" / "agents" / "pipeline"
     agents_dir.mkdir(parents=True)
-    # G1 version-pin guard: preflight now requires the 4 ocean SME files AND the 6 ocean-coding-agent
-    # workers to exist on the checked-out branch — seed both so the gh-specific tests aren't tripped.
+    # G1 version-pin guard: preflight now requires the 4 ocean SME files (under ocean-coding-agent/
+    # agents) AND the 6 ocean-coding-agent workers to exist on the checked-out branch — seed both.
+    oca = tmp_path / "fk-aideveloper" / "skills" / "ocean-coding-agent"
+    agents_home = oca / "agents"; agents_home.mkdir(parents=True)
     for f in ("sme-callback-notification.md", "sme-load-creation.md",
               "sme-ocean-milestones.md", "sme-ocean-data-quality.md"):
-        (agents_dir / f).write_text("# stub SME\n")
-    workers_dir = tmp_path / "fk-aideveloper" / "skills" / "ocean-coding-agent" / "workers"
-    workers_dir.mkdir(parents=True)
+        (agents_home / f).write_text("# stub SME\n")
+    workers_dir = oca / "workers"; workers_dir.mkdir(parents=True)
     for f in ("research.md", "dep-resolve.md", "reachability.md", "code.md", "review.md", "rca-research.md"):
         (workers_dir / f).write_text("# stub worker\n")
     monkeypatch.setattr(config, "FK_AIDEVELOPER_DIR", tmp_path / "fk-aideveloper")
     monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
     monkeypatch.setattr(config, "OCEAN_WORKERS_DIR", workers_dir)
+    monkeypatch.setattr(config, "OCEAN_AGENTS_DIR", agents_home)
 
 
 def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
@@ -873,7 +876,7 @@ def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
     FK_AIDEVELOPER_DIR on a branch missing the ocean SME files (origin/main doesn't carry them)
     must fail upfront with the #fk-aideveloper Slack hint, not deep inside sme_consult."""
     _preflight_ready_dirs(tmp_path, monkeypatch)
-    (config.AGENTS_DIR / "sme-load-creation.md").unlink()   # simulate the wrong branch
+    (config.OCEAN_AGENTS_DIR / "sme-load-creation.md").unlink()   # simulate the wrong branch
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
 
     class FakeProc:

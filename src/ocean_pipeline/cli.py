@@ -63,12 +63,12 @@ def _preflight() -> None:
         # Check them upfront and surface the same #fk-aideveloper Slack-branch hint the README gives.
         missing_smes = [f for f in ("sme-callback-notification.md", "sme-load-creation.md",
                                     "sme-ocean-milestones.md", "sme-ocean-data-quality.md")
-                        if not (config.AGENTS_DIR / f).exists()]
+                        if not (config.OCEAN_AGENTS_DIR / f).exists()]
         if missing_smes:
             problems.append(
-                f"ocean SME file(s) missing from {config.AGENTS_DIR}: {', '.join(missing_smes)} — "
-                f"FK_AIDEVELOPER_DIR is likely on a branch that doesn't carry them (origin/main does "
-                f"not). Ask in #fk-aideveloper which branch currently carries this work.")
+                f"ocean SME file(s) missing from {config.OCEAN_AGENTS_DIR}: {', '.join(missing_smes)} — "
+                f"FK_AIDEVELOPER_DIR is likely on a branch that doesn't carry the ocean-coding-agent "
+                f"skill. Ask in #fk-aideveloper which branch currently carries this work.")
         # Same version-pin guard for the ocean coding WORKERS — they live in fk-aideveloper's
         # ocean-coding-agent (MM-14620); a checkout without it fails deep at the first agent node.
         missing_workers = [f for f in ("research.md", "dep-resolve.md", "reachability.md",

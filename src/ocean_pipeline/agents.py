@@ -98,15 +98,18 @@ def _agent_path(agent_md: str) -> Path:
     worker = config.OCEAN_WORKERS_DIR / agent_md
     if worker.exists():
         return worker
+    sme = config.OCEAN_AGENTS_DIR / agent_md
+    if sme.exists():
+        return sme
     fallback = config.AGENTS_DIR / agent_md
     if fallback.exists():
         return fallback
     raise StationError(
         "agent-resolve", agent_md,
         f"worker/agent prompt {agent_md!r} not found — looked in the ocean-coding-agent workers dir "
-        f"({config.OCEAN_WORKERS_DIR}) and the fk-aideveloper station/SME dir ({config.AGENTS_DIR}). "
-        f"Check FK_AIDEVELOPER_DIR is on the branch that carries this file (see the README's "
-        f"version-pinning note).",
+        f"({config.OCEAN_WORKERS_DIR}), its agents/SME dir ({config.OCEAN_AGENTS_DIR}), and the "
+        f"fk-aideveloper station dir ({config.AGENTS_DIR}). Check FK_AIDEVELOPER_DIR is on the branch "
+        f"that carries this file (see the README's version-pinning note).",
     )
 
 

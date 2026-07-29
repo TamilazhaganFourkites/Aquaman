@@ -25,6 +25,11 @@ AGENTS_DIR = FK_AIDEVELOPER_DIR / "agents" / "pipeline"
 # fk-aideveloper the single source (no duplication / drift).
 OCEAN_WORKERS_DIR = FK_AIDEVELOPER_DIR / "skills" / "ocean-coding-agent" / "workers"
 
+# Ocean domain SMEs (`sme-*.md`) also live under the ocean-coding-agent skill (MM-14620: ocean-
+# introduced, so housed in the ocean home, not the generic agents/pipeline). Aquaman's sme_consult
+# node dispatches them; _agent_path resolves them here.
+OCEAN_AGENTS_DIR = FK_AIDEVELOPER_DIR / "skills" / "ocean-coding-agent" / "agents"
+
 # Per-run artifact root (reachability-report.json, per-station verdict.json, etc.)
 ARTIFACTS_ROOT = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline"))
 
