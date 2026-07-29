@@ -56,6 +56,19 @@ def _preflight() -> None:
         problems.append(f"FK_AIDEVELOPER_DIR not found: {config.FK_AIDEVELOPER_DIR}")
     elif not config.AGENTS_DIR.exists():
         problems.append(f"station agents dir not found: {config.AGENTS_DIR}")
+    else:
+        # Version-pin guard (README "Checkout state, not just presence"): the ocean SME files are the
+        # fk-aideveloper artifacts the graph reaches into at run time, and origin/main does NOT carry
+        # them yet — so a checkout on the wrong branch fails deep at sme_consult with an opaque error.
+        # Check them upfront and surface the same #fk-aideveloper Slack-branch hint the README gives.
+        missing_smes = [f for f in ("sme-callback-notification.md", "sme-load-creation.md",
+                                    "sme-ocean-milestones.md", "sme-ocean-data-quality.md")
+                        if not (config.AGENTS_DIR / f).exists()]
+        if missing_smes:
+            problems.append(
+                f"ocean SME file(s) missing from {config.AGENTS_DIR}: {', '.join(missing_smes)} — "
+                f"FK_AIDEVELOPER_DIR is likely on a branch that doesn't carry them (origin/main does "
+                f"not). Ask in #fk-aideveloper which branch currently carries this work.")
     if shutil.which("claude") is None:
         problems.append("`claude` CLI not on PATH — the Claude Agent SDK spawns it (install Claude Code)")
     # gitops.py's own docstring says "the caller is responsible for `gh auth` (preflight checks

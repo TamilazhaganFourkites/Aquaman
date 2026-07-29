@@ -827,8 +827,31 @@ def _preflight_ready_dirs(tmp_path, monkeypatch):
     """Make the non-gh preflight checks pass so a test can isolate the gh-specific behavior."""
     agents_dir = tmp_path / "fk-aideveloper" / "agents" / "pipeline"
     agents_dir.mkdir(parents=True)
+    # G1 version-pin guard: preflight now also requires the 4 ocean SME files to exist on the
+    # checked-out branch — create them so the gh-specific tests aren't tripped by that check.
+    for f in ("sme-callback-notification.md", "sme-load-creation.md",
+              "sme-ocean-milestones.md", "sme-ocean-data-quality.md"):
+        (agents_dir / f).write_text("# stub SME\n")
     monkeypatch.setattr(config, "FK_AIDEVELOPER_DIR", tmp_path / "fk-aideveloper")
     monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
+
+
+def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
+    """G1: preflight must catch the README's 'checkout state, not just presence' trap — a
+    FK_AIDEVELOPER_DIR on a branch missing the ocean SME files (origin/main doesn't carry them)
+    must fail upfront with the #fk-aideveloper Slack hint, not deep inside sme_consult."""
+    _preflight_ready_dirs(tmp_path, monkeypatch)
+    (config.AGENTS_DIR / "sme-load-creation.md").unlink()   # simulate the wrong branch
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    class FakeProc:
+        returncode = 0
+        stdout = "Logged in"
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    with pytest.raises(SystemExit, match="sme-load-creation.md"):
+        cli._preflight()
 
 
 def test_preflight_fails_when_gh_missing(tmp_path, monkeypatch):
