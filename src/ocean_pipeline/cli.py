@@ -69,6 +69,16 @@ def _preflight() -> None:
                 f"ocean SME file(s) missing from {config.AGENTS_DIR}: {', '.join(missing_smes)} — "
                 f"FK_AIDEVELOPER_DIR is likely on a branch that doesn't carry them (origin/main does "
                 f"not). Ask in #fk-aideveloper which branch currently carries this work.")
+        # Same version-pin guard for the ocean coding WORKERS — they live in fk-aideveloper's
+        # ocean-coding-agent (MM-14620); a checkout without it fails deep at the first agent node.
+        missing_workers = [f for f in ("research.md", "dep-resolve.md", "reachability.md",
+                                       "code.md", "review.md", "rca-research.md")
+                           if not (config.OCEAN_WORKERS_DIR / f).exists()]
+        if missing_workers:
+            problems.append(
+                f"ocean-coding-agent worker(s) missing from {config.OCEAN_WORKERS_DIR}: "
+                f"{', '.join(missing_workers)} — FK_AIDEVELOPER_DIR is likely on a branch without the "
+                f"ocean-coding-agent skill. Ask in #fk-aideveloper which branch currently carries it.")
     if shutil.which("claude") is None:
         problems.append("`claude` CLI not on PATH — the Claude Agent SDK spawns it (install Claude Code)")
     # gitops.py's own docstring says "the caller is responsible for `gh auth` (preflight checks

@@ -101,7 +101,7 @@ async def researcher(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0, "start")
     jira.transition(state["ticket_id"], "In Progress")   # best-effort; no-op without a Jira token
     v: schemas.ResearchVerdict = await agents.run_agent(
-        agent_md="research.md",   # vendored slim worker (Phase B); resolves under workers/
+        agent_md="research.md",   # ocean-coding-agent worker (fk-aideveloper single source)
         node="researcher",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -159,7 +159,7 @@ async def sme_consult(state: OceanState) -> dict:
 async def dep_resolver(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1, "start")
     v: schemas.DependencyVerdict = await agents.run_agent(
-        agent_md="dep-resolve.md",   # vendored slim worker (Workstream B)
+        agent_md="dep-resolve.md",   # ocean-coding-agent worker (fk-aideveloper single source)
         node="dep_resolver",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -178,7 +178,7 @@ async def dep_resolver(state: OceanState) -> dict:
 async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
     v: schemas.ReachabilityVerdict = await agents.run_agent(
-        agent_md="reachability.md",   # vendored slim worker (Workstream B)
+        agent_md="reachability.md",   # ocean-coding-agent worker (fk-aideveloper single source)
         node="reachability_gate",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -217,7 +217,7 @@ async def coder(state: OceanState) -> dict:
     # there, so the reviewer and any rework pass run against the SAME tree (reuse on re-entry).
     workspace = config.workspace_dir(state["execution_id"])
     v: schemas.CoderVerdict = await agents.run_agent(
-        agent_md="code.md",   # vendored slim worker (Phase B)
+        agent_md="code.md",   # ocean-coding-agent worker (fk-aideveloper single source)
         node="coder",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -257,7 +257,7 @@ async def harsh_reviewer(state: OceanState) -> dict:
     # re-execution see the real tree (falls back to the default cwd if unset).
     wt = state.get("worktree_dir") or ""
     v: schemas.ReviewVerdict = await agents.run_agent(
-        agent_md="review.md",   # vendored slim worker (Phase B)
+        agent_md="review.md",   # ocean-coding-agent worker (fk-aideveloper single source)
         node="harsh_reviewer",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
@@ -680,7 +680,7 @@ async def rca_agent(state: OceanState) -> dict:
     Fix needed -> coder). On fix_needed the RCA brief is handed to the coder."""
     telemetry.station_event(state["execution_id"], 0.1, "start", route="rca")
     v: schemas.RcaVerdict = await agents.run_agent(
-        agent_md="rca-research.md",   # vendored slim worker (Workstream B); drives the ocean-rca approach
+        agent_md="rca-research.md",   # ocean-coding-agent worker (fk-aideveloper single source); drives the ocean-rca approach
         node="rca_agent",
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],

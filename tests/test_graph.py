@@ -396,24 +396,28 @@ def test_sme_consult_runs_for_known_bucket(tmp_path, monkeypatch):
     assert final["sme_findings"]["summary"] == "owner: ocean-worker"
 
 
-# ----------------------------------------------------------------- vendored workers (Phase B + Workstream B)
-def test_vendored_workers_resolve():
-    """Every migrated worker is vendored into this repo and resolves BEFORE any fk-aideveloper
-    fallback; only the ocean SME agents still fall back (referenced domain knowledge). Guards the
-    control-plane decoupling — no graph node should load a heavy fk-aideveloper station file."""
-    for name in ("research.md", "code.md", "review.md",           # Phase B
-                 "dep-resolve.md", "reachability.md", "rca-research.md"):   # Workstream B
+# ----------------------------------------------------------------- ocean workers (MM-14620: single source in fk-aideveloper)
+def test_ocean_workers_resolve():
+    """The ocean coding workers live in fk-aideveloper's ocean-coding-agent (single source — the
+    control plane holds NO worker content, MM-14620 Q1). They resolve from OCEAN_WORKERS_DIR; the
+    ocean SMEs still resolve from the fk-aideveloper station dir. Skips if fk-aideveloper isn't
+    checked out (the workers no longer live in this repo)."""
+    if not config.OCEAN_WORKERS_DIR.exists():
+        pytest.skip("fk-aideveloper ocean-coding-agent/workers not checked out")
+    for name in ("research.md", "code.md", "review.md",
+                 "dep-resolve.md", "reachability.md", "rca-research.md"):
         p = agents._agent_path(name)
-        assert p == config.VENDORED_AGENTS_DIR / name and p.exists(), f"{name} not vendored"
+        assert p == config.OCEAN_WORKERS_DIR / name and p.exists(), f"{name} not in ocean-coding-agent/workers"
         assert "Not your job" in p.read_text(), f"{name} missing the process-ownership boundary"
-    # ocean SME agents intentionally still resolve to the fk-aideveloper station dir (domain knowledge)
+    # ocean SME agents still resolve to the fk-aideveloper station dir (referenced domain knowledge)
     assert agents._agent_path("sme-load-creation.md") == config.AGENTS_DIR / "sme-load-creation.md"
 
 
-def test_run_agent_loads_vendored_worker(tmp_path, monkeypatch):
-    """run_agent must actually LOAD the vendored worker (regression: it previously read
-    config.AGENTS_DIR unconditionally, so a real run would FileNotFoundError on research.md —
-    the graph tests never caught it because they mock run_agent itself)."""
+def test_run_agent_loads_ocean_worker(tmp_path, monkeypatch):
+    """run_agent must actually LOAD the ocean worker prompt from fk-aideveloper's ocean-coding-agent
+    (regression guard for the resolver). Skips if fk-aideveloper isn't checked out."""
+    if not config.OCEAN_WORKERS_DIR.exists():
+        pytest.skip("fk-aideveloper ocean-coding-agent/workers not checked out")
     monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
     captured: dict = {}
 
@@ -480,27 +484,30 @@ def test_language_scoped_docker_rule_present():
     on old gems). Keyed on the rule (by language), not on which repos exist, so a new Ruby repo needs no
     change here; the test fails loudly only if a copy silently LOSES the rule (the native-run regression).
     The copies are kept in-context deliberately (a reference the worker might not read would reintroduce
-    the bug) — this guard is what keeps them from drifting apart."""
-    sources = {"AGENT_GUARDRAILS": agents.AGENT_GUARDRAILS}
+    the bug) — this guard is what keeps them from drifting apart. AGENT_GUARDRAILS (this repo) is always
+    checked; the ocean workers now live in fk-aideveloper's ocean-coding-agent, so they're checked only
+    when that checkout is present."""
+    low = agents.AGENT_GUARDRAILS.lower()
+    assert "ruby" in low and "docker" in low, (
+        "AGENT_GUARDRAILS lost the language-scoped Ruby->Docker rule — a Ruby repo could be run native.")
+    if not config.OCEAN_WORKERS_DIR.exists():
+        pytest.skip("fk-aideveloper ocean-coding-agent/workers not checked out")
     for name in ("research.md", "code.md", "review.md", "reachability.md"):
-        sources[name] = (config.VENDORED_AGENTS_DIR / name).read_text()
-    for where, text in sources.items():
-        low = text.lower()
+        low = (config.OCEAN_WORKERS_DIR / name).read_text().lower()
         assert "ruby" in low and "docker" in low, (
-            f"{where} lost the language-scoped Ruby->Docker build/test rule — a Ruby repo (incl. a new "
+            f"{name} lost the language-scoped Ruby->Docker build/test rule — a Ruby repo (incl. a new "
             f"one) could be run natively and fail on old gems. Re-add it BY LANGUAGE (Ruby -> Docker), "
             f"never as an enumerated repo list.")
 
 
 # ----------------------------------------------------------------- G2: fail-loud worker resolution
 def test_agent_path_raises_clear_error_when_missing(tmp_path, monkeypatch):
-    """G2: a worker prompt that exists in NEITHER the vendored dir nor the fk-aideveloper station
-    dir must raise a clear StationError naming both locations — not silently return a nonexistent
-    path that later dies as a bare FileNotFoundError inside _read (the prior failure mode when the
-    vendored `workers/` dir was absent)."""
+    """G2: a worker prompt that exists in NEITHER the ocean-coding-agent workers dir nor the
+    fk-aideveloper station dir must raise a clear StationError naming both locations — not silently
+    return a nonexistent path that later dies as a bare FileNotFoundError inside _read."""
     (tmp_path / "workers").mkdir()
     (tmp_path / "agents").mkdir()
-    monkeypatch.setattr(config, "VENDORED_AGENTS_DIR", tmp_path / "workers")
+    monkeypatch.setattr(config, "OCEAN_WORKERS_DIR", tmp_path / "workers")
     monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
     with pytest.raises(agents.StationError) as ei:
         agents._agent_path("does-not-exist.md")
@@ -847,13 +854,18 @@ def _preflight_ready_dirs(tmp_path, monkeypatch):
     """Make the non-gh preflight checks pass so a test can isolate the gh-specific behavior."""
     agents_dir = tmp_path / "fk-aideveloper" / "agents" / "pipeline"
     agents_dir.mkdir(parents=True)
-    # G1 version-pin guard: preflight now also requires the 4 ocean SME files to exist on the
-    # checked-out branch — create them so the gh-specific tests aren't tripped by that check.
+    # G1 version-pin guard: preflight now requires the 4 ocean SME files AND the 6 ocean-coding-agent
+    # workers to exist on the checked-out branch — seed both so the gh-specific tests aren't tripped.
     for f in ("sme-callback-notification.md", "sme-load-creation.md",
               "sme-ocean-milestones.md", "sme-ocean-data-quality.md"):
         (agents_dir / f).write_text("# stub SME\n")
+    workers_dir = tmp_path / "fk-aideveloper" / "skills" / "ocean-coding-agent" / "workers"
+    workers_dir.mkdir(parents=True)
+    for f in ("research.md", "dep-resolve.md", "reachability.md", "code.md", "review.md", "rca-research.md"):
+        (workers_dir / f).write_text("# stub worker\n")
     monkeypatch.setattr(config, "FK_AIDEVELOPER_DIR", tmp_path / "fk-aideveloper")
     monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
+    monkeypatch.setattr(config, "OCEAN_WORKERS_DIR", workers_dir)
 
 
 def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
@@ -871,6 +883,23 @@ def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
     with pytest.raises(SystemExit, match="sme-load-creation.md"):
+        cli._preflight()
+
+
+def test_preflight_fails_when_ocean_workers_missing(tmp_path, monkeypatch):
+    """MM-14620: the ocean coding workers now live in fk-aideveloper's ocean-coding-agent; a checkout
+    without them must fail preflight upfront (they'd otherwise fail deep at the first agent node)."""
+    _preflight_ready_dirs(tmp_path, monkeypatch)
+    (config.OCEAN_WORKERS_DIR / "code.md").unlink()   # simulate a branch without ocean-coding-agent
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    class FakeProc:
+        returncode = 0
+        stdout = "Logged in"
+        stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+    with pytest.raises(SystemExit, match="code.md"):
         cli._preflight()
 
 

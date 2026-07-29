@@ -17,11 +17,13 @@ FK_AIDEVELOPER_DIR = Path(
 
 AGENTS_DIR = FK_AIDEVELOPER_DIR / "agents" / "pipeline"
 
-# Slim, single-job worker prompts VENDORED into this repo (Phase B onward): the graph owns
-# these workers, stripped of the fk-aideveloper station process. run_agent resolves an
-# agent_md here FIRST, falling back to AGENTS_DIR for nodes not yet migrated. Named "workers"
-# (not "agents") to avoid clashing with the agents.py module in the same package.
-VENDORED_AGENTS_DIR = Path(__file__).resolve().parent / "workers"
+# Ocean coding WORKERS now live in fk-aideveloper's `ocean-coding-agent` skill — the single home for
+# the slim, single-job ocean coding worker prompts (MM-14620 Q1: the control plane holds NO worker
+# content, it references them). run_agent resolves a worker `agent_md` here FIRST, then falls back to
+# AGENTS_DIR for the ocean domain SMEs (`sme-*.md`, still referenced expert knowledge). Previously these
+# workers were vendored into this repo (`src/ocean_pipeline/workers/`); that copy was removed to make
+# fk-aideveloper the single source (no duplication / drift).
+OCEAN_WORKERS_DIR = FK_AIDEVELOPER_DIR / "skills" / "ocean-coding-agent" / "workers"
 
 # Per-run artifact root (reachability-report.json, per-station verdict.json, etc.)
 ARTIFACTS_ROOT = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline"))

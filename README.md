@@ -339,10 +339,12 @@ orchestrator's `flip_ready` node.
 
 MM-14615 / MM-14621: full node/edge topology, checkpointer, the Claude Agent SDK bridge, the
 RCA→fix→coder branch, the review loop, and **Station 6 (ocean-automation-testing) with the
-code_fault full-loop** are in place. MM-14621 made LangGraph the sole control plane — vendored
-slim workers (`workers/research|code|review.md`), graph-owned SME consult, deterministic
-git/PR code nodes, the coder's worktree threaded to the reviewer, an optional human-approval
-gate before the ready-flip, and Jira lifecycle transitions. **Telemetry is wired** to the
+code_fault full-loop** are in place. MM-14621 made LangGraph the sole control plane — slim
+single-job workers, graph-owned SME consult, deterministic git/PR code nodes, the coder's
+worktree threaded to the reviewer, an optional human-approval gate before the ready-flip, and
+Jira lifecycle transitions. **MM-14620: the workers now live in fk-aideveloper's
+`ocean-coding-agent` skill (single source), not vendored here — this repo is a pure control
+plane that references them (`config.OCEAN_WORKERS_DIR`); it holds no worker/domain content.** **Telemetry is wired** to the
 aidev-db HTTP MCP server (`telemetry.py`, best-effort, no-op without `RCA_TOKEN`; transport
 validated live). **Station 6 is now decomposed into per-step graph nodes** (`sit_resolve →
 sit_author → qa_review_gate → sit_run ‖ sit_testrail → sit_triage`), with graph-owned repo

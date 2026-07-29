@@ -87,28 +87,25 @@ def _read(path: Path) -> str:
 
 
 def _agent_path(agent_md: str) -> Path:
-    """Resolve a worker prompt: prefer the vendored slim worker owned by this repo, and fall
-    back to the fk-aideveloper station agent for any node not yet migrated (Phase B is
-    incremental — one node at a time points at a vendored file here).
+    """Resolve a worker/agent prompt from fk-aideveloper (the single source — MM-14620 Q1: the
+    control plane holds no worker content). The ocean coding WORKERS (`research.md`, `code.md`, …)
+    live in fk-aideveloper's `ocean-coding-agent/workers/`; the ocean domain SMEs (`sme-*.md`) live
+    in `agents/pipeline/`. Try the workers dir first, then the SME/station dir.
 
-    The vendored workers use different filenames from the fk-aideveloper station agents
-    (`research.md` vs `fk-researcher.md`), so the fallback only genuinely covers files that exist
-    under the SAME name in both places (today: the `sme-*.md` domain agents). If NEITHER location
-    has the file, raise a clear error naming both candidates — a bare FileNotFoundError deep inside
-    `_read` (its previous failure mode: this returned `AGENTS_DIR/<name>` unconditionally when the
-    vendored file was missing, e.g. if the `workers/` dir were absent) doesn't tell the operator
-    where the resolver actually looked."""
-    vendored = config.VENDORED_AGENTS_DIR / agent_md
-    if vendored.exists():
-        return vendored
+    If NEITHER location has the file, raise a clear error naming both candidates — a bare
+    FileNotFoundError deep inside `_read` doesn't tell the operator where the resolver looked, and
+    the usual cause is FK_AIDEVELOPER_DIR being on a branch that doesn't carry the file."""
+    worker = config.OCEAN_WORKERS_DIR / agent_md
+    if worker.exists():
+        return worker
     fallback = config.AGENTS_DIR / agent_md
     if fallback.exists():
         return fallback
     raise StationError(
         "agent-resolve", agent_md,
-        f"worker prompt {agent_md!r} not found — looked in the vendored dir "
-        f"({config.VENDORED_AGENTS_DIR}) and the fk-aideveloper station dir ({config.AGENTS_DIR}). "
-        f"Check FK_AIDEVELOPER_DIR is on the branch that carries this worker (see the README's "
+        f"worker/agent prompt {agent_md!r} not found — looked in the ocean-coding-agent workers dir "
+        f"({config.OCEAN_WORKERS_DIR}) and the fk-aideveloper station/SME dir ({config.AGENTS_DIR}). "
+        f"Check FK_AIDEVELOPER_DIR is on the branch that carries this file (see the README's "
         f"version-pinning note).",
     )
 
