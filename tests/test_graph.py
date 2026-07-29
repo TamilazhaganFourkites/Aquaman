@@ -702,7 +702,7 @@ def test_sit_run_preflight_short_circuit_skips_agent_calls(tmp_path, monkeypatch
     assert final["final_status"] == "failed"
     assert "could_not_verify" in final["final_outcome"]
     assert s.calls["sit_run"] == 0        # short-circuited before the agent call
-    assert s.calls["sit_triage"] == 0     # recognized the marker, skipped its own agent call
+    assert s.calls["sit_triage"] == 0     # recognized preflight_failed in typed state, skipped its own agent call
     assert s.calls["flip_ready"] == 0
 
 

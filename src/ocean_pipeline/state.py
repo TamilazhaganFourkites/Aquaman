@@ -71,6 +71,12 @@ class OceanState(TypedDict, total=False):
     sit_report: dict                 # tests[] / changed_repo / dependencies / evidence
     test_automation_pr_url: str      # opened by the skill on pass
     sit_findings: list               # findings_for_coder (code_fault -> fk-coder)
+    # sit_run Docker-resource preflight short-circuit — carried as TYPED STATE, not a marker Python
+    # writes into the skill's own verdict file. When Docker can't take the chain, sit_run fails fast
+    # BEFORE the (expensive) skill call and flags it here; sit_triage reads this from state (not a
+    # file marker) and emits the could_not_verify verdict without its own redundant skill call.
+    preflight_failed: bool
+    preflight_reason: str
 
     # --- QA review gate (human 3-way: approve+TestRail / approve / changes) ---
     qa_test_path: str                # drafted SIT file, shown to the reviewer

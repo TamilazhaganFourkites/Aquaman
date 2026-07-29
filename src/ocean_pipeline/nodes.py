@@ -419,21 +419,14 @@ async def sit_run(state: OceanState) -> dict:
     # full-chain attempt ground for ~40 min before hitting this exact documented ceiling).
     reason = _docker_preflight_reason()
     if reason:
-        verdict_path = config.automation_verdict_path(tid)
-        verdict_path.parent.mkdir(parents=True, exist_ok=True)
-        # Merge onto whatever sit_resolve/sit_author already recorded (test_path, domain_bucket, ...)
-        # rather than clobbering it — `_preflight_short_circuit` is the explicit marker sit_triage
-        # checks for; it is NEVER written by the skill itself, so it can't collide with a real verdict.
-        partial = _load_json(str(verdict_path))
-        partial.update({
-            "ticket_id": tid, "automation_result": "failed", "failure_class": "could_not_verify",
-            "execution_mode": "local-mock-first", "evidence": reason,
-            "_preflight_short_circuit": True,
-        })
-        verdict_path.write_text(json.dumps(partial))
+        # Fail fast via TYPED STATE — do NOT hand-write a marker into the skill's own verdict file.
+        # (That Python-into-skill-file mutation was the multi-writer fragility G3 removes: sit_triage
+        # now reads `preflight_failed` from state, not a `_preflight_short_circuit` file marker, so no
+        # cross-phase reliance on a hand-merged JSON. The skill's verdict file is written only by the
+        # skill.)
         telemetry.station_event(exec_id, 6.2, "end", automation_result="failed",
                                 failure_class="could_not_verify", preflight="insufficient_resources")
-        return {}
+        return {"preflight_failed": True, "preflight_reason": reason}
 
     await agents.run_skill(
         skill_name="ocean-automation-testing",
@@ -496,21 +489,19 @@ async def sit_triage(state: OceanState) -> dict:
     tid, exec_id = state["ticket_id"], state["execution_id"]
     telemetry.station_event(exec_id, 6.4, "start")
     verdict_path = config.automation_verdict_path(tid)
-    # The verdict file is progressively enriched across stations (sit_resolve/sit_author already wrote
-    # partial data by this point in the normal path), so mere existence isn't a safe signal. sit_run's
-    # resource-preflight short-circuit (Workstream 3.4) stamps an explicit `_preflight_short_circuit`
-    # marker that the skill itself never writes — only THAT means "pytest never ran, skip the redundant,
-    # expensive Station-3 agent call" (there's no reports/junit.xml for it to parse anyway).
-    partial = _load_json(str(verdict_path))
-    if partial.get("_preflight_short_circuit"):
+    # sit_run's resource-preflight short-circuit (Workstream 3.4) is carried in TYPED STATE
+    # (`preflight_failed`), not a marker Python wrote into the skill's verdict file — when set,
+    # pytest never ran (no reports/junit.xml to parse), so skip the redundant, expensive Station-3
+    # skill call and emit the could_not_verify verdict directly from state.
+    if state.get("preflight_failed"):
         telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
                                 failure_class="could_not_verify", preflight_short_circuit=True)
         return {"automation_result": "failed", "failure_class": "could_not_verify",
-                "execution_mode": partial.get("execution_mode", "local-mock-first"),
+                "execution_mode": "local-mock-first",
                 "test_automation_pr_url": "", "sit_findings": [],
                 "needs_onboarding": False, "onboard_repo": "",
                 "sit_report": {"tests": [], "changed_repo": None, "dependencies": [],
-                               "evidence": partial.get("evidence", ""), "testrail_run_id": 0,
+                               "evidence": state.get("preflight_reason", ""), "testrail_run_id": 0,
                                "ac_coverage": []}}
     await agents.run_skill(
         skill_name="ocean-automation-testing",
