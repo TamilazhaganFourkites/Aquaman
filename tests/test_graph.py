@@ -1487,3 +1487,106 @@ def test_report_markdown_pr_number_without_ready_flip_shows_draft():
     }
     md = report._markdown(doc)
     assert "**Service PR:** #7 (draft)" in md
+
+
+# ----------------------------------------------------------------- ui.py log-level tiers
+def test_management_level_shows_only_header_no_outcome_or_milestone(monkeypatch, capsys):
+    """management = station_start header only. No step() outcome line, no milestone."""
+    monkeypatch.setattr(config, "LOG_LEVEL", "management")
+    ui.station_start("researcher")
+    ui.milestone("querying jira: getJiraIssue")
+    ui.step("researcher", {"route": "coding"}, 12.0)
+    out = capsys.readouterr().out
+    assert "Research & routing" in out          # the header
+    assert "querying jira" not in out           # milestone suppressed
+    assert "routed to coding" not in out        # step()'s outcome line suppressed entirely
+
+
+def test_team_level_shows_header_and_exactly_one_outcome_line(monkeypatch, capsys):
+    """team = header + step()'s one outcome line. No milestone, no detail bullets."""
+    monkeypatch.setattr(config, "LOG_LEVEL", "team")
+    ui.station_start("researcher")
+    ui.milestone("querying jira: getJiraIssue")
+    ui.step("researcher", {"route": "coding", "target_repos": [{"repo": "ocean-worker"}]}, 12.0)
+    out = capsys.readouterr().out
+    assert "Research & routing" in out
+    assert "routed to coding" in out             # the one outcome line
+    assert "querying jira" not in out            # still no milestone at team
+    assert "repo: ocean-worker" not in out       # still no detail bullets at team
+
+
+def test_developer_level_shows_milestones_and_detail_bullets_too(monkeypatch, capsys):
+    """developer = team + milestones + detail bullets (the raw per-agent dump is separate,
+    emitted by agents._drive, not by these ui.py functions)."""
+    monkeypatch.setattr(config, "LOG_LEVEL", "developer")
+    ui.station_start("researcher")
+    ui.milestone("querying jira: getJiraIssue")
+    ui.step("researcher", {"route": "coding", "target_repos": [{"repo": "ocean-worker"}]}, 12.0)
+    out = capsys.readouterr().out
+    assert "Research & routing" in out
+    assert "routed to coding" in out
+    assert "querying jira" in out                # milestone now shown
+    assert "repo: ocean-worker" in out           # detail bullet now shown
+
+
+# ----------------------------------------------------------------- agents.py _format_message: Task/SystemMessage family
+def _task_message(cls_name, **kw):
+    """Build a real SDK dataclass instance for the given Task/SystemMessage subclass —
+    exercising the actual attribute names, not an assumption about their shape."""
+    from claude_agent_sdk import types as sdk_types
+    return getattr(sdk_types, cls_name)(**kw)
+
+
+def test_format_message_surfaces_task_started():
+    msg = _task_message("TaskStartedMessage", subtype="task_started", data={}, task_id="t1",
+                        description="research MM-1", uuid="u1", session_id="s1")
+    lines = agents._format_message(msg)
+    assert any("sub-agent started" in l and "research MM-1" in l for l in lines)
+
+
+def test_format_message_surfaces_task_progress_with_last_tool():
+    msg = _task_message("TaskProgressMessage", subtype="task_progress", data={}, task_id="t1",
+                        description="research MM-1", usage={"total_tokens": 500, "tool_uses": 3,
+                        "duration_ms": 1200}, uuid="u1", session_id="s1", last_tool_name="Bash")
+    lines = agents._format_message(msg)
+    assert any("sub-agent progress" in l and "Bash" in l for l in lines)
+
+
+def test_format_message_surfaces_task_notification():
+    msg = _task_message("TaskNotificationMessage", subtype="task_notification", data={}, task_id="t1",
+                        status="completed", output_file="/tmp/out.json",
+                        summary="found the owning repo", uuid="u1", session_id="s1")
+    lines = agents._format_message(msg)
+    assert any("completed" in l and "found the owning repo" in l for l in lines)
+
+
+def test_format_message_surfaces_task_updated():
+    msg = _task_message("TaskUpdatedMessage", subtype="task_updated", data={}, task_id="t1",
+                        patch={"status": "completed"})
+    lines = agents._format_message(msg)
+    assert any("task update" in l and "completed" in l for l in lines)
+
+
+def test_format_message_surfaces_unknown_system_subtype_rather_than_dropping_it():
+    """Regression: the entire SystemMessage family previously had NEITHER .content nor
+    .result, so it fell through _format_message silently -- developer level (\"give me
+    all logs\") was quietly missing every sub-agent lifecycle event. A subtype this
+    function doesn't special-case must still surface something, not vanish."""
+    msg = _task_message("SystemMessage", subtype="rate_limit_notice", data={"remaining": 10})
+    lines = agents._format_message(msg)
+    assert any("rate_limit_notice" in l for l in lines)
+
+
+def test_format_message_result_message_still_shows_result_text_not_swallowed_by_subtype_check():
+    """Regression: ResultMessage ALSO has a .subtype (e.g. "success", set when the SDK
+    reports a benign completion) but no .data -- checking .subtype alone to detect the
+    SystemMessage family would intercept ResultMessage here FIRST and silently swallow its
+    actual result text into a useless "system[success]" line, never reaching the `result`
+    handling below. This is exactly the shape of bug this whole fix was meant to close, just
+    reintroduced one level down -- must gate on .data too, not .subtype alone."""
+    msg = _task_message("ResultMessage", subtype="success", duration_ms=100, duration_api_ms=90,
+                        is_error=False, num_turns=3, session_id="s1",
+                        result="the coder pushed branch MM-1/fix")
+    lines = agents._format_message(msg)
+    assert lines == ["✔ the coder pushed branch MM-1/fix"]
+    assert not any("system[success]" in l for l in lines)

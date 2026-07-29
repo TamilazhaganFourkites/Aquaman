@@ -205,11 +205,20 @@ automatically. The engineer still owns final merge, sign-off, and deploy.
 
 ## Observability
 
-**Runner log (default) — clean, management-legible.** Every run prints a plain-English
-process log: a `▶` header per station, live **milestones** for the significant actions
-(clone / branch / edit / test / commit / push / PR / docker / pytest — noise suppressed), a
-`✓` line with elapsed time + outcome, and structured facts (`└`). No jargon:
+**`--log-level {management,team,developer}` — three audiences, one run, each a strict
+superset of the one before it.**
 
+- **`management`** — the run banner + a `▶` header per station. Nothing else: no outcome,
+  no milestones, no detail bullets. Just "what's running right now."
+- **`team`** (default) — management, plus exactly **one outcome line per station** (`✓`/`✗`,
+  elapsed time, a one-line highlight).
+- **`developer`** (same as the older `-v`/`--verbose` flag, still supported as a shorthand)
+  — team, plus the curated **milestones** streamed live during each station (clone / branch /
+  edit / test / commit / push / PR / docker / pytest — noise suppressed), that station's
+  detail bullets (`└`), and each agent's raw tool calls, tool results, thinking text, and
+  sub-agent (Task) lifecycle — the full firehose, for debugging.
+
+`management`:
 ```
 ════════════════════════════════════════════════════════════════
   FK Ocean Pipeline   ·   MM-14609
@@ -217,35 +226,27 @@ process log: a `▶` header per station, live **milestones** for the significant
 ════════════════════════════════════════════════════════════════
 
 ▶  Research & routing
-     · querying Atlassian
-     · dispatching sub-agent: ocean SME
-  ✓  Research & routing                        34s   → routed to coding
-        └ repo: ocean-worker (ruby, docker)
 
 ▶  Coding
-     · cloning the target repo
-     · creating the ticket branch
-     · editing exception_clearer.rb
-     · installing gems (Docker)
-     · committing changes
-     · pushing the branch
+
+▶  Adversarial code review
+
+▶  Local SIT (automation testing)
+```
+
+`team` (default) — same banner, but each `▶` header is followed by its one outcome line:
+```
+▶  Research & routing
+  ✓  Research & routing                        34s   → routed to coding
+
+▶  Coding
   ✓  Coding                                  3m30s   branch pushed
-        └ 3 file(s) changed
 
 ▶  Adversarial code review
   ✓  Adversarial code review                   42s   APPROVE
-        └ no CRITICAL/MAJOR findings
 
 ▶  Local SIT (automation testing)
-     · repointing config to local + mocks
-     · starting the mock server
-     · bringing up local Docker infra
-     · running the SIT (pytest)
-     · opening the draft PR
   ✓  Local SIT (automation testing)          6m20s   SIT passed
-        └ 2/2 tests passed
-        └   passed: test_eta_exception_cleared_on_pod
-        └ ran ocean-worker local · mocked: tracking-service
 ────────────────────────────────────────────────────────────────
   RESULT: COMPLETED   ·   took 11m06s   ·   finished 23:04:48
   sit_passed; service PR #123 ready-for-review
@@ -253,22 +254,35 @@ process log: a `▶` header per station, live **milestones** for the significant
 ════════════════════════════════════════════════════════════════
 ```
 
-Each station shows: a timestamped `▶` header, live `·` milestones, per-station usage
-(`done — 140k tokens · 24 tool calls`), and a `✓` line with elapsed + facts —
-including review findings spelled out (severity + summary + file) and SIT test names. The
-footer totals cost / tokens / tool-calls for the whole run.
+`developer` additionally streams milestones live and prints detail bullets after each outcome:
+```
+▶  Research & routing
+     · querying Atlassian
+     · dispatching sub-agent: ocean SME
+    [researcher] ⚡ sub-agent progress: ocean SME (last tool: mcp__fk-code-graph__execute_cypher_query)
+  ✓  Research & routing                        34s   → routed to coding
+        └ repo: ocean-worker (ruby, docker)
 
-**Run report (written at the end).** Every run leaves a consolidated, shareable
-`run-report.md` (+ `run-report.json`) in `$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/` — header
-(ticket, timing, result, PR links, total usage) + a timeline table of every node with its
-duration and outcome. Written even if the run fails (partial timeline). The console prints
-`Full report: <path>` at the end.
+▶  Local SIT (automation testing)
+     · bringing up local Docker infra
+     · running the SIT (pytest)
+  ✓  Local SIT (automation testing)          6m20s   SIT passed
+        └ 2/2 tests passed
+        └   passed: test_eta_exception_cleared_on_pod
+        └ ran ocean-worker local · mocked: tracking-service
+```
 
-**`--log-level {management,team,developer}` — three audiences, one run.** `team` is the
-default and is exactly what's shown above. `management` prints only the `▶` header + the
-`✓` outcome line per station — no milestones, no detail bullets. `developer` (same as the
-older `-v`/`--verbose` flag, still supported as a shorthand) adds each agent's raw tool
-calls, tool results, and thinking text on top of the milestones, for debugging. Per-node
+The `[label] ...` lines are the raw per-agent dump: every tool call, tool result, thinking
+block, and — since a worker can itself dispatch a sub-agent via the Task tool — that
+sub-agent's own start/progress/completion lifecycle, which previously vanished silently even
+under `--verbose` (neither shape `_format_message` checked for matched a `SystemMessage`).
+
+**Run report (written at the end, regardless of console level).** Every run leaves a
+consolidated, shareable `run-report.md` (+ `run-report.json`) in
+`$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/` — header (ticket, timing, result, PR links, total
+usage) + a timeline table of every node with its duration and full outcome line (the same
+detail `developer` shows, independent of what the console printed). Written even if the run
+fails (partial timeline). The console prints `Full report: <path>` at the end. Per-node
 verdicts also land in `$OCEAN_PIPELINE_ARTIFACTS/<EXE-id>/*.verdict.json` regardless of level.
 
 **Langfuse (self-hosted run UI) — recommended.** FourKites runs open-source Langfuse at

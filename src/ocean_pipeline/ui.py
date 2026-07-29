@@ -1,8 +1,13 @@
-"""Runner log — three audiences, one run (see config.LOG_LEVEL):
+"""Runner log — three audiences, one run (see config.LOG_LEVEL), each a strict superset
+of the one below it:
 
-  management — top station headers + one-line outcome only.
-  team       — (default) headers + outcome + curated milestones/detail lines.
-  developer  — team, plus the raw per-agent tool activity (agents._drive's firehose).
+  management — the run banner + each station's "▶ header" line only. No outcome, no
+               milestones, no detail bullets — just "what's running right now."
+  team       — (default) management, PLUS one outcome line per station (icon, elapsed,
+               highlight) — exactly one line per process, nothing streamed underneath.
+  developer  — team, PLUS the curated milestones streamed during each station, its
+               detail bullets, and the raw per-agent tool activity (agents._drive's
+               firehose) — this is the "give me everything" tier.
 """
 from __future__ import annotations
 
@@ -56,9 +61,10 @@ def station_start(node: str) -> None:
 
 
 def milestone(text: str) -> None:
-    """One curated, human-readable action inside a running node.
-    Suppressed at management level — that tier gets headers + outcome only."""
-    if not _at_least("team"):
+    """One curated, human-readable action inside a running node. Developer-only: team
+    level is capped at exactly one line per process (the step() outcome line) — the
+    streamed "what's happening right now" detail belongs to the "give me everything" tier."""
+    if not _at_least("developer"):
         return
     print(f"     · {text}", flush=True)
 
@@ -196,9 +202,13 @@ def banner(ticket: str, execution_id: str) -> None:
 
 
 def step(node: str, upd: dict, elapsed: float) -> None:
-    """The station's completion line (sub-heading): icon, label, elapsed, one-line
-    outcome. Always printed, at every log level. Detail bullets underneath are the
-    team-level-and-up "additional lines" — management stops at this one line."""
+    """The station's one-line outcome: icon, label, elapsed, highlight. This is team
+    level's entire "one line per process" — management doesn't get this line at all
+    (it stops at the station_start header); developer additionally gets the detail
+    bullets underneath (milestones and the raw per-agent dump are separate, streamed
+    during the station rather than printed here at completion)."""
+    if not _at_least("team"):
+        return
     icon = "✗" if node in _STOP_NODES else "✓"
     label = _LABELS.get(node, node)
     line = f"  {icon}  {label:<38}{_fmt_elapsed(elapsed):>7}"
@@ -206,7 +216,7 @@ def step(node: str, upd: dict, elapsed: float) -> None:
     if hi:
         line += f"   {hi}"
     print(line, flush=True)
-    if _at_least("team"):
+    if _at_least("developer"):
         for det in _details(node, upd):
             print(f"        └ {det}", flush=True)
 

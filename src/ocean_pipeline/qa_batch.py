@@ -32,7 +32,7 @@ from pathlib import Path
 
 from langgraph.graph import END, StateGraph
 
-from . import config, graph as graph_mod, nodes, telemetry, tracing, ui
+from . import config, graph as graph_mod, nodes, telemetry, tracing
 from .state import OceanState
 
 
@@ -130,7 +130,11 @@ async def run_batch(tickets: list[str]) -> list[dict]:
     stops the rest (run_one already swallows its own exceptions into a failed result)."""
     results = []
     for i, t in enumerate(tickets, 1):
-        ui.milestone(f"[{i}/{len(tickets)}] {t}")
+        # Always printed, regardless of --log-level: this is the ONLY indicator of which
+        # ticket in the batch is currently running, not a per-station action detail — it
+        # would wrongly disappear at team/management level if it reused ui.milestone()
+        # (developer-only) for this.
+        print(f"\n· [{i}/{len(tickets)}] {t}", flush=True)
         results.append(await run_one(t))
     return results
 

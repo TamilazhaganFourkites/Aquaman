@@ -306,14 +306,21 @@ def _milestones(msg) -> list[str]:
 
 def _format_message(msg) -> list[str]:
     """Best-effort, SDK-shape-tolerant one-liners for a streamed agent message: tool
-    calls, tool RESULTS, assistant text, thinking, and the final result.
+    calls, tool RESULTS, assistant text, thinking, the sub-agent (Task) lifecycle, and
+    the final result.
 
-    Previously this only matched ToolUseBlock (.name) and TextBlock (.text) — so
-    ThinkingBlock (.thinking, not .text) and ToolResultBlock (the actual tool
-    OUTPUT, e.g. command stdout/stderr) were silently dropped from every message,
-    even under --verbose. That's the "verbose isn't giving all logs" gap: developer
-    level is supposed to be the full raw firehose, and tool results/thinking are
-    most of what a developer debugging a stuck station actually needs to see."""
+    Two rounds of "verbose/developer isn't giving all logs" gaps closed here:
+      1. ThinkingBlock (.thinking, not .text) and ToolResultBlock (the actual tool
+         OUTPUT, e.g. command stdout/stderr) were silently dropped — only ToolUseBlock
+         and TextBlock were matched.
+      2. The entire SystemMessage family (TaskStartedMessage, TaskProgressMessage,
+         TaskNotificationMessage, TaskUpdatedMessage, and any other `system` subtype —
+         hook events, rate-limit notices, mirror errors) has NEITHER `.content` nor
+         `.result`, so it fell through both checks below and vanished with no output at
+         all. That's exactly the sub-agent dispatch story: `_milestones` shows the
+         moment a worker calls the Task tool, but everything the sub-agent does after
+         that — starting, progressing, finishing — arrives as one of these and was
+         completely invisible even at developer level."""
     out: list[str] = []
     content = getattr(msg, "content", None)
     if isinstance(content, list):
@@ -341,6 +348,32 @@ def _format_message(msg) -> list[str]:
                 if t:
                     out.append(t[:220])
         return out
+    # SystemMessage family — see docstring point 2. Gated on BOTH .subtype and .data (a
+    # SystemMessage base-class field, inherited by every Task*Message subclass) because
+    # ResultMessage ALSO has its own unrelated .subtype (e.g. "success") but no .data —
+    # checking .subtype alone would intercept ResultMessage here and silently swallow its
+    # actual result text into a useless "system[success]" line instead of falling through
+    # to the `result` handling below. Caught by test_format_message_result_message_still_
+    # shows_result_text_not_swallowed_by_subtype_check.
+    subtype = getattr(msg, "subtype", None)
+    if subtype is not None and hasattr(msg, "data"):
+        if subtype == "task_started":
+            return [f"⚡ sub-agent started: {getattr(msg, 'description', '')} "
+                    f"(task {getattr(msg, 'task_id', '')})"]
+        if subtype == "task_progress":
+            last_tool = getattr(msg, "last_tool_name", None)
+            return [f"⚡ sub-agent progress: {getattr(msg, 'description', '')}"
+                    + (f" (last tool: {last_tool})" if last_tool else "")]
+        if subtype == "task_notification":
+            return [f"⚡ sub-agent {getattr(msg, 'status', '?')}: {getattr(msg, 'summary', '')}"]
+        if subtype == "task_updated":
+            patch = getattr(msg, "patch", None) or {}
+            return [f"⚡ sub-agent task update: {json.dumps(patch, default=str)[:200]}"]
+        # Any other `system` subtype (hook events, rate limits, mirror errors, a future
+        # kind we haven't named) — surface the raw payload rather than dropping it
+        # silently; "developer level" means ALL logs, not just the ones we anticipated.
+        data = getattr(msg, "data", None)
+        return [f"⚙ system[{subtype}]: {json.dumps(data, default=str)[:200]}" if data else f"⚙ system[{subtype}]"]
     result = getattr(msg, "result", None)               # ResultMessage
     if result:
         out.append(f"✔ {str(result)[:200]}")
