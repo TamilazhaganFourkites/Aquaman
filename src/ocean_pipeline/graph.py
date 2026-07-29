@@ -20,17 +20,22 @@ from . import config, nodes
 from .state import OceanState
 
 
-def route_after_research(state: OceanState) -> str:
+def route_after_research(state: OceanState):
+    """Returns the next node NAME(s). On the coding route with PARALLEL_ANALYSIS on, returns a LIST
+    so LangGraph fans out to sme_consult ∥ dep_resolver ∥ prep_image in one superstep (they are
+    independent; reachability_gate joins them). Off -> the sequential chain via sme_consult."""
     r = state.get("route")
     # RCA-only run (control-plane "In RCA" stage): always take the analysis path, even if
     # the researcher leaned "coding" — the fix is a separate later run ("RCA Done").
     if config.RCA_ONLY and r != "unsupported" and r in ("rca", "coding"):
-        return "rca"
-    if r in ("rca", "coding"):
-        return r
+        return "rca_agent"
+    if r == "rca":
+        return "rca_agent"
+    if r == "coding":
+        return ["sme_consult", "dep_resolver", "prep_image"] if config.PARALLEL_ANALYSIS else "sme_consult"
     # sop / loft / ff_onboarding / unclassified are handled by other harnesses, not this
     # Ocean pipeline — stop cleanly rather than silently coding a non-coding ticket.
-    return "unsupported"
+    return "unsupported_route"
 
 
 def after_rca_review(state: OceanState) -> str:
@@ -108,6 +113,8 @@ def build_graph():
 
     g.add_node("researcher", nodes.researcher)
     g.add_node("sme_consult", nodes.sme_consult)
+    if config.PARALLEL_ANALYSIS:
+        g.add_node("prep_image", nodes.prep_image)               # #2: pre-warm the Ruby image (parallel path only)
     g.add_node("rca_agent", nodes.rca_agent)
     g.add_node("rca_report", nodes.rca_report)                    # plain-code: post the RCA report to Jira (one comment)
     g.add_node("rca_review_gate", nodes.rca_review_gate)          # human review of the posted RCA before acting on it
@@ -115,6 +122,10 @@ def build_graph():
     g.add_node("unsupported_route", nodes.unsupported_route)
     g.add_node("dep_resolver", nodes.dep_resolver)
     g.add_node("reachability_gate", nodes.reachability_gate)
+    if config.PERSISTENT_CONTAINER:
+        g.add_node("prep_container", nodes.prep_container)        # #1: start ONE shared test container
+    if config.PERSISTENT_CONTAINER or config.WARM_SIT_INFRA:
+        g.add_node("teardown_container", nodes.teardown_container)  # #1/#6: remove run-scoped Docker at end
     g.add_node("coder", nodes.coder)
     g.add_node("harsh_reviewer", nodes.harsh_reviewer)
     g.add_node("open_pr", nodes.open_pr)
@@ -133,11 +144,21 @@ def build_graph():
     g.add_node("stop_run", nodes.stop_run)
 
     g.add_edge(START, "researcher")
-    # Coding route consults the ocean SME (graph-owned dispatch) before the gates.
-    g.add_conditional_edges("researcher", route_after_research,
-                            {"rca": "rca_agent", "coding": "sme_consult",
-                             "unsupported": "unsupported_route"})
-    g.add_edge("sme_consult", "dep_resolver")
+    # Coding route consults the ocean SME (graph-owned dispatch) before the gates. route_after_research
+    # returns node NAMES directly (a list on the parallel coding path); the list below is the set of
+    # possible destinations for graph validation/visualization.
+    _research_dests = ["rca_agent", "sme_consult", "unsupported_route"]
+    if config.PARALLEL_ANALYSIS:
+        _research_dests += ["dep_resolver", "prep_image"]
+    g.add_conditional_edges("researcher", route_after_research, _research_dests)
+    if config.PARALLEL_ANALYSIS:
+        # Fan-out sme ∥ dep ∥ prep_image (one superstep) -> join at reachability_gate. Same-superstep
+        # fan-in is LangGraph's safe barrier: reachability runs ONCE, after all three complete.
+        g.add_edge("sme_consult", "reachability_gate")
+        g.add_edge("prep_image", "reachability_gate")
+        # dep_resolver -> reachability_gate is added once below (shared with the RCA fix path).
+    else:
+        g.add_edge("sme_consult", "dep_resolver")   # original strictly-sequential baseline
     g.add_edge("unsupported_route", END)
     # RCA agent -> human review gate -> RCA Done (terminal) | Fix needed -> deps + reachability
     # gate -> coder. Reject at the gate -> stop, before any coding starts.
@@ -148,7 +169,13 @@ def build_graph():
     g.add_edge("rca_done", END)
 
     g.add_edge("dep_resolver", "reachability_gate")
-    g.add_edge("reachability_gate", "coder")
+    if config.PERSISTENT_CONTAINER:
+        # #1: start the shared container after the gates (target repo known, image pre-warmed), before
+        # the first Docker station. reachability_gate -> prep_container -> coder.
+        g.add_edge("reachability_gate", "prep_container")
+        g.add_edge("prep_container", "coder")
+    else:
+        g.add_edge("reachability_gate", "coder")
     g.add_edge("coder", "harsh_reviewer")
     g.add_conditional_edges("harsh_reviewer", after_review,
                             {"rework": "coder", "approve": "open_pr"})
@@ -188,8 +215,16 @@ def build_graph():
     # unverified fan-in/join behavior at sit_triage -- the existing sit_run -> sit_triage edge fires
     # exactly as it does on a first attempt.
     g.add_edge("prep_env_retry", "sit_run")
-    g.add_edge("flip_ready", END)
-    g.add_edge("stop_run", END)
+    if config.PERSISTENT_CONTAINER or config.WARM_SIT_INFRA:
+        # #1/#6: both coding-route terminals route through teardown to remove the shared container
+        # and/or the warm SIT infra (idempotent no-op for whatever wasn't created). RCA/unsupported
+        # terminals never made either, so they go straight to END.
+        g.add_edge("flip_ready", "teardown_container")
+        g.add_edge("stop_run", "teardown_container")
+        g.add_edge("teardown_container", END)
+    else:
+        g.add_edge("flip_ready", END)
+        g.add_edge("stop_run", END)
 
     return g
 

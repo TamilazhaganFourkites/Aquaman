@@ -172,10 +172,149 @@ def _run(ticket="MM-1"):
 
 # ----------------------------------------------------------------- pure routing
 def test_route_after_research():
-    assert graph.route_after_research({"route": "rca"}) == "rca"
-    assert graph.route_after_research({"route": "coding"}) == "coding"
-    assert graph.route_after_research({"route": "sop"}) == "unsupported"
-    assert graph.route_after_research({}) == "unsupported"
+    # route_after_research now returns next-node NAME(s), not routing keys.
+    assert graph.route_after_research({"route": "rca"}) == "rca_agent"
+    assert graph.route_after_research({"route": "sop"}) == "unsupported_route"
+    assert graph.route_after_research({}) == "unsupported_route"
+
+
+def test_route_after_research_coding_fans_out_when_parallel(monkeypatch):
+    # Parallel on: coding route fans out to sme ∥ dep ∥ prep_image (a list => LangGraph fan-out).
+    monkeypatch.setattr(config, "PARALLEL_ANALYSIS", True)
+    dests = graph.route_after_research({"route": "coding"})
+    assert isinstance(dests, list)
+    assert set(dests) == {"sme_consult", "dep_resolver", "prep_image"}
+    # Parallel off: the original sequential chain via sme_consult.
+    monkeypatch.setattr(config, "PARALLEL_ANALYSIS", False)
+    assert graph.route_after_research({"route": "coding"}) == "sme_consult"
+
+
+def test_graph_builds_both_topologies(monkeypatch):
+    # Both wirings must COMPILE (compile is where unreachable-node / missing-edge guards fire).
+    for parallel in (True, False):
+        monkeypatch.setattr(config, "PARALLEL_ANALYSIS", parallel)
+        app = graph.build_graph().compile()
+        nodes_present = set(app.get_graph().nodes)
+        assert "prep_image" in nodes_present if parallel else "prep_image" not in nodes_present
+
+
+def test_parallel_fanout_joins_reachability_once(tmp_path, monkeypatch):
+    # The core correctness of #5: research fans out to sme ∥ dep (∥ prep_image), and reachability_gate
+    # must run EXACTLY ONCE (a broken join would run it per-predecessor). sme_bucket set so sme_consult
+    # actually runs rather than no-opping.
+    monkeypatch.setattr(config, "PARALLEL_ANALYSIS", True)
+    s = Script(route="coding", sme_bucket="callback_notification")
+    _install(s, tmp_path, monkeypatch)
+    _run()
+    assert s.calls["sme_consult"] == 1        # fanned out
+    assert s.calls["dep_resolver"] == 1       # fanned out (in parallel, not after sme)
+    assert s.calls["reachability_gate"] == 1  # JOINED once despite 2-3 predecessors
+    assert s.calls["coder"] == 1
+
+
+def test_sequential_baseline_still_works(tmp_path, monkeypatch):
+    # Parallel off: the original research -> sme -> dep -> reachability chain, each once.
+    monkeypatch.setattr(config, "PARALLEL_ANALYSIS", False)
+    s = Script(route="coding", sme_bucket="callback_notification")
+    _install(s, tmp_path, monkeypatch)
+    _run()
+    assert s.calls["sme_consult"] == 1
+    assert s.calls["dep_resolver"] == 1
+    assert s.calls["reachability_gate"] == 1
+    assert s.calls["coder"] == 1
+
+
+# ----------------------------------------------------------- #1 persistent container
+def test_container_directive_toggle(monkeypatch):
+    # Off / not-ready -> empty (stations use their own recipe; prompts unchanged, fallback-safe).
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", False)
+    assert nodes._container_directive({"container_name": "c", "container_ready": True}, "/w") == ""
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    assert nodes._container_directive({"container_ready": False}, "/w") == ""
+    # On + ready -> a directive naming the container and using docker cp/exec (never docker run).
+    d = nodes._container_directive({"container_name": "ocean-x-EXE1", "container_ready": True}, "/ws")
+    assert "ocean-x-EXE1" in d and "docker cp" in d and "docker exec" in d
+    assert "/ws" in d
+
+
+def test_prep_container_fallback(monkeypatch):
+    # No ruby target -> clean no-op (container_ready False), never raises.
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    out = asyncio.run(nodes.prep_container({"execution_id": "EXE1", "target_repos": []}))
+    assert out == {"container_ready": False}
+    # Ruby target but Docker absent -> still a clean fallback (no container started).
+    monkeypatch.setattr(nodes.shutil, "which", lambda _: None)
+    out = asyncio.run(nodes.prep_container(
+        {"execution_id": "EXE1", "target_repos": [{"repo": "cloudqwest/ocean-worker", "build_env": "docker"}]}))
+    assert out == {"container_ready": False}
+
+
+def test_teardown_container_is_safe_noop(monkeypatch):
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    # No container name -> no docker call, returns cleanly.
+    assert asyncio.run(nodes.teardown_container({"execution_id": "EXE1", "container_name": ""})) == {}
+
+
+def test_graph_persistent_container_wiring(monkeypatch):
+    # On: reachability -> prep_container -> coder, and both terminals -> teardown_container -> END.
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    edges = {(e.source, e.target) for e in graph.build_graph().compile().get_graph().edges}
+    assert ("reachability_gate", "prep_container") in edges
+    assert ("prep_container", "coder") in edges
+    assert ("flip_ready", "teardown_container") in edges
+    assert ("stop_run", "teardown_container") in edges
+    # Off: coder is fed directly, no container nodes.
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", False)
+    edges = {(e.source, e.target) for e in graph.build_graph().compile().get_graph().edges}
+    assert ("reachability_gate", "coder") in edges
+    assert not any("container" in a or "container" in b for a, b in edges)
+
+
+def test_full_coding_flow_with_persistent_container_on(tmp_path, monkeypatch):
+    # PC on must not break the flow even when no container starts (empty target_repos -> fallback).
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    s = Script(route="coding")
+    _install(s, tmp_path, monkeypatch)
+    final = _run()
+    assert s.calls["coder"] == 1
+    assert final["final_status"] in ("completed", "rca_report") or final.get("pr_number")
+
+
+# ----------------------------------------------------------- #6 warm SIT infra
+def test_sit_infra_directive_toggle(monkeypatch):
+    monkeypatch.setattr(config, "WARM_SIT_INFRA", False)
+    assert nodes._sit_infra_directive({"execution_id": "EXE1"}) == ""
+    monkeypatch.setattr(config, "WARM_SIT_INFRA", True)
+    d = nodes._sit_infra_directive({"execution_id": "EXE1"})
+    assert "ocean-sit-EXE1" in d and "compose -p" in d and "REUSE" in d
+
+
+def test_teardown_removes_sit_infra(monkeypatch):
+    calls = []
+
+    async def rec(args, timeout=120):
+        calls.append(args)
+        return 0
+    monkeypatch.setattr(nodes, "_docker", rec)
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    monkeypatch.setattr(config, "WARM_SIT_INFRA", True)
+    asyncio.run(nodes.teardown_container({"execution_id": "EXE1", "container_name": "ocean-x-EXE1"}))
+    # removed both the container and the SIT compose project
+    assert ["rm", "-f", "ocean-x-EXE1"] in calls
+    assert any(a[:2] == ["compose", "-p"] and "ocean-sit-EXE1" in a for a in calls)
+
+
+def test_graph_warm_sit_infra_wiring_without_container(monkeypatch):
+    # #6 alone (no persistent container): teardown node present + terminals routed, but NO prep_container.
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", False)
+    monkeypatch.setattr(config, "WARM_SIT_INFRA", True)
+    app = graph.build_graph().compile()
+    ns = set(app.get_graph().nodes)
+    assert "teardown_container" in ns and "prep_container" not in ns
+    edges = {(e.source, e.target) for e in app.get_graph().edges}
+    assert ("flip_ready", "teardown_container") in edges
+    assert ("stop_run", "teardown_container") in edges
+    assert ("reachability_gate", "coder") in edges   # no prep_container inserted
 
 
 def test_after_review():

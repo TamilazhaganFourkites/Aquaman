@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from . import metrics, ui
+from . import config, metrics, telemetry, ui
 
 _rows: list[dict] = []
 _meta: dict = {}
@@ -22,6 +22,7 @@ def start(ticket: str, execution_id: str) -> None:
     now = datetime.now()
     _meta.update(ticket=ticket, execution_id=execution_id,
                  started=now.strftime("%Y-%m-%d %H:%M:%S"), _start=now)
+    telemetry.reset_timings(execution_id)
 
 
 def record(node: str, duration: float, update: dict) -> None:
@@ -61,12 +62,41 @@ def finish(final: dict, out_dir: Path) -> Path | None:
             "tool_calls": t["tools"], "station_runs": t["stations"],
         },
         "timeline": list(_rows),
+        # Measured per-station wall-clock (accurate even when stations run in parallel — sourced from
+        # each station's own start/end, not the sequential stream-gap). name -> seconds.
+        "station_seconds": telemetry.station_durations(_meta.get("execution_id") or ""),
+        # which latency levers were active — so a timings.jsonl line is attributable to the right one
+        # in a before/after comparison (all three toggle independently).
+        "parallel_analysis": config.PARALLEL_ANALYSIS,
+        "persistent_container": config.PERSISTENT_CONTAINER,
+        "warm_sit_infra": config.WARM_SIT_INFRA,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "run-report.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
     md = out_dir / "run-report.md"
     md.write_text(_markdown(doc), encoding="utf-8")
+    _append_timings_log(doc)
     return md
+
+
+def _append_timings_log(doc: dict) -> None:
+    """Persist one JSON line per run to a DURABLE path (TIMINGS_LOG), so before/after latency
+    comparisons survive the /tmp artifacts cleanup. Best-effort — never breaks the run."""
+    try:
+        rec = {
+            "ticket": doc.get("ticket"), "execution_id": doc.get("execution_id"),
+            "finished": doc.get("finished"), "final_status": doc.get("final_status"),
+            "parallel_analysis": doc.get("parallel_analysis"),
+            "persistent_container": doc.get("persistent_container"),
+            "warm_sit_infra": doc.get("warm_sit_infra"),
+            "total_seconds": doc.get("duration_seconds"),
+            "station_seconds": doc.get("station_seconds") or {},
+        }
+        config.TIMINGS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with config.TIMINGS_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
 
 
 def _markdown(doc: dict) -> str:
@@ -103,4 +133,24 @@ def _markdown(doc: dict) -> str:
     for i, r in enumerate(doc["timeline"], 1):
         out.append(f"| {i} | {r['label']} (`{r['node']}`) | {_fmt(r['seconds'])} | {r['outcome'] or ''} |")
     out.append("")
+
+    # Measured per-station timing (slowest first) — the accurate, parallelism-safe breakdown for
+    # before/after latency comparisons. The Timeline above shows observed ORDER; this shows each
+    # station's OWN runtime (which the sequential stream-gap can mis-attribute once stations overlap).
+    stationsec = doc.get("station_seconds") or {}
+    if stationsec:
+        levers = (f"parallel_analysis={'on' if doc.get('parallel_analysis') else 'off'} · "
+                  f"persistent_container={'on' if doc.get('persistent_container') else 'off'} · "
+                  f"warm_sit_infra={'on' if doc.get('warm_sit_infra') else 'off'}")
+        out += [
+            f"## Station timings (measured · {levers})",
+            "",
+            "| Station | Own runtime |",
+            "|---------|-------------|",
+        ]
+        for name, sec in sorted(stationsec.items(), key=lambda kv: kv[1], reverse=True):
+            out.append(f"| {name} | {_fmt(sec)} |")
+        # NB: with parallel_analysis on, the sum EXCEEDS wall-clock (overlapping stations) — the run's
+        # real elapsed is Duration above; this sum is a per-station total, not the wall-clock.
+        out += [f"| _sum of stations (not wall-clock)_ | {_fmt(sum(stationsec.values()))} |", ""]
     return "\n".join(out)

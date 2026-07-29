@@ -8,7 +8,9 @@ Two kinds of node:
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -109,6 +111,86 @@ def _reachability_for_coder(report: dict) -> str:
     return json.dumps(slim, indent=2, default=str)
 
 
+def _gh_token() -> str:
+    """GitHub token for private-gem Docker builds. Ocean Ruby images (ocean-worker et al.) need it on a
+    COLD build — VALIDATED: without it `bundle install` fails exit 11, so the pre-warm/container build
+    silently fails and falls back to a no-op. Prefer `gh auth token`, fall back to env."""
+    try:
+        out = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+
+
+def _image_cache_argv(tool: Path, name: str, worktree: Path) -> list[str]:
+    """Argv to build/resolve a repo's cached image. Passes --build-arg GITHUB_TOKEN when available so a
+    COLD build of a private-gem repo succeeds (ocean-worker's `bundle install` needs it)."""
+    argv = ["python3", str(tool), "--repo", name, "--worktree", str(worktree)]
+    tok = _gh_token()
+    if tok:
+        argv += ["--build-arg", f"GITHUB_TOKEN={tok}"]
+    return argv
+
+
+async def _docker(args: list[str], timeout: int = 120) -> int:
+    """Run `docker <args>` best-effort; return the exit code (127 if docker/subprocess is unusable).
+    Never raises — the persistent-container path is an optimization that must never break the run."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return 124
+        return proc.returncode
+    except OSError:
+        return 127
+
+
+def _container_directive(state: OceanState, repo_dir: str) -> str:
+    """Latency #1: the prompt snippet telling a Docker station to REUSE the orchestrator's persistent
+    container instead of standing up its own. Empty string unless prep_container actually started one
+    (container_ready) — so with the feature off, or if the container failed to start, every station's
+    prompt is byte-for-byte what it is today and the agent uses its own recipe (fallback-safe)."""
+    name = state.get("container_name") or ""
+    if not (config.PERSISTENT_CONTAINER and state.get("container_ready") and name):
+        return ""
+    rd = repo_dir or "<repo_dir>"
+    return (
+        f"\n\nPERSISTENT CONTAINER: the orchestrator has already started ONE booted container "
+        f"`{name}` from the pre-warmed image (gems installed). For ALL builds/tests do NOT `docker "
+        f"run`, `docker build`, or start your own container — copy the CURRENT code in and exec:\n"
+        f"    docker cp {rd}/. {name}:/app/fourkites/test/\n"
+        f"    docker exec <required -e env for YOUR station: RAILS_ENV/FK_ENVIRONMENT/AWS_*/BUNDLE_GEMFILE "
+        f"per local-docker-run.md §3 — unit specs use FK_ENVIRONMENT=test, SIT uses qat> {name} bash -lc "
+        f"'cd /app/fourkites/test && bundle exec rspec <changed_spec_files>'\n"
+        f"Re-`docker cp` after each edit (the container persists across your RED→GREEN cycles AND the "
+        f"reviewer/SIT stations); batch specs into ONE `rspec` call. Only fall back to your own "
+        f"`docker run` recipe if a `docker exec {name}` probe fails.\n"
+    )
+
+
+def _sit_infra_directive(state: OceanState) -> str:
+    """Latency #6: tell sit_run to bring the SIT infra up under a STABLE compose project and reuse it
+    across the retry loop instead of tearing it down + re-bootstrapping each attempt. Empty unless
+    WARM_SIT_INFRA is on — so with it off, sit_run's prompt is unchanged and it manages infra as today
+    (fallback-safe). The graph removes the project at run end (teardown_container)."""
+    if not config.WARM_SIT_INFRA:
+        return ""
+    project = config.sit_infra_project(state["execution_id"])
+    return (
+        f"\n\nWARM SIT INFRA: bring the local infra (localstack/es/redis/mock + bridges) up under a "
+        f"STABLE docker-compose project name `{project}` (`docker compose -p {project} …`). If it is "
+        f"ALREADY up (this is a code_fault / environment_failure re-entry), REUSE it as-is — do NOT "
+        f"`compose down` or rebuild the stack between attempts; only reset mutable state (re-seed the "
+        f"queue/mock expectations) and re-run the specs. The graph tears the project down at run end, "
+        f"so leave it running when you finish.\n"
+    )
+
+
 def _service_slug(state: OceanState) -> str:
     """The `<org>/<name>` slug of the repo whose branch we open/flip the PR on. Prefer what the
     coder reported; fall back to the single target repo when there's exactly one."""
@@ -184,6 +266,114 @@ async def sme_consult(state: OceanState) -> dict:
     )
     telemetry.station_event(exec_id, 0.5, "end", findings=len(v.findings))
     return {"sme_findings": {"summary": v.summary, "findings": v.findings}}
+
+
+# ------------------------------------------------------------------ Station 0.6 — pre-warm Ruby image
+async def prep_image(state: OceanState) -> dict:
+    """#2 latency: pre-build/cache the Ruby ocean Docker image CONCURRENTLY with sme_consult/
+    dep_resolver, so it is hot before the coder (the ~32m station) and reachability need it -- moving
+    the image build OFF the coder's critical path. Runs only on the PARALLEL_ANALYSIS path (the graph
+    fans it out beside sme/dep and joins at reachability_gate). Best-effort and non-blocking: no
+    Docker, no local checkout, a non-Ruby repo, a missing tool, a build error, or a timeout all no-op
+    cleanly and the coder just builds normally. Keyed by Gemfile.lock+Dockerfile hash inside
+    ruby_image_cache, so a warm cache returns fast."""
+    exec_id = state["execution_id"]
+    telemetry.station_event(exec_id, 0.6, "start")
+    tool = config.FK_AIDEVELOPER_DIR / "skills" / "ocean-qa-agent" / "tools" / "ruby_image_cache.py"
+    results: list[str] = []
+    for r in (state.get("target_repos") or []):
+        repo = r.get("repo", "")
+        name = repo.split("/")[-1]
+        is_ruby = "docker" in (r.get("build_env") or "").lower() or (r.get("language") or "").lower() == "ruby"
+        worktree = config.PROJECTS_ROOT / name
+        if not repo or not is_ruby:
+            continue
+        if not tool.exists():
+            results.append(f"{name}: skip (image-cache tool not found)"); continue
+        if not (worktree / ".git").exists():
+            results.append(f"{name}: skip (no local checkout to build from)"); continue
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_image_cache_argv(tool, name, worktree),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc.kill()
+                results.append(f"{name}: prewarm timed out (coder will build)"); continue
+            tail = ((out or b"").decode(errors="replace").strip().splitlines() or [""])[-1]
+            results.append(f"{name}: {'ready' if proc.returncode == 0 else 'build failed'} ({tail[:80]})")
+        except OSError as e:
+            results.append(f"{name}: prewarm error ({e})")
+    telemetry.station_event(exec_id, 0.6, "end", prewarm="; ".join(results) or "no ruby target to prewarm")
+    return {}
+
+
+# ------------------------------------------------------------------ Station 3.5 — persistent container
+async def prep_container(state: OceanState) -> dict:
+    """Latency #1: start ONE booted container from the pre-warmed image so the coder/reviewer/SIT
+    stations reuse it (docker cp + docker exec) instead of each doing its own `docker run` +
+    image/env re-derivation (D4/D5/P1). Best-effort and fallback-safe: not Ruby, no Docker, no image,
+    or a start failure all leave container_ready=False and the stations use their own recipe."""
+    exec_id = state["execution_id"]
+    telemetry.station_event(exec_id, 3.5, "start")
+    ruby = next((r for r in (state.get("target_repos") or [])
+                 if "docker" in (r.get("build_env") or "").lower() or (r.get("language") or "").lower() == "ruby"),
+                None)
+    tool = config.FK_AIDEVELOPER_DIR / "skills" / "ocean-qa-agent" / "tools" / "ruby_image_cache.py"
+    if not ruby:
+        telemetry.station_event(exec_id, 3.5, "skip", reason="no ruby target repo")
+        return {"container_ready": False}
+    name = (ruby.get("repo") or "").split("/")[-1]
+    worktree = config.PROJECTS_ROOT / name
+    if not shutil.which("docker") or not tool.exists() or not (worktree / ".git").exists():
+        telemetry.station_event(exec_id, 3.5, "skip", reason="docker / image-cache tool / checkout absent")
+        return {"container_ready": False}
+    container = f"ocean-{name}-{exec_id}"
+    try:
+        # Resolve (cache-hit if prep_image already built it) the pre-warmed image tag.
+        proc = await asyncio.create_subprocess_exec(
+            *_image_cache_argv(tool, name, worktree),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
+        except asyncio.TimeoutError:
+            proc.kill()
+            telemetry.station_event(exec_id, 3.5, "skip", reason="image resolve timed out")
+            return {"container_ready": False}
+        tag = (((out or b"").decode(errors="replace").strip().splitlines() or [""])[-1]) if proc.returncode == 0 else ""
+        if not tag:
+            telemetry.station_event(exec_id, 3.5, "skip", reason="image tag unresolved")
+            return {"container_ready": False}
+        await _docker(["rm", "-f", container])           # clear any stale same-named container
+        started = await _docker(["run", "-d", "--name", container, "--entrypoint", "sleep", tag, "infinity"])
+        ready = started == 0
+        telemetry.station_event(exec_id, 3.5, "end",
+                                container=container if ready else f"start failed (docker exit {started})")
+        return {"container_name": container if ready else "", "container_ready": ready}
+    except OSError as e:
+        telemetry.station_event(exec_id, 3.5, "skip", reason=f"prep error ({e})")
+        return {"container_ready": False}
+
+
+async def teardown_container(state: OceanState) -> dict:
+    """Remove the run-scoped Docker resources at run end (both terminal paths route through here):
+    the persistent test container (#1) and the warm SIT infra project (#6). Best-effort; a no-op for
+    whatever wasn't created. Passes state straight through — it's a cleanup node, not a gate."""
+    exec_id = state["execution_id"]
+    removed = []
+    name = state.get("container_name") or ""
+    if config.PERSISTENT_CONTAINER and name:
+        await _docker(["rm", "-f", name])
+        removed.append(name)
+    if config.WARM_SIT_INFRA:
+        project = config.sit_infra_project(exec_id)
+        # remove the compose project AND any stray containers labeled/named for it (best-effort both ways)
+        await _docker(["compose", "-p", project, "down", "-v", "--remove-orphans"], timeout=180)
+        removed.append(project)
+    if removed:
+        telemetry.station_event(exec_id, 3.6, "end", removed="; ".join(removed))
+    return {}
 
 
 # ------------------------------------------------------------------ Station 1
@@ -264,6 +454,7 @@ async def coder(state: OceanState) -> dict:
             f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}\n\n"
             f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
             f"{_summary(state)}"
+            f"{_container_directive(state, str(workspace))}"
         ),
         verdict_model=schemas.CoderVerdict,
     )
@@ -301,6 +492,7 @@ async def harsh_reviewer(state: OceanState) -> dict:
             f"MAJOR.\n\n"
             f"Research summary (for AC context):\n{_brief(state.get('research_packet'))}\n\n"
             f"{_summary(state)}"
+            f"{_container_directive(state, wt)}"
         ),
         verdict_model=schemas.ReviewVerdict,
     )
@@ -493,6 +685,8 @@ async def sit_run(state: OceanState) -> dict:
             f"run Station 3 (report/verdict) — the graph's sit_triage node does that next."
             f"{retry_note}"
             f"\n\n{_summary(state)}"
+            f"{_container_directive(state, state.get('worktree_dir', ''))}"
+            f"{_sit_infra_directive(state)}"
         ),
     )
     telemetry.station_event(exec_id, 6.2, "end")

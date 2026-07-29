@@ -39,6 +39,45 @@ OCEAN_AGENTS_DIR = FK_AIDEVELOPER_DIR / "skills" / "ocean-coding-agent" / "agent
 # Per-run artifact root (reachability-report.json, per-station verdict.json, etc.)
 ARTIFACTS_ROOT = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline"))
 
+# Durable per-run station-timing log (one JSON line per finished run). ARTIFACTS_ROOT lives under
+# /tmp and gets cleaned, losing the run-report timings; this log persists them so before/after
+# latency comparisons survive. Out of any git repo by default.
+TIMINGS_LOG = Path(os.environ.get("OCEAN_PIPELINE_TIMINGS_LOG",
+                                  str(Path.home() / ".ocean-pipeline" / "timings.jsonl")))
+
+# Latency prototype (measure before/after with the SAME instrumentation):
+#   on  (default) — researcher fans out to sme_consult ∥ dep_resolver ∥ prep_image (they are
+#                   independent: dep_resolver reads only the research packet, not sme_findings),
+#                   joining at reachability_gate; prep_image pre-builds the Ruby image off the
+#                   coder's critical path.
+#   off — the original strictly-sequential research -> sme -> dep -> reachability chain, for a
+#         clean baseline run. Set OCEAN_PIPELINE_PARALLEL_ANALYSIS=0.
+PARALLEL_ANALYSIS = os.environ.get("OCEAN_PIPELINE_PARALLEL_ANALYSIS", "1").lower() not in ("0", "false", "no")
+
+# Latency lever #1 — orchestrator-owned persistent Docker container. When on, the graph starts ONE
+# booted container from the pre-warmed image before the coder (prep_container) and every Docker
+# station (coder, reviewer, sit_author, sit_run) reuses it (docker cp current code + docker exec) instead
+# of each doing its own `docker run` + image/env re-derivation; teardown_container removes it at the end.
+# DEFAULT OFF: this changes Docker *runtime* behavior and needs one real ocean run to validate the
+# cp/exec recipe. It is fully fallback-safe — if the container can't start (no Docker/image/checkout) or
+# a station's exec probe fails, container_ready stays False and stations use their existing self-contained
+# recipe, so the pipeline behaves exactly as today. Enable with OCEAN_PIPELINE_PERSISTENT_CONTAINER=1.
+PERSISTENT_CONTAINER = os.environ.get("OCEAN_PIPELINE_PERSISTENT_CONTAINER", "0").lower() in ("1", "true", "yes")
+
+# Latency lever #6 — keep the SIT infra (localstack/es/redis/mock) warm ACROSS the code_fault /
+# environment_failure retry loop. When on, sit_run brings the infra up under a stable compose project
+# `ocean-sit-<exec>` and REUSES it on a re-entry instead of tearing down + re-bootstrapping the whole
+# stack each attempt (the ~23m sit_run bring-up is paid once, not once per loop); teardown_container
+# removes the project at run end. Same DEFAULT OFF + fallback-safe rationale as PERSISTENT_CONTAINER:
+# if anything about the stack differs, the skill just brings up a fresh stack as it does today.
+WARM_SIT_INFRA = os.environ.get("OCEAN_PIPELINE_WARM_SIT_INFRA", "0").lower() in ("1", "true", "yes")
+
+
+def sit_infra_project(execution_id: str) -> str:
+    """Deterministic compose project name for a run's SIT infra, so a retry reuses the SAME stack and
+    teardown_container can remove exactly it (#6)."""
+    return f"ocean-sit-{execution_id}"
+
 # LangGraph checkpointer DB — durable resume + the AP-223 orphan fix.
 CHECKPOINT_DB = os.environ.get("OCEAN_PIPELINE_CHECKPOINT_DB", str(ARTIFACTS_ROOT / "checkpoints.sqlite"))
 
@@ -111,6 +150,10 @@ MAX_ONBOARD_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ONBOARD_ATTEMPTS",
 # preflight short-circuit (preflight_failed=True) -- more Docker memory doesn't appear between
 # attempts, so that case never retries regardless of this budget (see graph.py::after_sit_triage).
 MAX_ENV_RETRY_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ENV_RETRY_ATTEMPTS", "1"))
+
+# Wall-clock cap for the prep_image pre-warm (a cold Ruby image build can be minutes). On timeout the
+# pre-warm is abandoned best-effort and the coder builds normally -- pre-warm never blocks the run.
+IMAGE_PREWARM_TIMEOUT = int(os.environ.get("OCEAN_PIPELINE_IMAGE_PREWARM_TIMEOUT", "900"))
 
 # Local mock-first SIT: the LocalStack SQS endpoint the test-automation SQS client must target.
 # Without this exported, that client silently constructs as None and crashes on `.meta`, so the

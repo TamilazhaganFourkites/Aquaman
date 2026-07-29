@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 import secrets
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -37,7 +38,9 @@ _SOURCE_TAG = "source=langgraph (aquaman)"
 # Aquaman station-number -> the server's canonical station name (fk-execute telemetry map).
 _STATION_NAMES = {
     0: "researcher", 0.1: "rca_router", 0.12: "rca_report", 0.15: "rca_review_gate", 0.5: "sme_consult",
+    0.6: "prep_image",
     1: "dependency_resolver", 1.5: "reachability_gate",
+    3.5: "prep_container", 3.6: "teardown_container",
     3.87: "open_pr", 4: "coder",
     5: "harsh_review", 5.9: "code_fault_rework",
     5.95: "learn_repo", 6.0: "sit_resolve", 6.1: "sit_author", 6.15: "qa_review_gate",
@@ -137,8 +140,35 @@ def execution_end(execution_id: str, ticket_id: str, final_status: str, route: s
     })
 
 
+# --- local per-station wall-clock timing (independent of the aidev-db dispatch) --------------
+# Measured from each station's own start->end events, so it stays ACCURATE when stations run in
+# parallel -- unlike cli._drive_stream's `now - last` gap timing, which assumes sequential nodes.
+# Durations ACCUMULATE per (execution_id, station) so a looping station (coder rework, env retry)
+# sums its passes. Keyed by execution_id so a resumed run (fresh process) starts clean.
+_station_t0: dict[tuple[str, str], float] = {}
+_station_seconds: dict[tuple[str, str], float] = {}
+
+
+def station_durations(execution_id: str) -> dict[str, float]:
+    """Measured seconds per station for this run, name -> seconds (accumulated over re-runs)."""
+    return {name: round(sec, 1) for (eid, name), sec in _station_seconds.items() if eid == execution_id}
+
+
+def reset_timings(execution_id: str) -> None:
+    for d in (_station_t0, _station_seconds):
+        for k in [k for k in d if k[0] == execution_id]:
+            del d[k]
+
+
 def station_event(execution_id: str, station_number: float, phase: str, **extra: Any) -> None:
     name = _STATION_NAMES.get(station_number, f"station_{station_number}")
+    key = (execution_id, name)
+    if phase == "start":
+        _station_t0[key] = time.monotonic()
+    elif phase in ("end", "stop", "done", "skip"):
+        t0 = _station_t0.pop(key, None)
+        if t0 is not None:
+            _station_seconds[key] = _station_seconds.get(key, 0.0) + (time.monotonic() - t0)
     args: dict[str, Any] = {
         "execution_id": execution_id,
         "station": name,

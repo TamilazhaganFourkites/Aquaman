@@ -58,6 +58,10 @@ class OceanState(TypedDict, total=False):
     review_iteration: int
     review_findings: list            # replaced each review pass
 
+    # --- latency #1: orchestrator-owned persistent container (config.PERSISTENT_CONTAINER) ---
+    container_name: str      # the booted container the Docker stations reuse ("" when not started)
+    container_ready: bool    # True only if prep_container actually started it; else stations self-serve
+
     # --- 3.87 ---
     pr_number: int
     service_repo: str        # owner/name slug the coder pushed to; used by the git/PR code nodes
