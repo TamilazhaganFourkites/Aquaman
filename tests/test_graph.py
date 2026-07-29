@@ -77,7 +77,9 @@ def _install(script: Script, tmp_path, monkeypatch):
         if node.startswith("rca_agent"):
             return schemas.RcaVerdict(report_path=nowhere, fix_needed=script.rca_fix,
                                       findings_for_coder=(["fix X in ocean-worker"] if script.rca_fix else []))
-        if node.startswith("dep_resolver") or node.startswith("reachability_gate"):
+        if node.startswith("dep_resolver"):
+            return schemas.DependencyVerdict(report_path=nowhere)
+        if node.startswith("reachability_gate"):
             return schemas.ReachabilityVerdict(report_path=nowhere)
         if node.startswith("coder"):
             return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b",
@@ -468,6 +470,86 @@ def test_run_agent_allows_write_for_a_write_less_sme_file(tmp_path, monkeypatch)
     assert set(captured["allowed_tools"]) == {"Read", "Grep", "Glob", "Bash", "Write"}, (
         "the file's OTHER declared restrictions must still be preserved — only Write is added"
     )
+
+
+# ----------------------------------------------------------------- G2: fail-loud worker resolution
+def test_agent_path_raises_clear_error_when_missing(tmp_path, monkeypatch):
+    """G2: a worker prompt that exists in NEITHER the vendored dir nor the fk-aideveloper station
+    dir must raise a clear StationError naming both locations — not silently return a nonexistent
+    path that later dies as a bare FileNotFoundError inside _read (the prior failure mode when the
+    vendored `workers/` dir was absent)."""
+    (tmp_path / "workers").mkdir()
+    (tmp_path / "agents").mkdir()
+    monkeypatch.setattr(config, "VENDORED_AGENTS_DIR", tmp_path / "workers")
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    with pytest.raises(agents.StationError) as ei:
+        agents._agent_path("does-not-exist.md")
+    msg = str(ei.value)
+    assert "does-not-exist.md" in msg
+    assert "workers" in msg and "agents" in msg
+
+
+# ----------------------------------------------------------------- G7: node-level retry recovery
+def test_drive_with_retry_recovers_from_transient_failure(monkeypatch):
+    """G7: a single transient _drive failure must be retried and RECOVERED (not propagated) —
+    the node-level resilience config.MAX_AGENT_RETRIES promises. Previously no test proved recovery,
+    only that the retry code existed."""
+    monkeypatch.setattr(config, "MAX_AGENT_RETRIES", 2)
+    monkeypatch.setattr(config, "AGENT_RETRY_BACKOFF_SECONDS", 0)  # no real sleep
+    calls = {"n": 0}
+
+    async def flaky_drive(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient claude-CLI error")
+        return  # second attempt succeeds
+
+    monkeypatch.setattr(agents, "_drive", flaky_drive)
+    asyncio.run(agents._drive_with_retry(
+        system_prompt="sp", prompt="p", cwd=Path("/tmp"),
+        permission_mode="bypassPermissions", label="test"))
+    assert calls["n"] == 2   # failed once, recovered on the retry — did NOT propagate
+
+
+def test_drive_with_retry_propagates_after_budget(monkeypatch):
+    """The flip side of G7: once MAX_AGENT_RETRIES is exhausted the last error propagates, so the
+    caller (run_agent/run_skill) can normalize it to a StationError rather than it being swallowed."""
+    monkeypatch.setattr(config, "MAX_AGENT_RETRIES", 1)
+    monkeypatch.setattr(config, "AGENT_RETRY_BACKOFF_SECONDS", 0)
+
+    async def always_fails(*a, **kw):
+        raise RuntimeError("persistent failure")
+
+    monkeypatch.setattr(agents, "_drive", always_fails)
+    with pytest.raises(RuntimeError, match="persistent failure"):
+        asyncio.run(agents._drive_with_retry(
+            system_prompt="sp", prompt="p", cwd=Path("/tmp"),
+            permission_mode="bypassPermissions", label="test"))
+
+
+# ----------------------------------------------------------------- A3: RCA report posted by plain code
+def test_rca_report_posts_worker_report_via_jira(tmp_path, monkeypatch):
+    """A3: the RCA report is posted by the plain-code rca_report node via jira.py — NOT by the worker
+    via the Atlassian MCP. rca_report reads the worker-written report file and posts exactly one
+    comment; a missing file or no token is a silent no-op."""
+    posted = []
+    monkeypatch.setattr(jira, "comment", lambda tid, body: posted.append((tid, body)))
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+
+    report_file = tmp_path / "rca.md"
+    report_file.write_text("## Root cause\nX broke Y.")
+    out = asyncio.run(nodes.rca_report(
+        {"ticket_id": "MM-1", "execution_id": "EXE-x", "rca_report_path": str(report_file)}))
+    assert out == {}
+    assert len(posted) == 1                      # exactly one comment
+    assert posted[0][0] == "MM-1"
+    assert "Root cause" in posted[0][1] and posted[0][1].startswith("🤖 Aquaman Ocean RCA")
+
+    # missing report file -> no post (best-effort)
+    posted.clear()
+    asyncio.run(nodes.rca_report(
+        {"ticket_id": "MM-1", "execution_id": "EXE-x", "rca_report_path": str(tmp_path / "nope.md")}))
+    assert posted == []
 
 
 # ----------------------------------------------------------------- human-approval gate (Phase C)
@@ -881,7 +963,7 @@ def test_dep_resolver_surfaces_its_own_blocking_claim(monkeypatch):
     surfaced it as reachability_blocking -- same schema, inconsistent treatment. dep_resolver
     must surface its own claim the same way, as dependency_blocking."""
     async def fake_run_agent(**kw):
-        return schemas.ReachabilityVerdict(report_path="/tmp/x.json", blocking=True, notes="blocked on X")
+        return schemas.DependencyVerdict(report_path="/tmp/x.json", blocking=True, notes="blocked on X")
 
     monkeypatch.setattr(agents, "run_agent", fake_run_agent)
     result = asyncio.run(nodes.dep_resolver({"ticket_id": "MM-1", "execution_id": "EXE-x"}))

@@ -158,7 +158,7 @@ async def sme_consult(state: OceanState) -> dict:
 # ------------------------------------------------------------------ Station 1
 async def dep_resolver(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1, "start")
-    v: schemas.ReachabilityVerdict = await agents.run_agent(
+    v: schemas.DependencyVerdict = await agents.run_agent(
         agent_md="dep-resolve.md",   # vendored slim worker (Workstream B)
         node="dep_resolver",
         ticket_id=state["ticket_id"],
@@ -167,7 +167,7 @@ async def dep_resolver(state: OceanState) -> dict:
             f"Resolve dependencies/blockers for {state['ticket_id']}. Self-solve where possible; "
             f"flag only true blockers.\n\n{_summary(state)}"
         ),
-        verdict_model=schemas.ReachabilityVerdict,
+        verdict_model=schemas.DependencyVerdict,
     )
     telemetry.station_event(state["execution_id"], 1, "end", blocking=v.blocking)
     return {"dependency_report": {"report_path": v.report_path, "notes": v.notes},
@@ -694,10 +694,12 @@ async def rca_agent(state: OceanState) -> dict:
         execution_id=state["execution_id"],
         task_prompt=(
             f"Produce the ocean-rca evidence-cited report for {state['ticket_id']}. "
-            f"POST the completed 5-part report back to {state['ticket_id']} as a Jira comment via the "
-            f"Atlassian MCP (addCommentToJiraIssue), prefixed '🤖 Aquaman Ocean RCA': root cause, "
-            f"evidence (with proof — specific SigNoz/ClickHouse log lines + the source that produced "
-            f"them + read-only Redshift records), affected service/component, and recommended fix. "
+            f"WRITE the completed 5-part report as markdown to an absolute file path and return that "
+            f"path as `report_path`: root cause, evidence (with proof — specific SigNoz/ClickHouse log "
+            f"lines + the source that produced them + read-only Redshift records), affected "
+            f"service/component, and recommended fix. Do NOT post to Jira yourself — the graph's "
+            f"rca_report step posts the report as a SINGLE Jira comment (deterministic, one comment "
+            f"per investigation). "
             f"STRICT PRODUCTION SAFETY: use rca-app / fourkites MCP tools for READ/GET only; NEVER call "
             f"any create/update/delete/resolve tool against production. Then decide: "
             f"does the root cause require a code fix in an ocean repo? If yes, set fix_needed=true "
@@ -708,7 +710,29 @@ async def rca_agent(state: OceanState) -> dict:
         verdict_model=schemas.RcaVerdict,
     )
     telemetry.station_event(state["execution_id"], 0.1, "end", fix_needed=v.fix_needed)
-    return {"rca_fix_needed": v.fix_needed, "rca_findings": v.findings_for_coder}
+    return {"rca_fix_needed": v.fix_needed, "rca_findings": v.findings_for_coder,
+            "rca_report_path": v.report_path}
+
+
+# ------------------------------------------------------------------ RCA report post (plain code, one Jira comment)
+async def rca_report(state: OceanState) -> dict:
+    """Post the RCA worker's 5-part report to Jira as a SINGLE comment — deterministic plain code, run
+    by the graph, NOT the worker. This is the control-plane's own Jira transport (`jira.py`, the same
+    Bearer-token REST path used for the lifecycle transitions), so RCA posting no longer depends on the
+    headless worker having an interactively-authenticated Atlassian MCP (which may be absent in headless
+    runs). Best-effort: no report file / no JIRA_API_TOKEN -> silent no-op, exactly one comment at most."""
+    tid = state["ticket_id"]
+    telemetry.station_event(state["execution_id"], 0.12, "start")
+    report_text = ""
+    path = state.get("rca_report_path") or ""
+    if path:
+        p = Path(path)
+        if p.exists():
+            report_text = p.read_text(encoding="utf-8", errors="replace").strip()
+    if report_text:
+        jira.comment(tid, f"🤖 Aquaman Ocean RCA:\n\n{report_text}")
+    telemetry.station_event(state["execution_id"], 0.12, "end", posted=bool(report_text))
+    return {}
 
 
 # ------------------------------------------------------------------ RCA review gate (human, before acting on the RCA)

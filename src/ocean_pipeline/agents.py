@@ -82,9 +82,28 @@ def _read(path: Path) -> str:
 def _agent_path(agent_md: str) -> Path:
     """Resolve a worker prompt: prefer the vendored slim worker owned by this repo, and fall
     back to the fk-aideveloper station agent for any node not yet migrated (Phase B is
-    incremental — one node at a time points at a vendored file here)."""
+    incremental — one node at a time points at a vendored file here).
+
+    The vendored workers use different filenames from the fk-aideveloper station agents
+    (`research.md` vs `fk-researcher.md`), so the fallback only genuinely covers files that exist
+    under the SAME name in both places (today: the `sme-*.md` domain agents). If NEITHER location
+    has the file, raise a clear error naming both candidates — a bare FileNotFoundError deep inside
+    `_read` (its previous failure mode: this returned `AGENTS_DIR/<name>` unconditionally when the
+    vendored file was missing, e.g. if the `workers/` dir were absent) doesn't tell the operator
+    where the resolver actually looked."""
     vendored = config.VENDORED_AGENTS_DIR / agent_md
-    return vendored if vendored.exists() else config.AGENTS_DIR / agent_md
+    if vendored.exists():
+        return vendored
+    fallback = config.AGENTS_DIR / agent_md
+    if fallback.exists():
+        return fallback
+    raise StationError(
+        "agent-resolve", agent_md,
+        f"worker prompt {agent_md!r} not found — looked in the vendored dir "
+        f"({config.VENDORED_AGENTS_DIR}) and the fk-aideveloper station dir ({config.AGENTS_DIR}). "
+        f"Check FK_AIDEVELOPER_DIR is on the branch that carries this worker (see the README's "
+        f"version-pinning note).",
+    )
 
 
 _FRONTMATTER_TOOLS_INLINE_RE = re.compile(r'^tools:\s*(\[.*\])\s*$', re.MULTILINE)

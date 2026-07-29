@@ -27,7 +27,7 @@ re-express any station logic.
 ## Graph
 
 ```
-START → researcher ─┬─(rca)────→ rca_agent → rca_review_gate ─┬─(reject)────→ stop_run → END
+START → researcher ─┬─(rca)────→ rca_agent → rca_report → rca_review_gate ─┬─(reject)────→ stop_run → END
                     │                                          ├─(no fix)────→ rca_done → END
                     │                                          └─(fix needed)──┐
                     └─(coding)─────────────────────────────────────────────────┼─→ dep_resolver → reachability_gate → coder ◄─┐
@@ -50,7 +50,8 @@ START → researcher ─┬─(rca)────→ rca_agent → rca_review_gate
 An RCA that concludes **Fix needed** joins the coding pipeline at `dep_resolver`, so the fix gets the same
 dependency resolution and reachability gating as any coding ticket.
 
-`rca_agent` posts its 5-part evidence-cited report as a Jira comment itself; **`rca_review_gate`**
+`rca_agent` produces the 5-part evidence-cited report to a file and the plain-code `rca_report` node
+posts it to Jira as a single comment (deterministic, via `jira.py` — not the worker's MCP); **`rca_review_gate`**
 (default ON) then pauses for a human to read that comment before the graph acts on the RCA's own
 conclusion — an LLM's root-cause call should not silently trigger either the terminal report or an
 autonomous coding run unread. `--resume <exe> --approve` proceeds to whichever the RCA already
@@ -343,5 +344,8 @@ slim workers (`workers/research|code|review.md`), graph-owned SME consult, deter
 git/PR code nodes, the coder's worktree threaded to the reviewer, an optional human-approval
 gate before the ready-flip, and Jira lifecycle transitions. **Telemetry is wired** to the
 aidev-db HTTP MCP server (`telemetry.py`, best-effort, no-op without `RCA_TOKEN`; transport
-validated live). Remaining: decompose Station 6 into per-step graph nodes (deferred behind the
-`learn_repo` onboarding work).
+validated live). **Station 6 is now decomposed into per-step graph nodes** (`sit_resolve →
+sit_author → qa_review_gate → sit_run ‖ sit_testrail → sit_triage`), with graph-owned repo
+onboarding (`learn_repo`). Remaining: strip the residual "Station X" phase labels still passed
+in some node prompts; a test that proves node-level retry *recovers* (not just propagates) a
+transient failure; and one archived real end-to-end run (no `--mock`/golden-run scaffold exists).

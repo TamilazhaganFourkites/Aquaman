@@ -149,9 +149,10 @@ Jira post) is **plain Python** — no agent.
 5. ✅ **DONE** — `sme_consult` graph node: research classifies `domain_bucket`; the graph picks the
    ocean SME (fk-aideveloper `sme-*.md` as referenced expert knowledge) and feeds findings to the
    coder. No-op when no bucket applies. RCA path skips it.
-6. ⏳ **PENDING** — Wire `telemetry._call_mcp` to the real aidev-db MCP tools (best-effort,
-   non-blocking). Needs the aidev-db endpoint + a Python-side MCP transport + creds — not
-   testable locally; treat as its own integration task.
+6. ✅ **DONE** — Telemetry is wired to the real aidev-db MCP tools. `telemetry.py`'s `_call_async`
+   is a live `mcp.client.streamable_http` call against the aidev-db HTTP MCP server (best-effort,
+   non-blocking; silent no-op without `RCA_TOKEN`); `execution_start/end` + `station_event` write
+   `pipeline_executions` START/END + per-station events. Transport validated live.
 
 ### Phase C — Decompose Station 6 & add the human gate 🟡
 7. ✅ **DONE** — Split `automation_testing` into `sit_resolve → sit_run → sit_triage` graph nodes
@@ -226,8 +227,9 @@ full CD is a separate future ticket.)
 `StationError: … agent run failed: Exception: Claude Code returned an error result: success`.
 No node-level retry; a benign SDK `success` envelope is surfaced as fatal. **Fixed in Phase A.3.**
 
-### 9.2 🟠 Telemetry to aidev-db is a no-op stub
-`telemetry._call_mcp` is a `TODO`. Aquaman runs don't reach the team's dashboards. **Phase B.6.**
+### 9.2 ✅ RESOLVED — Telemetry to aidev-db is wired (was a no-op stub)
+`telemetry.py` now makes a real `mcp.client.streamable_http` call (`_call_async`); Aquaman runs
+reach the team's `aidev_db` dashboards (best-effort, no-op without `RCA_TOKEN`). **Phase B.6 done.**
 
 ### 9.3 🟠 README claims a human `interrupt()` the code doesn't do
 Doc/behavior drift. **Fixed in Phase C (add the gate) + C.9 (fix the doc).**

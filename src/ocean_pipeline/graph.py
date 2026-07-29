@@ -96,6 +96,7 @@ def build_graph():
     g.add_node("researcher", nodes.researcher)
     g.add_node("sme_consult", nodes.sme_consult)
     g.add_node("rca_agent", nodes.rca_agent)
+    g.add_node("rca_report", nodes.rca_report)                    # plain-code: post the RCA report to Jira (one comment)
     g.add_node("rca_review_gate", nodes.rca_review_gate)          # human review of the posted RCA before acting on it
     g.add_node("rca_done", nodes.rca_done)
     g.add_node("unsupported_route", nodes.unsupported_route)
@@ -126,7 +127,8 @@ def build_graph():
     g.add_edge("unsupported_route", END)
     # RCA agent -> human review gate -> RCA Done (terminal) | Fix needed -> deps + reachability
     # gate -> coder. Reject at the gate -> stop, before any coding starts.
-    g.add_edge("rca_agent", "rca_review_gate")
+    g.add_edge("rca_agent", "rca_report")
+    g.add_edge("rca_report", "rca_review_gate")
     g.add_conditional_edges("rca_review_gate", after_rca_review,
                             {"reject": "stop_run", "done": "rca_done", "fix_needed": "dep_resolver"})
     g.add_edge("rca_done", END)

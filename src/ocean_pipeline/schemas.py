@@ -38,6 +38,15 @@ class ReachabilityVerdict(BaseModel):
     notes: str = ""
 
 
+class DependencyVerdict(BaseModel):
+    """Station 1 (dependency resolution) outcome. Same shape as ReachabilityVerdict but a distinct
+    type so the two stations don't share a schema — a dependency block and a reachability block are
+    semantically different verdicts and should be validated (and evolved) independently."""
+    report_path: str
+    blocking: bool = False
+    notes: str = ""
+
+
 class RcaVerdict(BaseModel):
     """ocean-rca outcome. A human reviews the posted report at rca_review_gate before the graph
     acts on it; if fix_needed (and approved), the RCA hands an implementation brief to the coder
