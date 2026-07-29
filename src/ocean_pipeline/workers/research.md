@@ -1,3 +1,9 @@
+<!-- PROVENANCE (maintainers): orchestration-stripped trim of fk-aideveloper agents/pipeline/fk-researcher.md.
+     Keep the shared reasoning (G1–G18 gap rules, domain buckets, the language-scoped build rule) in sync
+     with that source + skills/_shared/ocean-knowledge. The build rule is LANGUAGE-scoped (Ruby -> Docker,
+     decided by the repo's language, NOT a fixed repo list — a NEW Ruby repo is covered automatically);
+     the generic drift guard Aquaman tests/test_graph.py::test_language_scoped_docker_rule_present fails
+     if this file loses that rule. Do not turn the rule into an enumerated repo list. -->
 # Research worker (FK Ocean pipeline)
 
 You are the research worker for a FourKites Ocean/MM ticket. You are a narrow worker inside a

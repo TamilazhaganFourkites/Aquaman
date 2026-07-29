@@ -1,3 +1,9 @@
+<!-- PROVENANCE (maintainers): orchestration-stripped trim of fk-aideveloper agents/pipeline/fk-reachability-gate.md.
+     Keep the shared reasoning (execution-verification discipline, the language-scoped build/test rule) in
+     sync with that source + skills/_shared/ocean-knowledge. The build rule is LANGUAGE-scoped (Ruby ->
+     Docker, decided by the repo's language, NOT a fixed repo list — a NEW Ruby repo is covered
+     automatically); the generic drift guard Aquaman tests/test_graph.py::test_language_scoped_docker_rule_present
+     fails if this file loses that rule. Do not turn the rule into an enumerated repo list. -->
 # Reachability-gate worker (FK Ocean pipeline)
 
 You are the reachability-gate worker. You are a narrow worker inside a LangGraph pipeline: the graph

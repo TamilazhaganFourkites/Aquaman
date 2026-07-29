@@ -472,6 +472,26 @@ def test_run_agent_allows_write_for_a_write_less_sme_file(tmp_path, monkeypatch)
     )
 
 
+# ----------------------------------------------------------------- language-scoped Docker rule drift guard
+def test_language_scoped_docker_rule_present():
+    """Generic drift guard — NOT a hardcoded repo list. Every worker prompt that builds/tests an ocean
+    repo, plus AGENT_GUARDRAILS, must carry the LANGUAGE-scoped 'Ruby -> Docker only' rule in-context, so
+    ANY Ruby repo — including a NEW one named nowhere here — is run in Docker, never native (native fails
+    on old gems). Keyed on the rule (by language), not on which repos exist, so a new Ruby repo needs no
+    change here; the test fails loudly only if a copy silently LOSES the rule (the native-run regression).
+    The copies are kept in-context deliberately (a reference the worker might not read would reintroduce
+    the bug) — this guard is what keeps them from drifting apart."""
+    sources = {"AGENT_GUARDRAILS": agents.AGENT_GUARDRAILS}
+    for name in ("research.md", "code.md", "review.md", "reachability.md"):
+        sources[name] = (config.VENDORED_AGENTS_DIR / name).read_text()
+    for where, text in sources.items():
+        low = text.lower()
+        assert "ruby" in low and "docker" in low, (
+            f"{where} lost the language-scoped Ruby->Docker build/test rule — a Ruby repo (incl. a new "
+            f"one) could be run natively and fail on old gems. Re-add it BY LANGUAGE (Ruby -> Docker), "
+            f"never as an enumerated repo list.")
+
+
 # ----------------------------------------------------------------- G2: fail-loud worker resolution
 def test_agent_path_raises_clear_error_when_missing(tmp_path, monkeypatch):
     """G2: a worker prompt that exists in NEITHER the vendored dir nor the fk-aideveloper station

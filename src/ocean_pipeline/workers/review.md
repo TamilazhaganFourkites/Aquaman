@@ -1,3 +1,9 @@
+<!-- PROVENANCE (maintainers): orchestration-stripped trim of fk-aideveloper agents/pipeline/fk-harsh-reviewer.md.
+     Keep the shared reasoning (review severity discipline, the language-scoped build/test rule) in sync
+     with that source + skills/_shared/ocean-knowledge. The build rule is LANGUAGE-scoped (Ruby -> Docker,
+     decided by the repo's language, NOT a fixed repo list — a NEW Ruby repo is covered automatically);
+     the generic drift guard Aquaman tests/test_graph.py::test_language_scoped_docker_rule_present fails
+     if this file loses that rule. Do not turn the rule into an enumerated repo list. -->
 # Review worker (FK Ocean pipeline)
 
 You are the adversarial code-review worker for a FourKites Ocean/MM ticket. You are a narrow

@@ -45,11 +45,14 @@ class StationError(RuntimeError):
 
 # Operating guardrails handed to every worker. These are SAFETY constraints, not process
 # framing — the graph decides what runs when; the worker only obeys these while doing its one job.
-# NOTE: the language-scoped Docker rule below is a HARD COPY of the canonical rule in
+# NOTE: the build+test rule below is LANGUAGE-scoped (Ruby -> Docker, decided by the repo's language,
+# NOT an enumerated repo list) so a NEW Ruby repo is covered automatically — do not turn it back into
+# a fixed list. It is deliberately also stated in-context in the vendored worker prompts + the
+# learn_repo node prompt (nodes.py): every process that might build/test a Ruby repo must see it in
+# its OWN context, or it runs native and fails on old gems. Those in-context copies are KEPT, not
+# collapsed into a reference (that would reintroduce the native-run bug); test_language_scoped_docker
+# _rule_present keeps any copy from silently losing the rule. Canonical statement of the same rule:
 # fk-aideveloper skills/_shared/ocean-knowledge/ocean-repos.md ("Language-scoped build+test rule").
-# If that canonical rule changes (a repo's language/Docker bucket moves, or a learned repo is added),
-# keep this string, the learn_repo node prompt (nodes.py), and workers/research.md in sync — the
-# ocean-repos.md frozen-contract note spells out this coupling.
 AGENT_GUARDRAILS = """\
 Operating guardrails for ticket {ticket_id}:
 - Never fork cloudqwest repos -- push branches directly to upstream
@@ -58,10 +61,14 @@ Operating guardrails for ticket {ticket_id}:
 - Parameterized queries only -- no SQL string concatenation
 - This pipeline never auto-merges or auto-deploys; the engineer owns final merge, sign-off, deploy
 
-Ocean/MM build+test rule (LANGUAGE-SCOPED): Ruby workers (ocean-worker, multimodal-worker,
-multimodal-carrier-updates-worker, global_worker; and tracking-service) build/test in Docker ONLY.
-Java (eta-service, eta-worker) native is fine. Go (ocean-service, booking-service) native is the
-default, Docker fallback.
+Ocean/MM build+test rule (LANGUAGE-SCOPED — decided by the repo's LANGUAGE, not a fixed repo list,
+so a NEW Ruby repo is covered by the same rule automatically): ANY Ruby ocean repo builds/tests in
+Docker ONLY — the host can't resolve old native gems (e.g. nokogiri 1.6.8.1); never present a
+native-host Ruby build/test as valid (known Ruby repos today, illustrative not exhaustive:
+ocean-worker, multimodal-worker, multimodal-carrier-updates-worker, global_worker, tracking-service).
+Java repos (e.g. eta-service, eta-worker) native is fine. Go repos (e.g. ocean-service,
+booking-service) native is the default, Docker fallback. If a repo's language is unknown, resolve it
+first — then apply this rule by language.
 """
 
 VERDICT_INSTRUCTION = """\
