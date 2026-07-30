@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import re
 import shutil
 import subprocess
@@ -159,6 +160,92 @@ def _pause_message(execution_id: str, paused_on: tuple[str, ...]) -> str:
             f"resume with `ocean-pipeline --resume {execution_id}` and check nodes.py for what it expects.")
 
 
+def _run_repos(execution_id: str, final: dict) -> list[str]:
+    """Repo names this run targeted — from the final graph state, else the researcher verdict / research
+    packet on disk (present even on a crash, since research runs first). Used to know which
+    `<repo>-cached` base image to purge."""
+    repos: list[str] = []
+    def _collect(target_repos):
+        for r in (target_repos or []):
+            n = (r.get("repo") or "").split("/")[-1] if isinstance(r, dict) else ""
+            if n:
+                repos.append(n)
+    _collect(final.get("target_repos"))
+    if not repos:
+        adir = config.artifacts_dir(execution_id)
+        for f in list(adir.glob("research*packet*.json")) + list(adir.glob("researcher.verdict.json")):
+            try:
+                _collect(json.loads(f.read_text()).get("target_repos"))
+            except Exception:  # noqa: BLE001 — best-effort disk fallback
+                pass
+            if repos:
+                break
+    return list(dict.fromkeys(repos))   # dedup, preserve order
+
+
+def _cleanup_run_docker(execution_id: str, ticket_id: str, repos: list[str]) -> list[str]:
+    """Remove the Docker resources THIS run created — called from _execute's `finally`, so it fires on
+    success, failure, AND crash (unlike the graph's teardown node, which only runs on a terminal node,
+    so a crashed run — e.g. a StationError at reachability — leaked its container/image). Removes every
+    container named for this run (the orchestrator's `ocean-<repo>-<exec_id>` and the worker-recipe
+    `ocean-<repo>-<TICKET>` / `ocean-ow-<ticket>-coder`) and the run's ticket-scoped `*-mm<ticket>-*`
+    images. The SHARED lock-scoped `<repo>-cached:<hash>` base image is removed too UNLESS
+    config.KEEP_CACHED_IMAGE (default: delete — one ticket at a time leaves no residue; set the flag to
+    keep it for cross-run reuse). Best-effort: never raises — a cleanup hiccup must not mask the run's
+    outcome. Ticket is matched with a delimiter (`-mm14235-`/`-mm14235:`/ends-with) so MM-1423 never
+    nukes MM-14235's resources."""
+    if not shutil.which("docker"):
+        return []
+    exl = (execution_id or "").lower()
+    tkl = (ticket_id or "").lower()            # mm-14235
+    tkey = tkl.replace("-", "")                # mm14235
+
+    def _d(args):
+        try:
+            return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _owns(name: str) -> bool:
+        # EVERY ticket clause is guarded on a non-empty key: `"x".endswith("")` is True, so an empty
+        # ticket_id (e.g. `--resume` after a lost checkpoint, which falls back to "") would otherwise
+        # match EVERY container and `rm -f` the whole host. With ticket empty we fall back to exec-id
+        # matching only. Both dash-less (`ocean-ow-mm14235-coder`) and dashed (`ocean-…-mm-14235`)
+        # ticket forms are covered.
+        n = name.lower()
+        return bool((exl and exl in n)
+                    or (tkl and (n.endswith(tkl) or f"-{tkl}-" in n or n.endswith("-" + tkl)))
+                    or (tkey and (f"-{tkey}-" in n or n.endswith("-" + tkey))))
+
+    removed: list[str] = []
+    out = _d(["ps", "-a", "--format", "{{.Names}}"])                   # containers this run created
+    for name in (out.stdout.split() if out and out.returncode == 0 else []):
+        if _owns(name) and (_d(["rm", "-f", name]) or _Bad()).returncode == 0:
+            removed.append(f"container:{name}")
+    out = _d(["images", "--format", "{{.Repository}}:{{.Tag}}"])       # ticket-scoped images, NOT -cached
+    for img in (out.stdout.splitlines() if out and out.returncode == 0 else []):
+        il = img.lower()
+        if "-cached:" in il:
+            continue
+        if tkey and (f"-{tkey}-" in il or f"-{tkey}:" in il) and (_d(["rmi", "-f", img]) or _Bad()).returncode == 0:
+            removed.append(f"image:{img}")
+    # shared <repo>-cached base image — delete by default (single-ticket workflow), keep only if flagged.
+    # NB: this removes ALL tags of <repo>-cached, not just this run's lock-hash — so two CONCURRENT
+    # same-repo runs must set KEEP_CACHED_IMAGE=1, else the first to finish pulls the image out from the
+    # second (it just rebuilds; not destructive). The single-ticket-at-a-time default is safe.
+    if not config.KEEP_CACHED_IMAGE:
+        for repo in repos:
+            out = _d(["images", f"{repo}-cached", "--format", "{{.Repository}}:{{.Tag}}"])
+            for img in (out.stdout.splitlines() if out and out.returncode == 0 else []):
+                if img.strip() and (_d(["rmi", "-f", img.strip()]) or _Bad()).returncode == 0:
+                    removed.append(f"image:{img.strip()}")
+    return removed
+
+
+class _Bad:                       # tiny stand-in so `(_d(...) or _Bad()).returncode` is always safe
+    returncode = 1
+
+
 async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
     """Run (or resume) the graph, guaranteeing a telemetry END row + report even on failure."""
     Path(config.CHECKPOINT_DB).parent.mkdir(parents=True, exist_ok=True)
@@ -181,6 +268,7 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
         print(f"[ocean-pipeline] Langfuse tracing → {tracing.host()}"
               f"  (trace: {tkey or 'aquaman-run'}, tags: aquaman{',' + tkey if tkey else ''})")
     final: dict = {}
+    paused_on: tuple = ()   # stays () on a crash before _drive_stream returns → finally treats it as terminal
     try:
         async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
             app = compile_app(saver)
@@ -214,6 +302,17 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             path = report.finish(final, out_dir)
             if path:
                 print(f"  Full report: {path}")
+        except Exception:
+            pass
+        try:
+            # Remove THIS run's containers + ticket-scoped images on any TERMINAL exit (success / fail /
+            # crash) so a batch of tickets doesn't accumulate them; the shared <repo>-cached base image
+            # is kept. Skip on a PAUSE — the run is mid-flight and will resume + reuse the container.
+            if not paused_on:
+                cleaned = _cleanup_run_docker(execution_id, ticket_id, _run_repos(execution_id, final))
+                if cleaned:
+                    print(f"  Cleaned {len(cleaned)} run Docker resource(s): "
+                          + ", ".join(cleaned[:8]) + (" …" if len(cleaned) > 8 else ""))
         except Exception:
             pass
         if handler is not None:

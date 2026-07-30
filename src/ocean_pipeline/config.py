@@ -58,11 +58,14 @@ PARALLEL_ANALYSIS = os.environ.get("OCEAN_PIPELINE_PARALLEL_ANALYSIS", "1").lowe
 # booted container from the pre-warmed image before the coder (prep_container) and every Docker
 # station (coder, reviewer, sit_author, sit_run) reuses it (docker cp current code + docker exec) instead
 # of each doing its own `docker run` + image/env re-derivation; teardown_container removes it at the end.
-# DEFAULT OFF: this changes Docker *runtime* behavior and needs one real ocean run to validate the
-# cp/exec recipe. It is fully fallback-safe — if the container can't start (no Docker/image/checkout) or
-# a station's exec probe fails, container_ready stays False and stations use their existing self-contained
-# recipe, so the pipeline behaves exactly as today. Enable with OCEAN_PIPELINE_PERSISTENT_CONTAINER=1.
-PERSISTENT_CONTAINER = os.environ.get("OCEAN_PIPELINE_PERSISTENT_CONTAINER", "0").lower() in ("1", "true", "yes")
+# DEFAULT ON: the Docker mechanics are validated (a real run showed each station rolling its OWN
+# container — reachability `ocean-<repo>-<TICKET>` and coder `ocean-ow-<ticket>-coder` never shared one,
+# so the per-station docker-run/re-derive cost + leaked containers persisted). Enabling it makes the
+# graph own ONE shared container and tear it down. Fully fallback-safe — if the container can't start
+# (no Docker/image/checkout) or a station's exec probe fails, container_ready stays False and stations
+# use their existing self-contained recipe, so the pipeline behaves exactly as before. Disable per-run
+# with OCEAN_PIPELINE_PERSISTENT_CONTAINER=0.
+PERSISTENT_CONTAINER = os.environ.get("OCEAN_PIPELINE_PERSISTENT_CONTAINER", "1").lower() in ("1", "true", "yes")
 
 # Latency lever #6 — keep the SIT infra (localstack/es/redis/mock) warm ACROSS the code_fault /
 # environment_failure retry loop. When on, sit_run brings the infra up under a stable compose project
@@ -77,6 +80,14 @@ def sit_infra_project(execution_id: str) -> str:
     """Deterministic compose project name for a run's SIT infra, so a retry reuses the SAME stack and
     teardown_container can remove exactly it (#6)."""
     return f"ocean-sit-{execution_id}"
+
+# At run end (terminal exit — NOT a pause), also delete the SHARED `<repo>-cached:<lockhash>` base image
+# this run built/used. DEFAULT ON (delete): the common workflow is one ticket at a time, so nothing else
+# needs the image — dropping it leaves no residue. The cache still helps WITHIN the run (built once,
+# reused across coder/reviewer/SIT); only the final teardown removes it. Set OCEAN_PIPELINE_KEEP_CACHED_IMAGE=1
+# to KEEP it for reuse across runs (concurrent tickets / back-to-back same-repo runs) — then it's capped
+# by ruby_image_cache's newest-N eviction instead.
+KEEP_CACHED_IMAGE = os.environ.get("OCEAN_PIPELINE_KEEP_CACHED_IMAGE", "0").lower() in ("1", "true", "yes")
 
 # LangGraph checkpointer DB — durable resume + the AP-223 orphan fix.
 CHECKPOINT_DB = os.environ.get("OCEAN_PIPELINE_CHECKPOINT_DB", str(ARTIFACTS_ROOT / "checkpoints.sqlite"))
