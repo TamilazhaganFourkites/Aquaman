@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -250,6 +251,10 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
     """Run (or resume) the graph, guaranteeing a telemetry END row + report even on failure."""
     Path(config.CHECKPOINT_DB).parent.mkdir(parents=True, exist_ok=True)
     metrics.reset()
+    # Expose the exec-id so each worker's stream is captured to artifacts_dir/<station>.log — a stall
+    # (EXE-0417bc97's whole-disk grep) was only diagnosable by external forensics because nothing was
+    # logged; a per-station log makes the worker's last action visible in ~1s.
+    os.environ["OCEAN_PIPELINE_EXEC_ID"] = execution_id
     report.start(ticket_id, execution_id)
     out_dir = config.artifacts_dir(execution_id)
     handler = tracing.callback_handler()   # self-hosted Langfuse, or None if unconfigured

@@ -151,12 +151,22 @@ def build_graph():
     if config.PARALLEL_ANALYSIS:
         _research_dests += ["dep_resolver", "prep_image"]
     g.add_conditional_edges("researcher", route_after_research, _research_dests)
+    # With the persistent container ON, boot the shared container BEFORE reachability (not after) so
+    # reachability's Docker probes reuse it too — not just coder/review/SIT. reachability_gate already
+    # emits the reuse directive (nodes._container_directive), it just needs the container to exist by
+    # then; otherwise it boots its OWN ticket-scoped container that then leaks and doubles the boot of
+    # an infra-heavy Ruby repo (EXE-0417bc97: `ocean-mmcuw-MM-14457` ran the whole time alongside the
+    # coder's `ocean-…-EXE…`). So the fan-out / dep_resolver join at prep_container, which feeds
+    # reachability_gate; teardown_container then reaps the ONE shared container. OFF: join straight at
+    # reachability_gate (unchanged).
+    _analysis_join = "prep_container" if config.PERSISTENT_CONTAINER else "reachability_gate"
     if config.PARALLEL_ANALYSIS:
-        # Fan-out sme ∥ dep ∥ prep_image (one superstep) -> join at reachability_gate. Same-superstep
-        # fan-in is LangGraph's safe barrier: reachability runs ONCE, after all three complete.
-        g.add_edge("sme_consult", "reachability_gate")
-        g.add_edge("prep_image", "reachability_gate")
-        # dep_resolver -> reachability_gate is added once below (shared with the RCA fix path).
+        # Fan-out sme ∥ dep ∥ prep_image (one superstep) -> join at _analysis_join. Same-superstep
+        # fan-in is LangGraph's safe barrier: the join node runs ONCE, after all three complete, and
+        # reachability_gate (downstream, single edge) therefore also runs exactly once.
+        g.add_edge("sme_consult", _analysis_join)
+        g.add_edge("prep_image", _analysis_join)
+        # dep_resolver -> _analysis_join is added once below (shared with the RCA fix path).
     else:
         g.add_edge("sme_consult", "dep_resolver")   # original strictly-sequential baseline
     g.add_edge("unsupported_route", END)
@@ -168,12 +178,11 @@ def build_graph():
                             {"reject": "stop_run", "done": "rca_done", "fix_needed": "dep_resolver"})
     g.add_edge("rca_done", END)
 
-    g.add_edge("dep_resolver", "reachability_gate")
+    g.add_edge("dep_resolver", _analysis_join)
     if config.PERSISTENT_CONTAINER:
-        # #1: start the shared container after the gates (target repo known, image pre-warmed), before
-        # the first Docker station. reachability_gate -> prep_container -> coder.
-        g.add_edge("reachability_gate", "prep_container")
-        g.add_edge("prep_container", "coder")
+        # prep_container (shared boot) -> reachability_gate -> coder.
+        g.add_edge("prep_container", "reachability_gate")
+        g.add_edge("reachability_gate", "coder")
     else:
         g.add_edge("reachability_gate", "coder")
     g.add_edge("coder", "harsh_reviewer")

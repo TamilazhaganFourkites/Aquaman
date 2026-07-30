@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Type, TypeVar
 
@@ -220,8 +221,96 @@ def _deny_outside_allowlist(allowed: list[str]):
     return _hook
 
 
+# A recursive search rooted at a filesystem TOP-LEVEL is the MM-14457/EXE-0417bc97 stall: a coder
+# worker ran `grep -rln "def port_of_loading?" /` (search from `/`), which walks the whole machine
+# (/System, /Users, mounts…), never returns, and hangs the station for 30+ min with no captured log.
+# These are the roots a worker should NEVER recursively scan — it must scope to its worktree instead.
+_DANGEROUS_SEARCH_ROOTS = {
+    "/", "/System", "/Users", "/Library", "/private", "/usr", "/var", "/opt", "/etc",
+    "/Applications", "/Volumes", "/bin", "/sbin", "/cores", "/net", "/home", "~", "$HOME",
+}
+_RECURSIVE_SEARCH_TOOLS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}   # + `find` (always recursive)
+
+
+def unscoped_root_search(command: str) -> str | None:
+    """If `command` recursively searches a filesystem TOP-LEVEL root (e.g. `grep -r … /`, `find /System …`,
+    `rg pat /Users`), return the offending root path; else None. Only top-level system roots are flagged —
+    an absolute path INTO the run's worktree (`/tmp/ocean-pipeline/<EXE>/…`) is fine. Split on shell
+    separators so one bad segment in a pipeline is still caught (the real incident was the first stage of
+    a `grep … / | grep … | head` pipe)."""
+    for seg in re.split(r"\|\|?|&&?|;|\n", command):
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        if not toks:
+            continue
+        tool = os.path.basename(toks[0])
+        is_find = tool == "find"
+        if tool not in _RECURSIVE_SEARCH_TOOLS and not is_find:
+            continue
+        # grep needs an explicit -r/-R/--recursive; rg/ag/ack recurse by default; find always recurses.
+        recursive = is_find or tool in ("rg", "ag", "ack") or any(
+            t == "--recursive" or (t.startswith("-") and not t.startswith("--") and ("r" in t[1:].lower()))
+            for t in toks[1:])
+        if not recursive:
+            continue
+        for t in toks[1:]:
+            if t.startswith("-"):            # a flag, not a search path
+                continue
+            root = t if t in _DANGEROUS_SEARCH_ROOTS else (t.rstrip("/") or "/")
+            if root in _DANGEROUS_SEARCH_ROOTS:
+                return t
+    return None
+
+
+def _guard_bash():
+    """A PreToolUse hook that DENIES a Bash command recursively searching a filesystem root, so the worker
+    gets an immediate, recoverable error and re-scopes to its worktree — instead of hanging the station on
+    a whole-disk scan (the EXE-0417bc97 stall). Orchestrator-enforced: unlike a worker-prompt rule (which
+    the coder ignored), a hook runs regardless of permission_mode."""
+    async def _hook(input_data, tool_use_id, context):  # noqa: ARG001 — SDK hook signature
+        if input_data.get("tool_name") != "Bash":
+            return {}
+        cmd = str((input_data.get("tool_input") or {}).get("command", ""))
+        root = unscoped_root_search(cmd)
+        if root is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"Refusing a recursive search rooted at {root!r} — that scans the whole machine and "
+                    f"hangs the station. Scope the search to the repo worktree instead (e.g. run it from "
+                    f"the checkout with a relative path like `.` / `app/` / `lib/`, never an absolute "
+                    f"system root)."
+                ),
+            }
+        }
+    return _hook
+
+
 def _emit(label: str, line: str) -> None:
     print(f"    [{label}] {line}", flush=True)
+
+
+def _station_logfile(label: str):
+    """Open (append) a per-station stream log at artifacts_dir(<exec_id>)/<label>.log, or None if the
+    exec-id isn't set (unit tests) or the path can't be opened. Best-effort: a logging hiccup must never
+    break a run. `_execute` stamps OCEAN_PIPELINE_EXEC_ID; a station that re-runs (coder rework, env
+    retry) appends after a separator so each pass is preserved."""
+    exec_id = os.environ.get("OCEAN_PIPELINE_EXEC_ID", "")
+    if not exec_id:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", label) or "station"
+    try:
+        f = (config.artifacts_dir(exec_id) / f"{safe}.log").open("a", encoding="utf-8")
+        f.write(f"\n===== {label} @ pass start =====\n")
+        f.flush()
+        return f
+    except OSError:
+        return None
 
 
 def _classify_bash(command: str) -> str | None:
@@ -398,10 +487,13 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     # `claude` CLI it spawns) installed — the SDK is only needed at actual run time.
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
 
-    # Enforce the worker's own tools: frontmatter (if it declared one) via a PreToolUse hook —
-    # see _deny_outside_allowlist for why this has to be a hook and not can_use_tool.
-    hooks = ({"PreToolUse": [HookMatcher(hooks=[_deny_outside_allowlist(allowed_tools)])]}
-             if allowed_tools is not None else None)
+    # PreToolUse hooks (run regardless of permission_mode — see _deny_outside_allowlist). Always guard
+    # against a whole-disk recursive search (the EXE-0417bc97 hang); additionally enforce the worker's
+    # declared tool allowlist when it declared one.
+    _pre = [_guard_bash()]
+    if allowed_tools is not None:
+        _pre.append(_deny_outside_allowlist(allowed_tools))
+    hooks = {"PreToolUse": [HookMatcher(hooks=_pre)]}
 
     # Signal to worker skills that they're running UNDER the control plane (inherited by the
     # spawned CLI subprocess). The ocean-qa-agent's learn-a-repo gate keys off this: under the
@@ -416,6 +508,15 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     os.environ.setdefault("SQS_ENDPOINT_URL", config.SQS_ENDPOINT_URL)
     os.environ.setdefault("SQS_LOCAL_ACCOUNT", config.SQS_LOCAL_ACCOUNT)
 
+    # Bound the worker's Bash tool (inherited by the spawned claude CLI). WHY: an SDK-spawned worker's
+    # Bash has NO effective timeout, so a runaway command (EXE-0417bc97's whole-disk `grep /`) hung the
+    # coder 30+ min. /fk-execute never hit this — it runs under the standard interactive Bash tool, which
+    # already enforces a timeout. These env vars give the same ceiling: a command without an explicit
+    # timeout is capped at DEFAULT; the model may request up to MAX for a known-slow step. Generous
+    # enough for ocean long-poles (Rails-boot rspec ~73s, full suite) but far below a 30-min runaway.
+    os.environ.setdefault("BASH_DEFAULT_TIMEOUT_MS", config.BASH_DEFAULT_TIMEOUT_MS)
+    os.environ.setdefault("BASH_MAX_TIMEOUT_MS", config.BASH_MAX_TIMEOUT_MS)
+
     options = ClaudeAgentOptions(
         model=config.STATION_MODEL,
         system_prompt=system_prompt,
@@ -426,18 +527,29 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     ui.station_start(label)   # "▶ <station>" header; milestones stream underneath
     tools = 0
     in_tok = out_tok = 0
-    async for message in query(prompt=prompt, options=options):
-        # Default: curated, readable milestones (the significant actions).
-        for m in _milestones(message):
-            ui.milestone(m)
-        tools += _count_tools(message)
-        i, o = _usage(message)
-        in_tok += i
-        out_tok += o
-        # developer level: also dump the raw per-message activity for debugging.
-        if config.LOG_LEVEL == "developer":
-            for line in _format_message(message):
-                _emit(label, line)
+    logf = _station_logfile(label)   # per-station stream capture (EXE-0417bc97 stall was invisible w/o this)
+    try:
+        async for message in query(prompt=prompt, options=options):
+            # Default: curated, readable milestones (the significant actions).
+            for m in _milestones(message):
+                ui.milestone(m)
+            tools += _count_tools(message)
+            i, o = _usage(message)
+            in_tok += i
+            out_tok += o
+            # ALWAYS capture the raw per-message activity to the station log (so a hang/stall is
+            # diagnosable in ~1s); ALSO echo it to the console only at developer LOG_LEVEL.
+            lines = _format_message(message)
+            if logf is not None:
+                for line in lines:
+                    logf.write(line + "\n")
+                logf.flush()
+            if config.LOG_LEVEL == "developer":
+                for line in lines:
+                    _emit(label, line)
+    finally:
+        if logf is not None:
+            logf.close()
     spend = metrics.fmt(in_tok, out_tok, tools)
     if spend:
         ui.milestone(f"done — {spend}")

@@ -184,6 +184,15 @@ SQS_LOCAL_ACCOUNT = os.environ.get("OCEAN_PIPELINE_SQS_LOCAL_ACCOUNT", "72300819
 MIN_DOCKER_MEMORY_GB = float(os.environ.get("OCEAN_PIPELINE_MIN_DOCKER_MEMORY_GB", "4"))
 MIN_DOCKER_CPUS = int(os.environ.get("OCEAN_PIPELINE_MIN_DOCKER_CPUS", "2"))
 
+# Bash-tool timeout ceiling for the SDK-spawned worker (agents.py sets these in the worker env; the
+# spawned claude CLI honors them). An SDK worker's Bash otherwise has NO effective timeout, so a runaway
+# command hangs the station indefinitely (EXE-0417bc97: a whole-disk `grep /` ran 30+ min). /fk-execute
+# never hit this — it runs under the standard interactive Bash tool, which already enforces a timeout.
+# DEFAULT = ceiling for a command that doesn't set its own; MAX = the most the model may request for a
+# known-slow step (cold docker build, full suite). Generous vs the ocean long-poles, far below a runaway.
+BASH_DEFAULT_TIMEOUT_MS = os.environ.get("OCEAN_PIPELINE_BASH_DEFAULT_TIMEOUT_MS", "600000")    # 10 min
+BASH_MAX_TIMEOUT_MS = os.environ.get("OCEAN_PIPELINE_BASH_MAX_TIMEOUT_MS", "1200000")            # 20 min
+
 # MM-14628: the node-level preflight scales its budget to the CHANGED/target-repo set (1..N repos all
 # run real) instead of the fixed MIN_DOCKER_* floor. This MIRRORS the skill's
 # fk-aideveloper/skills/ocean-qa-agent/tools/docker_preflight.py (REPO_FOOTPRINT_GB + budget_for_repos)

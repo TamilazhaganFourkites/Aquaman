@@ -256,11 +256,18 @@ def test_teardown_container_is_safe_noop(monkeypatch):
 
 
 def test_graph_persistent_container_wiring(monkeypatch):
-    # On: reachability -> prep_container -> coder, and both terminals -> teardown_container -> END.
+    # On: the shared container boots BEFORE reachability so reachability reuses it too — the fan-out
+    # joins at prep_container -> reachability_gate -> coder; both terminals -> teardown_container -> END.
     monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    monkeypatch.setattr(config, "PARALLEL_ANALYSIS", True)
     edges = {(e.source, e.target) for e in graph.build_graph().compile().get_graph().edges}
-    assert ("reachability_gate", "prep_container") in edges
-    assert ("prep_container", "coder") in edges
+    assert ("prep_container", "reachability_gate") in edges
+    assert ("reachability_gate", "coder") in edges
+    assert ("reachability_gate", "prep_container") not in edges     # old order must be gone
+    # fan-out / dep_resolver now join at prep_container (the barrier)
+    assert ("dep_resolver", "prep_container") in edges
+    assert ("sme_consult", "prep_container") in edges
+    assert ("prep_image", "prep_container") in edges
     assert ("flip_ready", "teardown_container") in edges
     assert ("stop_run", "teardown_container") in edges
     # Off: coder is fed directly, no container nodes.
