@@ -1,0 +1,25 @@
+name: Claude On-Demand Review
+
+# Security Note: Permissions are managed by the reusable workflow, which follows
+# security best practices with explicit deny-all at root (permissions: {}) and
+# minimal grants at job level. Setting permissions here would restrict what the
+# reusable workflow can request, causing workflow failures.
+# See: https://github.com/cloudqwest/isbu-gh-actions/blob/main/.github/workflows/claude-on-demand.yml#L53-L97
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+
+jobs:
+  claude:
+    uses: cloudqwest/isbu-gh-actions/.github/workflows/claude-on-demand.yml@v1
+    with:
+      timeout_minutes: 30
+      max_turns: 15
+    secrets:
+      anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+      gh_token: ${{ secrets.CI_GITHUB_TOKEN }}
