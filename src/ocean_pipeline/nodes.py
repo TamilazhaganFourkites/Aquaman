@@ -43,22 +43,27 @@ def _docker_resources() -> tuple[float, int] | None:
         return None
 
 
-def _docker_preflight_reason() -> str:
-    """Empty string if Docker has enough resources per config.MIN_DOCKER_MEMORY_GB/CPUS; otherwise
-    a ready-to-use environment_failure reason string. This is the deterministic resource-insufficient
-    case specifically -- NEVER auto-retried (see graph.py::after_sit_triage's preflight_failed check),
-    because more Docker memory doesn't appear between attempts. Still classified as environment_failure
-    (not could_not_verify) because it IS a harness/infra limit, not a structural test limitation --
-    it's just a non-retriable one."""
+def _docker_preflight_reason(target_repos=None) -> str:
+    """Empty string if Docker has enough resources for THIS ticket's changed/target-repo set; otherwise
+    a ready-to-use environment_failure reason string. MM-14628: the budget scales to the repo set (1..N
+    changed repos all run real) via config.docker_budget_for_repos — mirroring the skill's
+    docker_preflight.py --repos — instead of a fixed floor, so an under-provisioned MULTI-repo chain
+    (e.g. 3 Ruby repos needing ~10 GB) fails fast here at the node too, not only deeper in the skill.
+    Native Go/Java repos add 0 (they run off the Docker VM). This is the deterministic
+    resource-insufficient case specifically -- NEVER auto-retried (see graph.py::after_sit_triage's
+    preflight_failed check), because more Docker memory doesn't appear between attempts. Still classified
+    as environment_failure (not could_not_verify) because it IS a harness/infra limit, not a structural
+    test limitation -- it's just a non-retriable one."""
     resources = _docker_resources()
     if resources is None:
         return ("environment_failure: Docker is not running, not reachable, or `docker info` didn't "
                  "expose memory/CPU (an alternate backend like colima/Podman may need a different "
                  "check) — could not determine available resources.")
     mem_gb, cpus = resources
-    if mem_gb < config.MIN_DOCKER_MEMORY_GB or cpus < config.MIN_DOCKER_CPUS:
+    min_gb, min_cpus = config.docker_budget_for_repos(target_repos)
+    if mem_gb < min_gb or cpus < min_cpus:
         return (f"environment_failure: insufficient_docker_resources — have {mem_gb:.1f} GB / {cpus} CPU, "
-                f"need >= {config.MIN_DOCKER_MEMORY_GB} GB / {config.MIN_DOCKER_CPUS} CPU (see "
+                f"need >= {min_gb} GB / {min_cpus} CPU for this repo set (see "
                 f"local_service_execution.md 'Docker memory ceiling'). Raise Docker Desktop/Rancher "
                 f"Desktop memory+CPU allocation before retrying.")
     return ""
@@ -237,6 +242,8 @@ _SME_BY_BUCKET = {
     "load_creation": "sme-load-creation.md",
     "ocean_tracking_milestones": "sme-ocean-milestones.md",
     "ocean_data_quality": "sme-ocean-data-quality.md",
+    "jt_data_quality": "sme-jt-data-quality.md",
+    "event_processing_failure": "sme-event-processing-failure.md",
 }
 
 
@@ -640,7 +647,7 @@ async def sit_run(state: OceanState) -> dict:
     # Resource pre-flight (ocean-qa-agent-ac-driven-plan.md Workstream 3.4): fail fast, deterministically,
     # BEFORE spending an entire agent invocation on a Docker bring-up that's going to OOM (MM-13437's
     # full-chain attempt ground for ~40 min before hitting this exact documented ceiling).
-    reason = _docker_preflight_reason()
+    reason = _docker_preflight_reason(state.get("target_repos"))
     if reason:
         # Fail fast via TYPED STATE — do NOT hand-write a marker into the skill's own verdict file.
         # (That Python-into-skill-file mutation was the multi-writer fragility G3 removes: sit_triage
@@ -749,7 +756,7 @@ async def sit_triage(state: OceanState) -> dict:
                 "execution_mode": "local-mock-first",
                 "test_automation_pr_url": "", "sit_findings": [],
                 "needs_onboarding": False, "onboard_repo": "",
-                "sit_report": {"tests": [], "changed_repo": None, "dependencies": [],
+                "sit_report": {"tests": [], "changed_repos": [], "dependencies": [],
                                "evidence": state.get("preflight_reason", ""), "testrail_run_id": 0,
                                "ac_coverage": []}}
     await agents.run_skill(
@@ -787,7 +794,7 @@ async def sit_triage(state: OceanState) -> dict:
         "onboard_repo": v.onboard_repo,
         "sit_report": {
             "tests": [t.model_dump() for t in v.tests],
-            "changed_repo": v.changed_repo.model_dump() if v.changed_repo else None,
+            "changed_repos": [c.model_dump() for c in v.changed_repos],
             "dependencies": [d.model_dump() for d in v.dependencies],
             "evidence": v.evidence,
             # prefer the id from the parallel sit_testrail branch (via state) over the skill's verdict

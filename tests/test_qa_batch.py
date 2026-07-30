@@ -58,7 +58,7 @@ def test_batch_is_sequential_and_never_flips_a_pr(tmp_path, monkeypatch):
     # This test doesn't go through test_graph.py's _install, so it needs its own Docker stub —
     # see _install's comment: without it, sit_run's real `docker info` call depends on Docker
     # Desktop actually being up on whatever machine runs the suite.
-    monkeypatch.setattr(nodes, "_docker_preflight_reason", lambda: "")
+    monkeypatch.setattr(nodes, "_docker_preflight_reason", lambda *a, **kw: "")
     vdir = tmp_path / "verdicts"
     vdir.mkdir()
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")

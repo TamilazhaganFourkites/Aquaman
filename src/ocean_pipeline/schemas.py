@@ -19,7 +19,7 @@ class ResearchVerdict(BaseModel):
     packet_path: str
     target_repos: list[dict]              # [{repo, language, build_env, branch}]
     # Ocean domain the ticket touches, so the graph can consult the right SME node.
-    domain_bucket: str = ""               # callback_notification | load_creation | ocean_tracking_milestones | ocean_data_quality | ""
+    domain_bucket: str = ""               # callback_notification | load_creation | ocean_tracking_milestones | ocean_data_quality | jt_data_quality | event_processing_failure | ""
 
 
 class SmeVerdict(BaseModel):
@@ -109,7 +109,9 @@ class AutomationTest(BaseModel):
 
 class ChangedRepo(BaseModel):
     repo: str = ""
-    ran_on: str = ""          # local | real-local | mocked
+    ran_on: str = ""          # local | real-local — a CHANGED repo is always run real (never mocked; a
+                              # mocked repo belongs in dependencies[]). Kept a free str (not a Literal) so
+                              # one unexpected value can't fail-parse the whole verdict.
     port: int | None = None
 
 
@@ -133,7 +135,9 @@ class AutomationVerdict(BaseModel):
     failure_class: Literal["", "code_fault", "could_not_verify", "environment_failure"] = ""
     execution_mode: str = "local-mock-first"
     tests: list[AutomationTest] = Field(default_factory=list)
-    changed_repo: ChangedRepo | None = None
+    # MM-14628: a ticket's PR can change 1..N ocean repos and the SIT runs EVERY changed repo real
+    # (see ocean-automation-testing SKILL.md §2 + Station 3 verdict `changed_repos[]`).
+    changed_repos: list[ChangedRepo] = Field(default_factory=list)
     dependencies: list[DependencyRun] = Field(default_factory=list)
     testrail_run_id: int = 0
     evidence: str = ""

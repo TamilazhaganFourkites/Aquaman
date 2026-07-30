@@ -153,7 +153,7 @@ def _install(script: Script, tmp_path, monkeypatch):
     # silently depends on Docker Desktop actually being up on whatever machine runs the suite,
     # rather than the mocked control-flow this file's whole docstring promises ("no real work").
     # Docker-specific tests override this back (test_sit_run_preflight_short_circuit_*).
-    monkeypatch.setattr(nodes, "_docker_preflight_reason", lambda: "")
+    monkeypatch.setattr(nodes, "_docker_preflight_reason", lambda *a, **kw: "")
 
     monkeypatch.setattr(agents, "run_agent", fake_run_agent)
     monkeypatch.setattr(agents, "run_skill", fake_run_skill)
@@ -913,7 +913,7 @@ def test_sit_run_preflight_short_circuit_skips_agent_calls(tmp_path, monkeypatch
     s = Script(review_seq=["APPROVE"], sit_seq=["passed"])   # would pass if it ever ran
     _install(s, tmp_path, monkeypatch)
     monkeypatch.setattr(nodes, "_docker_preflight_reason",
-                        lambda: "environment_failure: insufficient_docker_resources — have 2.0 GB / 2 CPU")
+                        lambda *a, **kw: "environment_failure: insufficient_docker_resources — have 2.0 GB / 2 CPU")
     final = _run()
     assert final["final_status"] == "failed"
     # environment_failure (not could_not_verify) -- this IS a harness/infra limit, but the

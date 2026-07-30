@@ -138,9 +138,11 @@ def _details(node: str, upd: dict) -> list[str]:
         if tests:
             passed = sum(1 for t in tests if isinstance(t, dict) and t.get("result") == "passed")
             d.append(f"{passed}/{len(tests)} tests passed")
-        cr = rep.get("changed_repo") or {}
-        if isinstance(cr, dict) and cr.get("repo"):
-            d.append(f"ran {cr['repo']} {cr.get('ran_on', '')}".strip())
+        crs = rep.get("changed_repos") or []
+        ran = [f"{c['repo']} {c.get('ran_on', '')}".strip()
+               for c in crs if isinstance(c, dict) and c.get("repo")]
+        if ran:
+            d.append("ran " + ", ".join(ran))
         for t in tests[:5]:
             if isinstance(t, dict) and t.get("name"):
                 d.append(f"  {t.get('result', '?')}: {t['name']}")

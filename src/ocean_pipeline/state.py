@@ -72,7 +72,7 @@ class OceanState(TypedDict, total=False):
     automation_result: AutomationResult
     failure_class: FailureClass
     execution_mode: str              # local-mock-first | qat-fallback
-    sit_report: dict                 # tests[] / changed_repo / dependencies / evidence
+    sit_report: dict                 # tests[] / changed_repos[] / dependencies / evidence
     test_automation_pr_url: str      # opened by the skill on pass
     sit_findings: list               # findings_for_coder (code_fault -> fk-coder)
     # sit_run Docker-resource preflight short-circuit — carried as TYPED STATE, not a marker Python

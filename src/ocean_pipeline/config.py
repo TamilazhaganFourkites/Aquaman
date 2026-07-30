@@ -184,6 +184,38 @@ SQS_LOCAL_ACCOUNT = os.environ.get("OCEAN_PIPELINE_SQS_LOCAL_ACCOUNT", "72300819
 MIN_DOCKER_MEMORY_GB = float(os.environ.get("OCEAN_PIPELINE_MIN_DOCKER_MEMORY_GB", "4"))
 MIN_DOCKER_CPUS = int(os.environ.get("OCEAN_PIPELINE_MIN_DOCKER_CPUS", "2"))
 
+# MM-14628: the node-level preflight scales its budget to the CHANGED/target-repo set (1..N repos all
+# run real) instead of the fixed MIN_DOCKER_* floor. This MIRRORS the skill's
+# fk-aideveloper/skills/ocean-qa-agent/tools/docker_preflight.py (REPO_FOOTPRINT_GB + budget_for_repos)
+# so the deterministic node gate and the skill's Station-2 `--repos` gate agree. Ruby repos run in Docker
+# and dominate; Go/Java run native (0 Docker-VM footprint). Keep in sync with docker_preflight.py /
+# ocean-repos.md when a repo is onboarded.
+_REPO_FOOTPRINT_GB = {
+    # Ruby (Docker-only, heavy) — the only repos that consume Docker VM memory
+    "ocean-worker": 2.5, "multimodal-worker": 2.5, "multimodal-carrier-updates-worker": 3.0,
+    "tracking-service": 2.5, "global_worker": 2.5,
+    # Go / Java (native — 0 Docker VM memory; host RAM is not what the gate measures)
+    "ocean-service": 0.0, "booking-service": 0.0, "notification-worker": 0.0,
+    "eta-service": 0.0, "eta-worker": 0.0,
+}
+_DEFAULT_REPO_GB = 2.5     # unknown/just-onboarded repo -> assume a heavy Docker-Ruby footprint (safe over-estimate)
+_BASE_INFRA_GB = 3.0       # shared kafka/postgres/redis/es/localstack/mock floor present in any Docker chain
+
+
+def docker_budget_for_repos(target_repos) -> tuple[float, int]:
+    """(min_gb, min_cpus) to run every repo in `target_repos` real on one shared Docker infra stack:
+    the infra floor plus each DOCKER-run repo's footprint (native Go/Java add 0), one CPU per Docker repo
+    beyond the first — never below the MIN_DOCKER_* floor. `target_repos` is the state list of
+    {repo, language, build_env} dicts. Mirrors docker_preflight.py::budget_for_repos so the node preflight
+    and the skill preflight agree. Empty/None -> the plain MIN_DOCKER_* floor (backward-compatible)."""
+    names = [(r.get("repo") or "").split("/")[-1] for r in (target_repos or [])
+             if isinstance(r, dict) and r.get("repo")]
+    footprints = [_REPO_FOOTPRINT_GB.get(n, _DEFAULT_REPO_GB) for n in names]
+    docker_count = sum(1 for f in footprints if f > 0)
+    gb = _BASE_INFRA_GB + sum(footprints) if names else MIN_DOCKER_MEMORY_GB
+    cpus = 2 + max(0, docker_count - 1)
+    return round(max(gb, MIN_DOCKER_MEMORY_GB), 1), max(cpus, MIN_DOCKER_CPUS)
+
 # Claude Agent SDK permission mode. This pipeline runs fully headless — every
 # station shells out (git push, gh pr create/ready, docker, pytest), and "acceptEdits"
 # only auto-approves Edit/Write, NOT Bash, so a non-bypass mode would stall with no
