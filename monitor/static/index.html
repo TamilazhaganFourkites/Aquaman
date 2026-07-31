@@ -6,119 +6,296 @@
 <title>Aquaman Batch Monitor</title>
 <style>
   :root {
-    --paper:#eef1ec; --panel:#fbfaf5; --panel-2:#f2f1e9; --ink:#12222f; --muted:#5b6f78;
-    --line:#d7ddd0; --line-2:#c7cfc0;
-    --accent:#2a4d8f; --ok:#1f7a5c; --ok-bg:#e3efe8; --warn:#b8842c; --warn-bg:#f5ecd9;
-    --crit:#b23b2e; --crit-bg:#f6e3e0; --pending:#8a9298;
+    /* Aquaman — bioluminescent deep-sea identity, dark-native with a proper light mode */
+    --abyss:#050e16; --abyss-2:#081827; --panel:#0d2233; --panel-2:#0a1a28;
+    --ink:#dff4f7; --muted:#7fa8b3;
+    --line:#153148; --line-2:#1e415a;
+    --glow:#2de3d1; --glow-ink:#052420;      /* bioluminescent teal — the signature accent */
+    --gold:#e0a94f; --gold-ink:#2a1a03;      /* Atlantean trident/armor accent — CTA only */
+    --ok:#35c98a; --ok-bg:rgba(53,201,138,.14);
+    --warn:#f0b35c; --warn-bg:rgba(240,179,92,.14);
+    --crit:#ff6f61; --crit-bg:rgba(255,111,97,.14);
+    --pending:#4c6b78;
+    --shadow:0 1px 2px rgba(0,0,0,.35), 0 16px 40px -18px rgba(0,0,0,.65);
+    --wash-a:color-mix(in srgb, var(--glow) 10%, transparent);
+    --wash-b:color-mix(in srgb, var(--glow) 16%, transparent);
+    --wash-c:color-mix(in srgb, var(--gold) 10%, transparent);
     --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;
   }
-  @media (prefers-color-scheme: dark) {
+  @media (prefers-color-scheme: light) {
     :root {
-      --paper:#0a1620; --panel:#0f2130; --panel-2:#0c1b28; --ink:#dfe9ec; --muted:#82a0ab;
-      --line:#1c3444; --line-2:#264257; --accent:#6f9adf; --ok:#34c295; --ok-bg:#0f2b23;
-      --warn:#d9a24c; --warn-bg:#2c2210; --crit:#e2665a; --crit-bg:#301715; --pending:#5d7481;
+      --abyss:#eaf5f6; --abyss-2:#dcedef; --panel:#f8fdfd; --panel-2:#eef8f8;
+      --ink:#082430; --muted:#4d6d78;
+      --line:#cfe4e6; --line-2:#b9d6d9;
+      --glow:#00a99a; --glow-ink:#eafffb;      /* richer, more saturated turquoise than a muted teal */
+      --gold:#b8791f; --gold-ink:#fff7ea;
+      --ok:#12805a; --ok-bg:#e1f3ea;
+      --warn:#a8681b; --warn-bg:#fbeedc;
+      --crit:#c23c2f; --crit-bg:#fbe6e3;
+      --pending:#7c9499;
+      --shadow:0 1px 2px rgba(8,60,66,.08), 0 12px 30px -16px rgba(8,60,66,.22);
+      --wash-a:color-mix(in srgb, var(--glow) 26%, transparent);
+      --wash-b:color-mix(in srgb, var(--glow) 34%, transparent);
+      --wash-c:color-mix(in srgb, var(--gold) 20%, transparent);
     }
   }
-  :root[data-theme="dark"] {
-    --paper:#0a1620; --panel:#0f2130; --panel-2:#0c1b28; --ink:#dfe9ec; --muted:#82a0ab;
-    --line:#1c3444; --line-2:#264257; --accent:#6f9adf; --ok:#34c295; --ok-bg:#0f2b23;
-    --warn:#d9a24c; --warn-bg:#2c2210; --crit:#e2665a; --crit-bg:#301715; --pending:#5d7481;
-  }
   :root[data-theme="light"] {
-    --paper:#eef1ec; --panel:#fbfaf5; --panel-2:#f2f1e9; --ink:#12222f; --muted:#5b6f78;
-    --line:#d7ddd0; --line-2:#c7cfc0; --accent:#2a4d8f; --ok:#1f7a5c; --ok-bg:#e3efe8;
-    --warn:#b8842c; --warn-bg:#f5ecd9; --crit:#b23b2e; --crit-bg:#f6e3e0; --pending:#8a9298;
+    --abyss:#eaf5f6; --abyss-2:#dcedef; --panel:#f8fdfd; --panel-2:#eef8f8;
+    --ink:#082430; --muted:#4d6d78;
+    --line:#cfe4e6; --line-2:#b9d6d9;
+    --glow:#00a99a; --glow-ink:#eafffb;
+    --gold:#b8791f; --gold-ink:#fff7ea;
+    --ok:#12805a; --ok-bg:#e1f3ea;
+    --warn:#a8681b; --warn-bg:#fbeedc;
+    --crit:#c23c2f; --crit-bg:#fbe6e3;
+    --pending:#7c9499;
+    --shadow:0 1px 2px rgba(8,60,66,.08), 0 12px 30px -16px rgba(8,60,66,.22);
+    --wash-a:color-mix(in srgb, var(--glow) 26%, transparent);
+    --wash-b:color-mix(in srgb, var(--glow) 34%, transparent);
+    --wash-c:color-mix(in srgb, var(--gold) 20%, transparent);
   }
+  :root[data-theme="dark"] {
+    --abyss:#050e16; --abyss-2:#081827; --panel:#0d2233; --panel-2:#0a1a28;
+    --ink:#dff4f7; --muted:#7fa8b3;
+    --line:#153148; --line-2:#1e415a;
+    --glow:#2de3d1; --glow-ink:#052420;
+    --gold:#e0a94f; --gold-ink:#2a1a03;
+    --ok:#35c98a; --ok-bg:rgba(53,201,138,.14);
+    --warn:#f0b35c; --warn-bg:rgba(240,179,92,.14);
+    --crit:#ff6f61; --crit-bg:rgba(255,111,97,.14);
+    --pending:#4c6b78;
+    --shadow:0 1px 2px rgba(0,0,0,.35), 0 16px 40px -18px rgba(0,0,0,.65);
+    --wash-a:color-mix(in srgb, var(--glow) 10%, transparent);
+    --wash-b:color-mix(in srgb, var(--glow) 16%, transparent);
+    --wash-c:color-mix(in srgb, var(--gold) 10%, transparent);
+  }
+
   * { box-sizing:border-box; }
   body {
-    margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans);
-    font-size:14px; line-height:1.5; min-height:100vh;
+    margin:0; color:var(--ink); font-family:var(--sans);
+    font-size:15px; line-height:1.5; min-height:100vh;
+    background:
+      radial-gradient(1200px 500px at 15% -10%, var(--wash-a), transparent 60%),
+      linear-gradient(180deg, var(--abyss) 0%, var(--abyss-2) 100%);
+    background-attachment:fixed;
   }
+
+  /* ── header: conning-tower brand bar ─────────────────────────────── */
   header {
-    padding:20px 26px; border-bottom:1px solid var(--line); background:var(--panel);
+    position:relative; overflow:hidden; padding:22px 26px;
+    border-bottom:1px solid var(--line);
+    background:linear-gradient(120deg, var(--panel-2) 0%, var(--panel) 60%, var(--panel-2) 100%);
     display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;
   }
-  header h1 { margin:0; font-family:var(--mono); font-size:18px; font-weight:700; }
-  header .sub { font-size:12px; color:var(--muted); margin-top:3px; }
+  header::before {
+    content:""; position:absolute; inset:0; pointer-events:none; opacity:.6;
+    background:
+      radial-gradient(420px 160px at 8% 130%, var(--wash-b), transparent 70%),
+      radial-gradient(320px 140px at 70% -60%, var(--wash-c), transparent 70%);
+  }
+  .brand { position:relative; z-index:1; display:flex; align-items:center; gap:12px; }
+  .trident { flex:none; filter:drop-shadow(0 0 6px color-mix(in srgb, var(--glow) 65%, transparent)); }
+  .trident path, .trident line { stroke:var(--glow); }
+  header h1 {
+    margin:0; font-family:var(--mono); font-size:20px; font-weight:700; letter-spacing:.02em;
+  }
+  header .sub { position:relative; z-index:1; font-size:13px; color:var(--muted); margin-top:3px; letter-spacing:.01em; }
 
-  .setup { max-width:640px; margin:40px auto; padding:0 20px; }
-  .setup label { font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+  /* ── setup form ──────────────────────────────────────────────────── */
+  .setup { max-width:640px; margin:44px auto; padding:0 20px; }
+  .setup label { font-family:var(--mono); font-size:12px; text-transform:uppercase; letter-spacing:.1em; color:var(--muted); }
   .setup textarea {
-    width:100%; margin-top:8px; padding:12px; border-radius:10px; border:1px solid var(--line);
-    background:var(--panel); color:var(--ink); font-family:var(--mono); font-size:13px; resize:vertical;
-    min-height:90px;
+    width:100%; margin-top:8px; padding:13px; border-radius:12px; border:1px solid var(--line);
+    background:var(--panel); color:var(--ink); font-family:var(--mono); font-size:14px; resize:vertical;
+    min-height:90px; box-shadow:var(--shadow);
   }
-  .setup .hint { font-size:11.5px; color:var(--muted); margin-top:6px; }
+  .setup textarea:focus, button:focus-visible, input[type="checkbox"]:focus-visible {
+    outline:2px solid var(--glow); outline-offset:2px;
+  }
+  .setup .hint { font-size:12.5px; color:var(--muted); margin-top:8px; line-height:1.55; }
+
+  .loglevel-row { display:flex; align-items:center; gap:10px; margin-top:14px; }
+  .loglevel-row label { text-transform:none; letter-spacing:0; font-size:13.5px; }
+  select.loglevel {
+    font-family:var(--sans); font-size:14px; padding:8px 10px; border-radius:8px;
+    border:1px solid var(--line); background:var(--panel); color:var(--ink); cursor:pointer;
+  }
+
+  .gates {
+    margin-top:18px; padding:14px 16px; border:1px solid var(--line); border-radius:12px;
+    background:var(--panel-2); display:flex; flex-direction:column; gap:11px; box-shadow:var(--shadow);
+  }
+  .gates .row { display:flex; align-items:flex-start; gap:10px; }
+  .gates input[type="checkbox"] { margin-top:2px; accent-color:var(--glow); width:15px; height:15px; }
+  .gates .row div { font-size:13.5px; }
+  .gates .row .sub { font-size:12px; color:var(--muted); margin-top:2px; text-transform:none; letter-spacing:0; line-height:1.5; }
+  .gates .warn-note { font-size:12px; color:var(--warn); border-top:1px solid var(--line); padding-top:10px; }
+
   button {
-    font-family:var(--sans); font-size:13px; font-weight:600; border-radius:8px; border:1px solid transparent;
-    padding:9px 16px; cursor:pointer;
+    font-family:var(--sans); font-size:14px; font-weight:650; border-radius:9px; border:1px solid var(--line);
+    padding:9px 16px; cursor:pointer; background:var(--panel); color:var(--ink);
+    transition:transform .08s ease, box-shadow .15s ease, border-color .15s ease;
   }
-  button.primary { background:var(--accent); color:#fff; margin-top:14px; }
-  button.primary:disabled { opacity:.5; cursor:default; }
+  button:hover { border-color:var(--line-2); }
+  button:active { transform:translateY(1px); }
+  button.primary {
+    background:linear-gradient(135deg, var(--gold), color-mix(in srgb, var(--gold) 70%, var(--glow)));
+    color:var(--gold-ink); border-color:transparent; margin-top:16px;
+    box-shadow:0 8px 22px -10px color-mix(in srgb, var(--gold) 60%, transparent);
+  }
+  button.primary:disabled { opacity:.5; cursor:default; box-shadow:none; }
   button.ghost { background:transparent; border-color:var(--line); color:var(--ink); }
 
-  .cards { padding:22px 24px 40px; display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
-  .card-head { padding:14px 16px 12px; border-bottom:1px solid var(--line); }
-  .card-head .ticket { font-family:var(--mono); font-size:15px; font-weight:700; }
+  /* ── card grid ───────────────────────────────────────────────────── */
+  .cards { padding:24px 24px 44px; display:grid; grid-template-columns:repeat(auto-fit,minmax(310px,1fr)); gap:20px; }
+  .card {
+    position:relative; background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    overflow:hidden; box-shadow:var(--shadow); backdrop-filter:blur(6px);
+  }
+  .card::before {
+    content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--pending);
+  }
+  .card:has(.pill.done)::before { background:var(--ok); }
+  .card:has(.pill.failed)::before { background:var(--crit); }
+  .card:has(.pill.running)::before,
+  .card:has(.pill.paused)::before { background:var(--glow); box-shadow:0 0 12px 1px color-mix(in srgb, var(--glow) 70%, transparent); }
+
+  .card-head { padding:15px 17px 13px; border-bottom:1px solid var(--line); }
+  .card-head .ticket { font-family:var(--mono); font-size:16px; font-weight:700; letter-spacing:.01em; }
   .pill {
-    display:inline-flex; align-items:center; gap:6px; margin-top:8px; padding:3px 9px; border-radius:100px;
-    font-family:var(--mono); font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+    display:inline-flex; align-items:center; gap:6px; margin-top:9px; padding:4px 10px; border-radius:100px;
+    font-family:var(--mono); font-size:11px; font-weight:700; letter-spacing:.05em; text-transform:uppercase;
   }
   .pill .d { width:6px; height:6px; border-radius:50%; background:currentColor; }
   .pill.queued { background:var(--panel-2); color:var(--pending); }
-  .pill.running { background:var(--warn-bg); color:var(--warn); }
+  .pill.running { background:color-mix(in srgb, var(--glow) 16%, var(--panel-2)); color:var(--glow); }
   .pill.paused { background:var(--warn-bg); color:var(--warn); }
   .pill.done { background:var(--ok-bg); color:var(--ok); }
   .pill.failed { background:var(--crit-bg); color:var(--crit); }
 
-  .stepper { padding:12px 16px 6px; }
-  .step { display:grid; grid-template-columns:18px 1fr; column-gap:10px; padding-bottom:10px; }
-  .marker { width:17px; height:17px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:800; }
+  .stepper { padding:13px 17px 7px; }
+  .step { display:grid; grid-template-columns:19px 1fr; column-gap:11px; padding-bottom:11px; }
+  .marker {
+    position:relative; width:18px; height:18px; border-radius:50%; display:flex; align-items:center;
+    justify-content:center; font-size:11px; font-weight:800;
+  }
   .step.ok .marker { background:var(--ok); color:var(--panel); }
   .step.crit .marker { background:var(--crit); color:var(--panel); }
-  .step.running .marker { background:var(--accent); color:var(--panel); animation:pulse 1.2s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
-  .step-name { font-family:var(--mono); font-size:11.5px; font-weight:650; }
-  .step-meta { display:flex; gap:8px; font-family:var(--mono); font-size:10px; color:var(--muted); margin-top:2px; }
-  .step-hi { font-size:11px; color:var(--muted); margin-top:2px; }
+  .step.running .marker { background:var(--glow); color:var(--glow-ink); }
+  /* sonar-ping: an expanding ring reads as "active" more than a flat opacity pulse */
+  @media (prefers-reduced-motion: no-preference) {
+    .step.running .marker::after {
+      content:""; position:absolute; inset:-4px; border-radius:50%; border:1.5px solid var(--glow);
+      animation:ping 1.6s cubic-bezier(.2,.7,.3,1) infinite;
+    }
+    @keyframes ping { 0%{ transform:scale(.7); opacity:.8; } 100%{ transform:scale(1.9); opacity:0; } }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .step.running .marker { box-shadow:0 0 0 3px color-mix(in srgb, var(--glow) 35%, transparent); }
+  }
+  .step-name { font-family:var(--mono); font-size:12.5px; font-weight:650; }
+  .step-meta { display:flex; gap:8px; font-family:var(--mono); font-size:11px; color:var(--muted); margin-top:2px; font-variant-numeric:tabular-nums; }
+  .step-hi { font-size:12px; color:var(--muted); margin-top:2px; }
 
-  .gate { margin:10px 16px 16px; padding:12px; border-radius:10px; background:var(--warn-bg); border:1px solid var(--warn); }
-  .gate .msg { font-size:11.5px; color:var(--ink); margin-bottom:9px; white-space:pre-wrap; }
+  .gate { margin:11px 17px 17px; padding:13px; border-radius:12px; background:var(--warn-bg); border:1px solid color-mix(in srgb, var(--warn) 55%, transparent); }
+  .gate .msg { font-size:12.5px; color:var(--ink); margin-bottom:10px; white-space:pre-wrap; }
   .gate .actions { display:flex; flex-wrap:wrap; gap:8px; }
-  .gate button { font-size:11.5px; padding:6px 10px; }
-  .gate textarea { width:100%; margin-top:8px; min-height:50px; font-family:var(--sans); font-size:12px; padding:8px; border-radius:6px; border:1px solid var(--line); }
+  .gate button { font-size:12.5px; padding:6px 11px; }
+  .gate textarea { width:100%; margin-top:9px; min-height:50px; font-family:var(--sans); font-size:13px; padding:8px; border-radius:8px; border:1px solid var(--line); background:var(--panel); color:var(--ink); }
 
-  .foot { padding:10px 16px 14px; border-top:1px solid var(--line); background:var(--panel-2); font-family:var(--mono); font-size:11px; color:var(--muted); }
+  .foot { padding:11px 17px 15px; border-top:1px solid var(--line); background:var(--panel-2); font-family:var(--mono); font-size:12px; color:var(--muted); }
   .foot b { color:var(--ink); }
 
   .rawlog { border-top:1px solid var(--line); }
   .rawlog summary {
-    cursor:pointer; padding:9px 16px; font-family:var(--mono); font-size:10.5px;
+    cursor:pointer; padding:9px 17px; font-family:var(--mono); font-size:11.5px;
     text-transform:uppercase; letter-spacing:.07em; color:var(--muted); user-select:none;
   }
+  .rawlog summary:hover { color:var(--ink); }
   .rawlog[open] summary { border-bottom:1px solid var(--line); }
   .rawlog pre {
-    margin:0; padding:10px 14px; max-height:220px; overflow:auto; background:var(--panel-2);
-    font-family:var(--mono); font-size:10.5px; line-height:1.5; white-space:pre-wrap; word-break:break-word;
+    margin:0; padding:11px 15px; max-height:220px; overflow:auto; background:var(--panel-2);
+    font-family:var(--mono); font-size:11.5px; line-height:1.5; white-space:pre-wrap; word-break:break-word;
+  }
+
+  /* ── setup <-> cards crossfade ───────────────────────────────────── */
+  #setup, #cards { transition:opacity .35s ease; }
+
+  /* ── new-card entrance (fires once per ticket, not on every poll) ──── */
+  @media (prefers-reduced-motion: no-preference) {
+    .card.entering { animation:rise .5s cubic-bezier(.2,.7,.2,1) both; }
+    @keyframes rise { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+  }
+
+  /* ── per-card activity bar: honest about state, not a fake percentage ──── */
+  .activity { height:3px; background:var(--line); overflow:hidden; }
+  .activity .fill { height:100%; width:100%; }
+  .activity.queued .fill { background:var(--pending); opacity:.4; }
+  .activity.paused .fill { background:var(--warn); }
+  .activity.done .fill { background:var(--ok); }
+  .activity.failed .fill { background:var(--crit); }
+  .activity.running .fill {
+    background:linear-gradient(90deg, transparent, var(--glow), transparent);
+    background-size:60% 100%;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .activity.running .fill { animation:sweep 1.4s ease-in-out infinite; }
+    @keyframes sweep { 0%{ background-position:-60% 0; } 100%{ background-position:160% 0; } }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .activity.running .fill { background:var(--glow); opacity:.7; }
   }
 </style>
 </head>
 <body>
   <header>
-    <div>
-      <h1>Aquaman Batch Monitor</h1>
-      <div class="sub">Sequential ocean-pipeline runs, live station-by-station</div>
+    <div class="brand">
+      <svg class="trident" width="30" height="30" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <line x1="15" y1="6" x2="15" y2="26" stroke-width="1.6" stroke-linecap="round"/>
+        <path d="M6 6 L6 11 Q6 15 15 15 Q24 15 24 11 L24 6" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+        <line x1="6" y1="3" x2="6" y2="8" stroke-width="1.6" stroke-linecap="round"/>
+        <line x1="24" y1="3" x2="24" y2="8" stroke-width="1.6" stroke-linecap="round"/>
+        <line x1="15" y1="3" x2="15" y2="8" stroke-width="1.6" stroke-linecap="round"/>
+        <line x1="10" y1="26" x2="20" y2="26" stroke-width="1.6" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <h1>Aquaman Batch Monitor</h1>
+        <div class="sub">Sequential ocean-pipeline runs, live station-by-station</div>
+      </div>
     </div>
   </header>
 
   <div id="setup" class="setup">
     <label for="tickets">Ticket IDs (one per line, or comma-separated)</label>
     <textarea id="tickets" placeholder="MM-14601&#10;MM-14602&#10;MM-14603"></textarea>
-    <div class="hint">Runs strictly one at a time — never in parallel. The underlying process
-      always runs verbose; this UI only ever shows team-level station outcomes, with the
-      full raw stream available in the terminal, the log file, and the panel below each card.</div>
+    <div class="hint">Runs strictly one at a time — never in parallel.</div>
+
+    <div class="loglevel-row">
+      <label for="loglevel">Log level</label>
+      <select id="loglevel" class="loglevel">
+        <option value="management">management — headers only</option>
+        <option value="team" selected>team — + one outcome line per station (default)</option>
+        <option value="developer">developer — + milestones &amp; raw agent activity</option>
+      </select>
+    </div>
+
+    <div class="gates">
+      <div class="row">
+        <input type="checkbox" id="qaAutoapprove">
+        <div>Auto-approve QA review gate<div class="sub">OCEAN_PIPELINE_QA_AUTOAPPROVE — skips the pause after the SIT scenarios are drafted</div></div>
+      </div>
+      <div class="row">
+        <input type="checkbox" id="rcaReviewAuto">
+        <div>Auto-approve RCA review gate<div class="sub">OCEAN_PIPELINE_RCA_REVIEW_AUTO — only matters for tickets routed through RCA</div></div>
+      </div>
+      <div class="row">
+        <input type="checkbox" id="qaTestrail">
+        <div>Create real TestRail cases on auto-approve<div class="sub">OCEAN_PIPELINE_TESTRAIL — a genuine write to TestRail project 22, not a no-op; only takes effect together with the QA checkbox above</div></div>
+      </div>
+      <div class="warn-note">Ready-for-review flip has no gate by default already — nothing needed for that one.</div>
+    </div>
+
     <button class="primary" id="start">Start batch</button>
   </div>
 
@@ -127,6 +304,24 @@
 <script>
 let batchId = null;
 let poller = null;
+const BATCH_KEY = "aquaman-batch-id";   // survives a page reload; server state is the real source of truth
+
+function showBatch(id) {
+  batchId = id;
+  localStorage.setItem(BATCH_KEY, id);
+  const setupEl = document.getElementById("setup");
+  const cardsEl = document.getElementById("cards");
+  setupEl.style.opacity = "0";
+  setTimeout(() => {
+    setupEl.style.display = "none";
+    cardsEl.style.display = "grid";
+    cardsEl.style.opacity = "0";
+    requestAnimationFrame(() => { cardsEl.style.opacity = "1"; });
+  }, 300);
+  if (poller) clearInterval(poller);
+  poll();
+  poller = setInterval(poll, 2000);
+}
 
 document.getElementById("start").addEventListener("click", async () => {
   const raw = document.getElementById("tickets").value;
@@ -134,16 +329,16 @@ document.getElementById("start").addEventListener("click", async () => {
   if (!tickets.length) return;
   const btn = document.getElementById("start");
   btn.disabled = true; btn.textContent = "Starting…";
+  const log_level = document.getElementById("loglevel").value;
+  const qa_autoapprove = document.getElementById("qaAutoapprove").checked;
+  const rca_review_auto = document.getElementById("rcaReviewAuto").checked;
+  const qa_testrail = document.getElementById("qaTestrail").checked;
   const res = await fetch("/batches", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({tickets}),
+    body: JSON.stringify({tickets, log_level, qa_autoapprove, rca_review_auto, qa_testrail}),
   });
   const data = await res.json();
-  batchId = data.batch_id;
-  document.getElementById("setup").style.display = "none";
-  document.getElementById("cards").style.display = "grid";
-  poll();
-  poller = setInterval(poll, 2000);
+  showBatch(data.batch_id);
 });
 
 async function poll() {
@@ -153,15 +348,50 @@ async function poll() {
   render(await res.json());
 }
 
+// On load: the frontend's own `batchId` never survives a reload, but the server's
+// batch state does (until uvicorn itself restarts) — so a refresh must not look like
+// the run vanished. First try the id this SAME browser started last; if that's gone
+// (uvicorn restarted), fall back to listing whatever the server still has, in case a
+// batch was started from a different tab/session and needs reconnecting to.
+(async function reconnectOnLoad() {
+  const remembered = localStorage.getItem(BATCH_KEY);
+  if (remembered) {
+    const res = await fetch(`/batches/${remembered}`);
+    if (res.ok) { showBatch(remembered); return; }
+    localStorage.removeItem(BATCH_KEY);
+  }
+  const res = await fetch("/batches");
+  if (!res.ok) return;
+  const { batches } = await res.json();
+  if (!batches.length) return;
+  const box = document.createElement("div");
+  box.className = "gates";
+  box.style.marginBottom = "16px";
+  box.innerHTML = `<div style="font-family:var(--mono);font-size:11px;text-transform:uppercase;
+    letter-spacing:.08em;color:var(--muted)">Still running on this server</div>` +
+    batches.map(b => `<div class="row" style="align-items:center">
+      <button data-reconnect="${esc(b.id)}">Reconnect</button>
+      <div>${b.tickets.map(t => `${esc(t.ticket)} (${esc(t.status)})`).join(", ")}</div>
+    </div>`).join("");
+  document.getElementById("setup").prepend(box);
+  box.querySelectorAll("[data-reconnect]").forEach(btn =>
+    btn.addEventListener("click", () => showBatch(btn.dataset.reconnect)));
+})();
+
 function esc(s) {
   return (s || "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 }
 
-const openLogs = new Set(); // tickets whose "Raw output" panel is currently expanded
+const openLogs = new Set(); // tickets whose log panel is currently expanded
+const seenTickets = new Set(); // tickets already rendered once — entrance animation fires only for new ones
 
 function render(batch) {
   const root = document.getElementById("cards");
-  root.innerHTML = batch.tickets.map(cardHtml).join("");
+  root.innerHTML = batch.tickets.map(t => {
+    const isNew = !seenTickets.has(t.ticket);
+    seenTickets.add(t.ticket);
+    return cardHtml(t, isNew);
+  }).join("");
   batch.tickets.forEach(t => {
     if (t.status !== "paused") return;
     const approveBtn = document.getElementById(`gate-approve-${t.ticket}`);
@@ -173,7 +403,7 @@ function render(batch) {
   });
 
   // innerHTML replacement above resets <details open> and scroll — restore both so
-  // an expanded raw-log panel keeps following the tail across polls, like `tail -f`.
+  // an expanded log panel keeps following the tail across polls, like `tail -f`.
   root.querySelectorAll(".rawlog").forEach(el => {
     const ticket = el.dataset.ticket;
     el.addEventListener("toggle", () => {
@@ -197,7 +427,7 @@ async function resume(ticket, decision) {
   poll();
 }
 
-function cardHtml(t) {
+function cardHtml(t, isNew) {
   const steps = t.events.map(e => `
     <div class="step ${e.state}">
       <div class="marker">${e.state === "ok" ? "✓" : e.state === "crit" ? "✕" : "…"}</div>
@@ -238,18 +468,19 @@ function cardHtml(t) {
     </div>` : "";
 
   return `
-    <div class="card">
+    <div class="card${isNew ? " entering" : ""}">
+      <div class="activity ${t.status}"><div class="fill"></div></div>
       <div class="card-head">
         <div class="ticket">${esc(t.ticket)}</div>
         <div class="pill ${t.status}"><span class="d"></span>${esc(t.status)}</div>
         ${t.execution_id ? `<div class="step-meta" style="margin-top:6px">${esc(t.execution_id)}</div>` : ""}
-        ${t.log_path ? `<div class="step-meta" title="tail -f this file for the FULL verbose stream">${esc(t.log_path)}</div>` : ""}
+        ${t.log_path ? `<div class="step-meta" title="tail -f this file for this ticket's full log">${esc(t.log_path)}</div>` : ""}
       </div>
       <div class="stepper">${steps}</div>
       ${gate}
       ${foot}
       <details class="rawlog" data-ticket="${esc(t.ticket)}">
-        <summary>Team-level log (${(t.raw_tail || []).length} lines) — verbose stream is in the terminal &amp; log file</summary>
+        <summary>Log (${(t.raw_tail || []).length} lines)</summary>
         <pre>${esc((t.raw_tail || []).join("\n"))}</pre>
       </details>
     </div>`;

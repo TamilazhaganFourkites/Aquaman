@@ -74,36 +74,10 @@ GATE_NODES = {"qa_review_gate", "rca_review_gate", "human_gate"}
 
 _HEADER_RE = re.compile(r"^▶\s+\d{2}:\d{2}:\d{2}\s+(.+)$")
 _BANNER_EXE_RE = re.compile(r"run (EXE-[0-9a-f]+)")
-_CLI_NOTE_RE = re.compile(r"^\[ocean-pipeline\]")  # e.g. the Langfuse-tracing startup line
 _DONE_RE = re.compile(r"^\[DONE\]\s+(\S+)\s+status=(\S+)(?:\s+pr=#(\d+))?")
 _FAILED_RE = re.compile(r"^\[FAILED\]\s*(.*)$")
 _PAUSED_RE = re.compile(r"^\[PAUSED\]\s*(.*)$", re.S)
 _RESULT_RE = re.compile(r"^\s*RESULT:\s*(\S+)")
-
-# Confirmed against a real captured `--verbose` transcript (Aquaman/run.log, MM-14472):
-# at developer level there are actually THREE distinct line shapes, not two — station
-# headers/steps (ui.py, team+), curated milestones "     · text" (ui.py, developer-only),
-# and a third, separate raw-agent-firehose prefix "    [stationname] ..." that ui.py does
-# NOT print at all (it comes from agents.py's own streaming, not ui.py) — none of the
-# patterns below match that third shape, so it's correctly excluded without special-casing it.
-
-
-def _is_team_level_line(line: str) -> bool:
-    """True for exactly the lines ui.py prints at team level or above (banner, the
-    ocean-pipeline startup note, station headers, step outcomes, [DONE]/[FAILED]/
-    [PAUSED], RESULT) — false for developer-only lines (milestones, the raw per-agent
-    firehose). Used to filter what the UI sees; the terminal/log file always get every
-    line regardless of this filter."""
-    return bool(
-        _BANNER_EXE_RE.search(line)
-        or _CLI_NOTE_RE.match(line)
-        or _HEADER_RE.match(line)
-        or _parse_step_line(line)
-        or _DONE_RE.match(line)
-        or _FAILED_RE.match(line)
-        or _PAUSED_RE.match(line)
-        or _RESULT_RE.match(line)
-    )
 
 
 def _parse_step_line(line: str):
@@ -161,9 +135,10 @@ class TicketRun:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "log_path": self.log_path,
-            # bounded tail, not the full history — raw_lines is already team-level-only
-            # (see _is_team_level_line), so this is mostly a defensive cap, not a
-            # frequently-hit limit; the full verbose stream lives at log_path.
+            # bounded tail, not the full history — this is exactly what the subprocess
+            # printed at the batch's chosen --log-level (nothing filtered client-side);
+            # the cap is defensive since a developer-level run can print thousands of
+            # lines, not something normally hit at management/team level.
             "raw_tail": self.raw_lines[-500:],
         }
 
@@ -172,11 +147,18 @@ class TicketRun:
 class Batch:
     id: str
     tickets: list[TicketRun]
+    log_level: str = "team"  # management | team | developer — ocean-pipeline's own --log-level
     cursor: int = 0
+    created_at: float = 0.0
     runner_task: asyncio.Task | None = None
+    # Explicit per-batch overrides for the three gate-auto env vars (config.py),
+    # keyed by the real OCEAN_PIPELINE_* name -> "1" or "" — always set to one of
+    # these two, never omitted, so the checkbox state wins regardless of whatever
+    # is already exported in the shell that launched uvicorn.
+    env_overrides: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> dict:
-        return {"id": self.id, "cursor": self.cursor,
+        return {"id": self.id, "cursor": self.cursor, "log_level": self.log_level,
                  "tickets": [t.to_json() for t in self.tickets]}
 
 
@@ -188,7 +170,8 @@ BATCHES: dict[str, Batch] = {}
 _RUN_LOCK = asyncio.Lock()
 
 
-async def _drive_process(run: TicketRun, args: list[str]) -> None:
+async def _drive_process(run: TicketRun, args: list[str],
+                          env_overrides: dict[str, str] | None = None) -> None:
     """Spawn one `ocean-pipeline` invocation and update `run` live as its stdout
     streams in. Returns when the process exits — either finished (done/failed) or
     paused at a gate (the process itself exits in that case; resuming means spawning
@@ -206,11 +189,20 @@ async def _drive_process(run: TicketRun, args: list[str]) -> None:
     await _RUN_LOCK.acquire()
     proc = None
     log_fh = None
+    # Inherit this app's own environment (AQUAMAN_BIN's PATH, credentials, etc.) and
+    # layer the batch's gate-auto overrides on top — config.py reads these via
+    # os.environ.get(...) at the CHILD process's own import time, so this is the only
+    # way to make the checkbox state win over whatever's exported in the parent shell.
+    child_env = {**environ, **(env_overrides or {})}
     try:
         proc = await asyncio.create_subprocess_exec(
             AQUAMAN_BIN, *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            cwd=AQUAMAN_DIR,
+            cwd=AQUAMAN_DIR, env=child_env,
+            start_new_session=True,   # own process group — a Ctrl+C on uvicorn's terminal
+                                       # sends SIGINT to the whole foreground group; without
+                                       # this, that would ALSO interrupt the real, possibly
+                                       # hours-long, real-side-effect ocean-pipeline run.
         )
         if run.log_path is None:
             ts = time.strftime("%Y%m%d-%H%M%S")
@@ -228,15 +220,13 @@ async def _drive_process(run: TicketRun, args: list[str]) -> None:
             print(f"[{run.ticket}] {line}", flush=True)
             log_fh.write(line + "\n")
             log_fh.flush()
-            # UI: team-level lines only — milestones and the raw per-agent firehose
-            # (developer-only) never reach run.raw_lines, hence never reach the browser.
-            # (Team-level output is sparse — ~6/209 lines in a real captured run — so
-            # this rarely grows large, but a heavily-retried run shouldn't grow it
-            # unbounded either.)
-            if _is_team_level_line(line):
-                run.raw_lines.append(line)
-                if len(run.raw_lines) > 2000:
-                    del run.raw_lines[:-2000]
+            # UI: every line the process actually prints at whatever --log-level this
+            # batch chose — the subprocess itself controls verbosity now (config.py's
+            # own LOG_LEVEL gating), so there's nothing left to filter client-side.
+            # Capped defensively — a developer-level run can print thousands of lines.
+            run.raw_lines.append(line)
+            if len(run.raw_lines) > 2000:
+                del run.raw_lines[:-2000]
             if not line.strip():
                 continue
 
@@ -318,9 +308,7 @@ async def _run_batch_from(batch: Batch, start: int) -> None:
         run = batch.tickets[i]
         run.status = "running"
         run.started_at = time.time()
-        # Always spawn verbose (developer-level): the terminal/log file get the full
-        # firehose; _is_team_level_line() filters what actually reaches the UI.
-        await _drive_process(run, [run.ticket, "--log-level", "developer"])
+        await _drive_process(run, [run.ticket, "--log-level", batch.log_level], batch.env_overrides)
         if run.status == "paused":
             return
     batch.cursor = len(batch.tickets)
@@ -329,7 +317,7 @@ async def _run_batch_from(batch: Batch, start: int) -> None:
 async def _resume_ticket(batch: Batch, run: TicketRun, args: list[str]) -> None:
     run.paused_gate = None
     run.paused_message = None
-    await _drive_process(run, args)
+    await _drive_process(run, args, batch.env_overrides)
     if run.status == "paused":
         return
     # Identity lookup, not `.index(run)`: TicketRun is a plain dataclass, so `==`
@@ -344,6 +332,10 @@ app = FastAPI(title="Aquaman Batch Monitor")
 
 class CreateBatchBody(BaseModel):
     tickets: list[str]
+    log_level: str = "team"         # management | team | developer — ocean-pipeline's own --log-level
+    qa_autoapprove: bool = False    # OCEAN_PIPELINE_QA_AUTOAPPROVE — skip qa_review_gate's pause
+    rca_review_auto: bool = False   # OCEAN_PIPELINE_RCA_REVIEW_AUTO — skip rca_review_gate's pause
+    qa_testrail: bool = False       # OCEAN_PIPELINE_TESTRAIL — real TestRail cases on auto-approve
 
 
 class ResumeBody(BaseModel):
@@ -351,15 +343,40 @@ class ResumeBody(BaseModel):
     note: str = ""
 
 
+def _flag(on: bool) -> str:
+    return "1" if on else ""
+
+
 @app.post("/batches")
 async def create_batch(body: CreateBatchBody) -> dict:
     tickets = [t.strip() for t in body.tickets if t.strip()]
     if not tickets:
         raise HTTPException(422, "provide at least one ticket id")
-    batch = Batch(id=str(uuid.uuid4())[:8], tickets=[TicketRun(ticket=t) for t in tickets])
+    env_overrides = {
+        "OCEAN_PIPELINE_QA_AUTOAPPROVE": _flag(body.qa_autoapprove),
+        "OCEAN_PIPELINE_RCA_REVIEW_AUTO": _flag(body.rca_review_auto),
+        "OCEAN_PIPELINE_TESTRAIL": _flag(body.qa_testrail),
+    }
+    level = body.log_level if body.log_level in ("management", "team", "developer") else "team"
+    batch = Batch(id=str(uuid.uuid4())[:8], tickets=[TicketRun(ticket=t) for t in tickets],
+                  log_level=level, env_overrides=env_overrides, created_at=time.time())
     BATCHES[batch.id] = batch
     batch.runner_task = asyncio.create_task(_run_batch_from(batch, 0))
     return {"batch_id": batch.id}
+
+
+@app.get("/batches")
+async def list_batches() -> dict:
+    """Every batch still held in memory (this process's uptime only — nothing persists
+    across a uvicorn restart), newest first. Exists so a reloaded/reopened browser tab
+    can reconnect to a batch that's still actually running server-side, even though the
+    frontend's own in-memory `batchId` was lost on reload."""
+    batches = sorted(BATCHES.values(), key=lambda b: b.created_at, reverse=True)
+    return {"batches": [
+        {"id": b.id, "created_at": b.created_at,
+         "tickets": [{"ticket": t.ticket, "status": t.status} for t in b.tickets]}
+        for b in batches
+    ]}
 
 
 @app.get("/batches/{batch_id}")
@@ -385,7 +402,7 @@ async def resume_batch(batch_id: str, body: ResumeBody) -> dict:
         raise HTTPException(500, f"unrecognized gate {run.paused_gate!r} — "
                              f"add it to GATE_NODES/LABEL_TO_NODE in app.py")
 
-    args = ["--resume", run.execution_id, "--log-level", "developer"]
+    args = ["--resume", run.execution_id, "--log-level", batch.log_level]
     if run.paused_gate == "qa_review_gate":
         qa_map = {"approve_testrail": "approve-testrail",
                   "approve_no_testrail": "approve-no-testrail", "changes": "changes"}
