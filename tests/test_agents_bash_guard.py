@@ -14,6 +14,16 @@ def test_blocks_whole_disk_searches():
     assert unscoped_root_search("grep -rn x ~") == "~"
 
 
+def test_blocks_evasions():
+    # root-glob (shell expands /* to every top-level dir) + wrapper/env prefixes must not slip past.
+    assert unscoped_root_search("grep -r x /*") == "/*"
+    assert unscoped_root_search("grep -r x /*/") == "/*/"
+    assert unscoped_root_search("sudo grep -r x /") == "/"
+    assert unscoped_root_search("time grep -r x /") == "/"
+    assert unscoped_root_search("FOO=1 grep -r x /") == "/"
+    assert unscoped_root_search("xargs grep -r x /") == "/"
+
+
 def test_allows_scoped_searches():
     assert unscoped_root_search('grep -rn "def get_stop" app/models/ocean') is None
     assert unscoped_root_search("grep -rn foo .") is None
@@ -23,6 +33,17 @@ def test_allows_scoped_searches():
     assert unscoped_root_search("rg pat /tmp/ocean-pipeline/EXE-x/workspace") is None
     assert unscoped_root_search("grep -n foo /etc/hosts") is None   # not recursive
     assert unscoped_root_search("ls /") is None                     # not a search tool
+
+
+def test_no_false_positive_when_grepping_FOR_a_path_literal():
+    # grep's FIRST bare positional is the PATTERN, not a path — searching FOR a path string, scoped to a
+    # relative dir, must be ALLOWED (the coder greps for path literals constantly).
+    assert unscoped_root_search('grep -rn "/" .') is None
+    assert unscoped_root_search('grep -rn "/etc" app/models/ocean') is None
+    assert unscoped_root_search('grep -rn "/System" app/') is None
+    assert unscoped_root_search('rg "/usr" src/') is None
+    # ...but the real dangerous root as the PATH arg is still caught even when the pattern looks path-like
+    assert unscoped_root_search('grep -rn "/etc" /') == "/"
 
 
 def _run_hook(cmd):

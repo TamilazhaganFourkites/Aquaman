@@ -196,15 +196,31 @@ def _sit_infra_directive(state: OceanState) -> str:
     )
 
 
-def _service_slug(state: OceanState) -> str:
-    """The `<org>/<name>` slug of the repo whose branch we open/flip the PR on. Prefer what the
-    coder reported; fall back to the single target repo when there's exactly one."""
-    repo = state.get("service_repo") or ""
-    if not repo:
-        repos = state.get("target_repos") or []
-        if len(repos) == 1:
-            repo = repos[0].get("repo", "")
-    return gitops.repo_slug(repo)
+def _service_slugs(state: OceanState) -> list[str]:
+    """EVERY `<org>/<name>` slug to open/flip a PR on — MULTI-REPO aware. A ticket's single branch
+    can span 1..N changed repos, and the coder reports `service_repo` as a COMMA-JOINED string
+    (e.g. "cloudqwest/tracking-service, cloudqwest/ocean-service"). Passing that joined string to
+    `gh --repo` fails, so open ONE PR per repo instead.
+
+    Precedence — the coder's `service_repo` FIRST: it is what the coder actually PUSHED, so it is
+    authoritative for which repos hold the branch. Only if it's empty do we fall back to
+    `changed_repos`, then the researcher's `target_repos` — a Station-0 *guess* that is often
+    over-scoped (candidate/read-only repos), and opening a PR on a repo the coder never pushed to
+    would fail. (`changed_repos` is only populated at Station 6, i.e. after open_pr, so it's normally
+    empty here; kept as a defensive middle tier.)"""
+    raw: list[str] = (state.get("service_repo") or "").split(",")
+    if not any(x.strip() for x in raw):
+        raw = [c.repo if not isinstance(c, dict) else c.get("repo", "")
+               for c in (state.get("changed_repos") or [])]
+    if not any(x.strip() for x in raw):
+        raw = [r.get("repo", "") for r in (state.get("target_repos") or []) if r.get("repo")]
+    seen: set[str] = set()
+    slugs: list[str] = []
+    for r in (gitops.repo_slug(x.strip()) for x in raw if x and x.strip()):
+        if r and r not in seen:
+            seen.add(r)
+            slugs.append(r)
+    return slugs
 
 
 # ------------------------------------------------------------------ Station 0
@@ -510,17 +526,22 @@ async def harsh_reviewer(state: OceanState) -> dict:
 
 # ------------------------------------------------------------------ 3.87 open PR (plain code, idempotent)
 async def open_pr(state: OceanState) -> dict:
-    """Open the DRAFT service PR — deterministic gh, run by the graph, NOT an agent.
-    Idempotent: reuses an existing PR for the branch (the code_fault loop re-enters here)."""
-    if state.get("pr_number"):
-        return {}  # PR already open (code_fault rework path re-enters here)
-    telemetry.station_event(state["execution_id"], 3.87, "start")
-    slug, branch = _service_slug(state), state.get("branch")
-    if not slug or not branch:
+    """Open the DRAFT service PR(s) — deterministic gh, run by the graph, NOT an agent. MULTI-REPO
+    aware: the coder's single branch may span 1..N changed repos, so open one draft PR PER repo.
+    Idempotent per repo: reuses an existing PR for the branch (the code_fault loop re-enters here)."""
+    slugs, branch = _service_slugs(state), state.get("branch")
+    if not slugs or not branch:
         raise gitops.GitOpError(
-            f"cannot open PR: missing repo slug ({slug!r}) or branch ({branch!r}) — the coder "
-            f"must report `repo` and `branch`, or provide a single target repo."
+            f"cannot open PR: no repo slugs ({slugs!r}) or branch ({branch!r}) — the coder "
+            f"must report `repo`/`target_repos` and `branch`."
         )
+    pr_numbers = dict(state.get("pr_numbers") or {})
+    # Back-compat: a pre-fix single-repo rework re-enters with only pr_number set.
+    if not pr_numbers and state.get("pr_number") and len(slugs) == 1:
+        pr_numbers[slugs[0]] = state["pr_number"]
+    if all(s in pr_numbers for s in slugs):
+        return {}  # every repo's PR already open (rework/resume re-enters here)
+    telemetry.station_event(state["execution_id"], 3.87, "start")
     title = state.get("pr_title") or f"{state['ticket_id']}: automated pipeline change"
     body_text = state.get("pr_body") or f"Automated change for {state['ticket_id']} (FK Ocean pipeline)."
     # FourKites org policy: every PR body must start with `Ticket: <TICKET-ID>` on its own line.
@@ -528,9 +549,13 @@ async def open_pr(state: OceanState) -> dict:
     # what the coder proposed or whether the fallback text above fired.
     ticket_line = f"Ticket: {state['ticket_id']}"
     body = body_text if body_text.startswith(ticket_line) else f"{ticket_line}\n\n{body_text}"
-    pr_number = gitops.open_draft_pr(slug, branch, title, body)
-    telemetry.station_event(state["execution_id"], 3.87, "end", pr_number=pr_number)
-    return {"pr_number": pr_number}
+    for slug in slugs:                       # one draft PR per changed repo (open_draft_pr is idempotent)
+        if slug not in pr_numbers:
+            pr_numbers[slug] = gitops.open_draft_pr(slug, branch, title, body)
+    primary = pr_numbers[slugs[0]]
+    telemetry.station_event(state["execution_id"], 3.87, "end",
+                            pr_number=primary, pr_numbers=pr_numbers)
+    return {"pr_number": primary, "pr_numbers": pr_numbers}
 
 
 # ============================ Station 6 — local SIT, decomposed into graph nodes ============================
@@ -905,18 +930,25 @@ async def flip_ready(state: OceanState) -> dict:
     In Review + posts a PR-link comment (best-effort Jira). This is the intended AUTOMATED terminal
     action; the human boundary is merge/deploy, which the pipeline never performs."""
     telemetry.station_event(state["execution_id"], 6.5, "start")
-    slug, pr = _service_slug(state), state.get("pr_number")
-    if slug and pr:
-        gitops.cross_link_and_ready(slug, int(pr), state.get("test_automation_pr_url") or "")
+    # Multi-repo: flip EVERY changed repo's PR ready (fall back to pr_number for a pre-fix single repo).
+    pr_numbers = dict(state.get("pr_numbers") or {})
+    if not pr_numbers and state.get("pr_number"):
+        slugs = _service_slugs(state)
+        if slugs:
+            pr_numbers = {slugs[0]: state["pr_number"]}
+    for slug, pr in pr_numbers.items():
+        if slug and pr:
+            gitops.cross_link_and_ready(slug, int(pr), state.get("test_automation_pr_url") or "")
     tid = state["ticket_id"]
     jira.transition(tid, "In Review")
-    pr_line = f"service PR #{pr}" + (f" · test PR {state['test_automation_pr_url']}"
-                                     if state.get("test_automation_pr_url") else "")
+    prs_str = ", ".join(f"#{n}" for n in pr_numbers.values()) or "(none)"
+    pr_line = f"service PR(s) {prs_str}" + (f" · test PR {state['test_automation_pr_url']}"
+                                            if state.get("test_automation_pr_url") else "")
     jira.comment(tid, f"🤖 Aquaman: SIT passed; {pr_line} flipped to ready-for-review. "
                       f"Merge/deploy remain with the engineer.")
-    telemetry.station_event(state["execution_id"], 6.5, "end", ready_flipped=bool(slug and pr))
+    telemetry.station_event(state["execution_id"], 6.5, "end", ready_flipped=bool(pr_numbers))
     return {"ready_flipped": True, "final_status": "completed",
-            "final_outcome": f"sit_passed; service PR #{state.get('pr_number')} ready-for-review"}
+            "final_outcome": f"sit_passed; service PR(s) {prs_str} ready-for-review"}
 
 
 # ------------------------------------------------------------------ stop (rejected / failed / could_not_verify / budget exhausted)

@@ -63,7 +63,8 @@ class OceanState(TypedDict, total=False):
     container_ready: bool    # True only if prep_container actually started it; else stations self-serve
 
     # --- 3.87 ---
-    pr_number: int
+    pr_number: int           # primary repo's PR number (back-compat; = pr_numbers[first slug])
+    pr_numbers: dict         # {slug: pr_number} — one draft PR per changed repo (multi-repo tickets)
     service_repo: str        # owner/name slug the coder pushed to; used by the git/PR code nodes
     pr_title: str            # PR title the coder proposed; the code node opens the PR with it
     pr_body: str             # PR body the coder proposed

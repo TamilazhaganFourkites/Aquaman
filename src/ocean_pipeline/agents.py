@@ -229,37 +229,68 @@ _DANGEROUS_SEARCH_ROOTS = {
     "/", "/System", "/Users", "/Library", "/private", "/usr", "/var", "/opt", "/etc",
     "/Applications", "/Volumes", "/bin", "/sbin", "/cores", "/net", "/home", "~", "$HOME",
 }
-_RECURSIVE_SEARCH_TOOLS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}   # + `find` (always recursive)
+_GREP_TOOLS = {"grep", "egrep", "fgrep", "rg", "ag", "ack"}   # first bare positional is the PATTERN, not a path
+# Leading wrappers a worker might prefix a search with — stripped so `sudo/time/xargs grep -r x /` is still caught.
+_WRAPPER_CMDS = {"sudo", "time", "nice", "ionice", "xargs", "env", "command", "nohup", "stdbuf", "timeout"}
+
+
+def _is_dangerous_root(path: str) -> bool:
+    """True if `path` names a filesystem TOP-LEVEL root to recursively scan — including the `/*`, `/*/`,
+    `/System/*` top-level-glob forms (the shell expands `/*` to every top-level dir = a whole-disk scan).
+    An absolute path INTO the run's worktree (`/tmp/ocean-pipeline/<EXE>/…`) is NOT dangerous."""
+    if path in _DANGEROUS_SEARCH_ROOTS:
+        return True
+    if (path.rstrip("/") or "/") in _DANGEROUS_SEARCH_ROOTS:
+        return True
+    stripped = re.sub(r"/\*+/?$", "", path) or "/"      # drop a trailing glob segment: /* , /*/ , /System/*
+    return stripped in _DANGEROUS_SEARCH_ROOTS
 
 
 def unscoped_root_search(command: str) -> str | None:
     """If `command` recursively searches a filesystem TOP-LEVEL root (e.g. `grep -r … /`, `find /System …`,
-    `rg pat /Users`), return the offending root path; else None. Only top-level system roots are flagged —
-    an absolute path INTO the run's worktree (`/tmp/ocean-pipeline/<EXE>/…`) is fine. Split on shell
-    separators so one bad segment in a pipeline is still caught (the real incident was the first stage of
-    a `grep … / | grep … | head` pipe)."""
+    `rg pat /Users`, `grep -r x /*`, `sudo grep -r x /`), return the offending root; else None. Only
+    top-level system roots are flagged — an absolute path INTO the run's worktree is fine. For grep-family
+    tools the FIRST bare positional is the PATTERN (skipped), so `grep -rn "/etc" app/` (searching FOR a
+    path literal, scoped to app/) is NOT a false positive. Split on shell separators so one bad segment of
+    a pipe is caught (the real incident was `grep … / | grep … | head`)."""
     for seg in re.split(r"\|\|?|&&?|;|\n", command):
         try:
             toks = shlex.split(seg)
         except ValueError:
             continue
-        if not toks:
+        # Strip leading `FOO=bar` env-assignments and wrapper commands (+ their own flags) so a prefixed
+        # search still resolves to its real tool at position 0.
+        i = 0
+        while i < len(toks) and not toks[i].startswith("-") and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[i]):
+            i += 1
+        while i < len(toks) and os.path.basename(toks[i]) in _WRAPPER_CMDS:
+            i += 1
+            while i < len(toks) and toks[i].startswith("-"):   # skip the wrapper's own flags (e.g. xargs -n1)
+                i += 1
+        if i >= len(toks):
             continue
-        tool = os.path.basename(toks[0])
+        tool = os.path.basename(toks[i])
+        rest = toks[i + 1:]
+        is_grep = tool in _GREP_TOOLS
         is_find = tool == "find"
-        if tool not in _RECURSIVE_SEARCH_TOOLS and not is_find:
+        if not is_grep and not is_find:
             continue
         # grep needs an explicit -r/-R/--recursive; rg/ag/ack recurse by default; find always recurses.
         recursive = is_find or tool in ("rg", "ag", "ack") or any(
             t == "--recursive" or (t.startswith("-") and not t.startswith("--") and ("r" in t[1:].lower()))
-            for t in toks[1:])
+            for t in rest)
         if not recursive:
             continue
-        for t in toks[1:]:
-            if t.startswith("-"):            # a flag, not a search path
+        # For grep-family, the first bare positional is the search PATTERN — skip it; every bare token after
+        # is a path. For `find`, the leading positionals ARE the search paths, so skip nothing.
+        pattern_skipped = not is_grep
+        for t in rest:
+            if t.startswith("-"):            # a flag (or a flag value we conservatively ignore)
                 continue
-            root = t if t in _DANGEROUS_SEARCH_ROOTS else (t.rstrip("/") or "/")
-            if root in _DANGEROUS_SEARCH_ROOTS:
+            if not pattern_skipped:
+                pattern_skipped = True       # this bare token is grep's pattern, not a path
+                continue
+            if _is_dangerous_root(t):
                 return t
     return None
 
