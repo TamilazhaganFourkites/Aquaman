@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -43,7 +44,37 @@ def _docker_resources() -> tuple[float, int] | None:
         return None
 
 
-def _docker_preflight_reason(target_repos=None) -> str:
+def _docker_used_gb(exclude_name_substr: str = "") -> float | None:
+    """Memory (GB) CURRENTLY consumed by running containers, via `docker stats --no-stream`. None if it
+    can't be measured. Lets preflight check FREE headroom, not just total capacity — so a run doesn't
+    start its SIT stack when CONCURRENT pipeline runs already saturate Docker (manual-findings #18:
+    EXE-caa5c082 died at Step-0 because two other tickets' full stacks were up). `exclude_name_substr`
+    drops containers whose NAME contains it — pass THIS run's execution_id so its own warm SIT stack /
+    persistent container (both named with the exec_id) don't count as competing usage on a retry (review
+    #4). Best-effort: any failure returns None and the caller falls back to the total-capacity check
+    (never a false environment_failure)."""
+    try:
+        out = subprocess.run(["docker", "stats", "--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"],
+                             capture_output=True, text=True, timeout=20)
+        if out.returncode != 0:
+            return None
+    except (subprocess.SubprocessError, OSError):
+        return None
+    # GB multipliers relative to a GiB (docker reports GiB/MiB/KiB or bare B): KiB, MiB, GiB, TiB, B.
+    mult = {"K": 1 / 1024 / 1024, "M": 1 / 1024, "G": 1.0, "T": 1024.0, "": 1 / 1024 ** 3}
+    total = 0.0
+    for line in out.stdout.splitlines():
+        name, _, usage = line.partition("\t")
+        if exclude_name_substr and exclude_name_substr in name:
+            continue
+        used = usage.split("/")[0].strip()   # "1.5GiB / 9.7GiB" -> "1.5GiB"
+        m = re.match(r"([\d.]+)\s*([KMGT]?)i?B", used, re.I)
+        if m:
+            total += float(m.group(1)) * mult.get(m.group(2).upper(), 0)
+    return total
+
+
+def _docker_preflight_reason(target_repos=None, exclude_name_substr: str = "") -> str:
     """Empty string if Docker has enough resources for THIS ticket's changed/target-repo set; otherwise
     a ready-to-use environment_failure reason string. MM-14628: the budget scales to the repo set (1..N
     changed repos all run real) via config.docker_budget_for_repos — mirroring the skill's
@@ -66,6 +97,16 @@ def _docker_preflight_reason(target_repos=None) -> str:
                 f"need >= {min_gb} GB / {min_cpus} CPU for this repo set (see "
                 f"local_service_execution.md 'Docker memory ceiling'). Raise Docker Desktop/Rancher "
                 f"Desktop memory+CPU allocation before retrying.")
+    # Total capacity is enough — but is it FREE? Concurrent pipeline runs (separate terminals) share this
+    # one Docker VM; if their live containers already consume most of it, this run's SIT stack won't fit.
+    # This is the case EXE-caa5c082 hit (manual-findings #18). Unlike insufficient total capacity, this is
+    # transient — retry once the other runs finish or their stale stacks are torn down.
+    used_gb = _docker_used_gb(exclude_name_substr)
+    if used_gb is not None and (mem_gb - used_gb) < min_gb:
+        return (f"environment_failure: docker_over_committed — {used_gb:.1f} GB of {mem_gb:.1f} GB is already "
+                f"in use by other running containers, leaving {mem_gb - used_gb:.1f} GB free; this repo set "
+                f"needs >= {min_gb} GB. A concurrent pipeline run is likely holding a full SIT stack — wait "
+                f"for it to finish or tear down stale stacks (`docker ps`), then retry (manual-findings #18).")
     return ""
 
 
@@ -129,14 +170,30 @@ def _gh_token() -> str:
     return os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
 
 
-def _image_cache_argv(tool: Path, name: str, worktree: Path) -> list[str]:
-    """Argv to build/resolve a repo's cached image. Passes --build-arg GITHUB_TOKEN when available so a
-    COLD build of a private-gem repo succeeds (ocean-worker's `bundle install` needs it)."""
+def _image_cache_argv(tool: Path, name: str, worktree: Path, has_token: bool) -> list[str]:
+    """Argv to build/resolve a repo's cached image. When has_token, adds --inject-github-token so
+    ruby_image_cache reads the token from the child's ENVIRONMENT (supplied via env= at the call site,
+    see _image_cache_env) instead of taking `--build-arg GITHUB_TOKEN=<value>` — the credential never
+    rides the command line, where a logged argv would leak it (manual-findings #1). When BAKE_TEST_GROUP
+    is on, also asks for the test-group child image so the coder/SIT container starts test-ready
+    (manual-findings #4)."""
     argv = ["python3", str(tool), "--repo", name, "--worktree", str(worktree)]
+    if has_token:
+        argv.append("--inject-github-token")
+    if config.BAKE_TEST_GROUP:
+        argv.append("--include-test-group")
+    return argv
+
+
+def _image_cache_env() -> tuple[dict | None, bool]:
+    """(env, has_token) for spawning ruby_image_cache. When a GitHub token is available, returns a COPY of
+    os.environ with GH_TOKEN set — WITHOUT mutating this long-lived process's global env (review #5: a
+    global mutation would leak the token into every later subprocess). Returns (None, False) when there's
+    no token, so the child just inherits the parent env unchanged."""
     tok = _gh_token()
     if tok:
-        argv += ["--build-arg", f"GITHUB_TOKEN={tok}"]
-    return argv
+        return {**os.environ, "GH_TOKEN": tok}, True
+    return None, False
 
 
 async def _docker(args: list[str], timeout: int = 120) -> int:
@@ -316,8 +373,9 @@ async def prep_image(state: OceanState) -> dict:
         if not (worktree / ".git").exists():
             results.append(f"{name}: skip (no local checkout to build from)"); continue
         try:
+            env, has_token = _image_cache_env()
             proc = await asyncio.create_subprocess_exec(
-                *_image_cache_argv(tool, name, worktree),
+                *_image_cache_argv(tool, name, worktree, has_token), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             try:
                 out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
@@ -355,8 +413,9 @@ async def prep_container(state: OceanState) -> dict:
     container = f"ocean-{name}-{exec_id}"
     try:
         # Resolve (cache-hit if prep_image already built it) the pre-warmed image tag.
+        env, has_token = _image_cache_env()
         proc = await asyncio.create_subprocess_exec(
-            *_image_cache_argv(tool, name, worktree),
+            *_image_cache_argv(tool, name, worktree, has_token), env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
@@ -672,7 +731,9 @@ async def sit_run(state: OceanState) -> dict:
     # Resource pre-flight (ocean-qa-agent-ac-driven-plan.md Workstream 3.4): fail fast, deterministically,
     # BEFORE spending an entire agent invocation on a Docker bring-up that's going to OOM (MM-13437's
     # full-chain attempt ground for ~40 min before hitting this exact documented ceiling).
-    reason = _docker_preflight_reason(state.get("target_repos"))
+    # Exclude THIS run's own containers (named with the exec_id — warm SIT stack + persistent container)
+    # from the over-commit check, so a WARM_SIT_INFRA retry isn't blocked by its own reused stack (review #4).
+    reason = _docker_preflight_reason(state.get("target_repos"), exclude_name_substr=exec_id)
     if reason:
         # Fail fast via TYPED STATE — do NOT hand-write a marker into the skill's own verdict file.
         # (That Python-into-skill-file mutation was the multi-writer fragility G3 removes: sit_triage

@@ -75,6 +75,17 @@ PERSISTENT_CONTAINER = os.environ.get("OCEAN_PIPELINE_PERSISTENT_CONTAINER", "1"
 # if anything about the stack differs, the skill just brings up a fresh stack as it does today.
 WARM_SIT_INFRA = os.environ.get("OCEAN_PIPELINE_WARM_SIT_INFRA", "0").lower() in ("1", "true", "yes")
 
+# Latency lever #7 — bake the `test` bundle group into the pre-warmed image (ruby_image_cache
+# --include-test-group) so the coder's unit rspec and the SIT run start test-ready and NEVER re-run
+# `bundle install` at runtime. WHY: EXE-1e3d6530 observed the coder running 49 runtime `bundle install`s
+# across two repos, each crawling under Rosetta, which pushed it past its wait window and the run was
+# killed with no verdict (manual-findings #4 / tracker #1+#16). DEFAULT OFF + fully fallback-safe: the
+# test-group child build is best-effort; if it fails, prep falls back to the prod image and the station
+# installs as it does today. Turn on per-run with OCEAN_PIPELINE_BAKE_TEST_GROUP=1 to validate, then flip
+# the default once a run confirms the -test image boots green. Pair with OCEAN_IMAGE_PLATFORM=linux/arm64
+# on Apple Silicon (ruby_image_cache reads it) to also drop Rosetta (manual-findings #15).
+BAKE_TEST_GROUP = os.environ.get("OCEAN_PIPELINE_BAKE_TEST_GROUP", "0").lower() in ("1", "true", "yes")
+
 
 def sit_infra_project(execution_id: str) -> str:
     """Deterministic compose project name for a run's SIT infra, so a retry reuses the SAME stack and
