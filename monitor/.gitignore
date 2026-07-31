@@ -1,0 +1,2 @@
+# Per-ticket run logs — ephemeral, may contain ticket-specific content; never committed.
+logs/

@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquaman Batch Monitor</title>
+<style>
+  :root {
+    --paper:#eef1ec; --panel:#fbfaf5; --panel-2:#f2f1e9; --ink:#12222f; --muted:#5b6f78;
+    --line:#d7ddd0; --line-2:#c7cfc0;
+    --accent:#2a4d8f; --ok:#1f7a5c; --ok-bg:#e3efe8; --warn:#b8842c; --warn-bg:#f5ecd9;
+    --crit:#b23b2e; --crit-bg:#f6e3e0; --pending:#8a9298;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:#0a1620; --panel:#0f2130; --panel-2:#0c1b28; --ink:#dfe9ec; --muted:#82a0ab;
+      --line:#1c3444; --line-2:#264257; --accent:#6f9adf; --ok:#34c295; --ok-bg:#0f2b23;
+      --warn:#d9a24c; --warn-bg:#2c2210; --crit:#e2665a; --crit-bg:#301715; --pending:#5d7481;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:#0a1620; --panel:#0f2130; --panel-2:#0c1b28; --ink:#dfe9ec; --muted:#82a0ab;
+    --line:#1c3444; --line-2:#264257; --accent:#6f9adf; --ok:#34c295; --ok-bg:#0f2b23;
+    --warn:#d9a24c; --warn-bg:#2c2210; --crit:#e2665a; --crit-bg:#301715; --pending:#5d7481;
+  }
+  :root[data-theme="light"] {
+    --paper:#eef1ec; --panel:#fbfaf5; --panel-2:#f2f1e9; --ink:#12222f; --muted:#5b6f78;
+    --line:#d7ddd0; --line-2:#c7cfc0; --accent:#2a4d8f; --ok:#1f7a5c; --ok-bg:#e3efe8;
+    --warn:#b8842c; --warn-bg:#f5ecd9; --crit:#b23b2e; --crit-bg:#f6e3e0; --pending:#8a9298;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--paper); color:var(--ink); font-family:var(--sans);
+    font-size:14px; line-height:1.5; min-height:100vh;
+  }
+  header {
+    padding:20px 26px; border-bottom:1px solid var(--line); background:var(--panel);
+    display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px;
+  }
+  header h1 { margin:0; font-family:var(--mono); font-size:18px; font-weight:700; }
+  header .sub { font-size:12px; color:var(--muted); margin-top:3px; }
+
+  .setup { max-width:640px; margin:40px auto; padding:0 20px; }
+  .setup label { font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+  .setup textarea {
+    width:100%; margin-top:8px; padding:12px; border-radius:10px; border:1px solid var(--line);
+    background:var(--panel); color:var(--ink); font-family:var(--mono); font-size:13px; resize:vertical;
+    min-height:90px;
+  }
+  .setup .hint { font-size:11.5px; color:var(--muted); margin-top:6px; }
+  button {
+    font-family:var(--sans); font-size:13px; font-weight:600; border-radius:8px; border:1px solid transparent;
+    padding:9px 16px; cursor:pointer;
+  }
+  button.primary { background:var(--accent); color:#fff; margin-top:14px; }
+  button.primary:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:transparent; border-color:var(--line); color:var(--ink); }
+
+  .cards { padding:22px 24px 40px; display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .card-head { padding:14px 16px 12px; border-bottom:1px solid var(--line); }
+  .card-head .ticket { font-family:var(--mono); font-size:15px; font-weight:700; }
+  .pill {
+    display:inline-flex; align-items:center; gap:6px; margin-top:8px; padding:3px 9px; border-radius:100px;
+    font-family:var(--mono); font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+  }
+  .pill .d { width:6px; height:6px; border-radius:50%; background:currentColor; }
+  .pill.queued { background:var(--panel-2); color:var(--pending); }
+  .pill.running { background:var(--warn-bg); color:var(--warn); }
+  .pill.paused { background:var(--warn-bg); color:var(--warn); }
+  .pill.done { background:var(--ok-bg); color:var(--ok); }
+  .pill.failed { background:var(--crit-bg); color:var(--crit); }
+
+  .stepper { padding:12px 16px 6px; }
+  .step { display:grid; grid-template-columns:18px 1fr; column-gap:10px; padding-bottom:10px; }
+  .marker { width:17px; height:17px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:800; }
+  .step.ok .marker { background:var(--ok); color:var(--panel); }
+  .step.crit .marker { background:var(--crit); color:var(--panel); }
+  .step.running .marker { background:var(--accent); color:var(--panel); animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+  .step-name { font-family:var(--mono); font-size:11.5px; font-weight:650; }
+  .step-meta { display:flex; gap:8px; font-family:var(--mono); font-size:10px; color:var(--muted); margin-top:2px; }
+  .step-hi { font-size:11px; color:var(--muted); margin-top:2px; }
+
+  .gate { margin:10px 16px 16px; padding:12px; border-radius:10px; background:var(--warn-bg); border:1px solid var(--warn); }
+  .gate .msg { font-size:11.5px; color:var(--ink); margin-bottom:9px; white-space:pre-wrap; }
+  .gate .actions { display:flex; flex-wrap:wrap; gap:8px; }
+  .gate button { font-size:11.5px; padding:6px 10px; }
+  .gate textarea { width:100%; margin-top:8px; min-height:50px; font-family:var(--sans); font-size:12px; padding:8px; border-radius:6px; border:1px solid var(--line); }
+
+  .foot { padding:10px 16px 14px; border-top:1px solid var(--line); background:var(--panel-2); font-family:var(--mono); font-size:11px; color:var(--muted); }
+  .foot b { color:var(--ink); }
+
+  .rawlog { border-top:1px solid var(--line); }
+  .rawlog summary {
+    cursor:pointer; padding:9px 16px; font-family:var(--mono); font-size:10.5px;
+    text-transform:uppercase; letter-spacing:.07em; color:var(--muted); user-select:none;
+  }
+  .rawlog[open] summary { border-bottom:1px solid var(--line); }
+  .rawlog pre {
+    margin:0; padding:10px 14px; max-height:220px; overflow:auto; background:var(--panel-2);
+    font-family:var(--mono); font-size:10.5px; line-height:1.5; white-space:pre-wrap; word-break:break-word;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Aquaman Batch Monitor</h1>
+      <div class="sub">Sequential ocean-pipeline runs, live station-by-station</div>
+    </div>
+  </header>
+
+  <div id="setup" class="setup">
+    <label for="tickets">Ticket IDs (one per line, or comma-separated)</label>
+    <textarea id="tickets" placeholder="MM-14601&#10;MM-14602&#10;MM-14603"></textarea>
+    <div class="hint">Runs strictly one at a time — never in parallel. The underlying process
+      always runs verbose; this UI only ever shows team-level station outcomes, with the
+      full raw stream available in the terminal, the log file, and the panel below each card.</div>
+    <button class="primary" id="start">Start batch</button>
+  </div>
+
+  <div id="cards" class="cards" style="display:none"></div>
+
+<script>
+let batchId = null;
+let poller = null;
+
+document.getElementById("start").addEventListener("click", async () => {
+  const raw = document.getElementById("tickets").value;
+  const tickets = raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  if (!tickets.length) return;
+  const btn = document.getElementById("start");
+  btn.disabled = true; btn.textContent = "Starting…";
+  const res = await fetch("/batches", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({tickets}),
+  });
+  const data = await res.json();
+  batchId = data.batch_id;
+  document.getElementById("setup").style.display = "none";
+  document.getElementById("cards").style.display = "grid";
+  poll();
+  poller = setInterval(poll, 2000);
+});
+
+async function poll() {
+  if (!batchId) return;
+  const res = await fetch(`/batches/${batchId}`);
+  if (!res.ok) return;
+  render(await res.json());
+}
+
+function esc(s) {
+  return (s || "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+}
+
+const openLogs = new Set(); // tickets whose "Raw output" panel is currently expanded
+
+function render(batch) {
+  const root = document.getElementById("cards");
+  root.innerHTML = batch.tickets.map(cardHtml).join("");
+  batch.tickets.forEach(t => {
+    if (t.status !== "paused") return;
+    const approveBtn = document.getElementById(`gate-approve-${t.ticket}`);
+    const rejectBtn = document.getElementById(`gate-reject-${t.ticket}`);
+    const qaBtns = document.querySelectorAll(`[data-qa-for="${t.ticket}"]`);
+    if (approveBtn) approveBtn.onclick = () => resume(t.ticket, "approve");
+    if (rejectBtn) rejectBtn.onclick = () => resume(t.ticket, "reject");
+    qaBtns.forEach(b => b.onclick = () => resume(t.ticket, b.dataset.decision));
+  });
+
+  // innerHTML replacement above resets <details open> and scroll — restore both so
+  // an expanded raw-log panel keeps following the tail across polls, like `tail -f`.
+  root.querySelectorAll(".rawlog").forEach(el => {
+    const ticket = el.dataset.ticket;
+    el.addEventListener("toggle", () => {
+      if (el.open) openLogs.add(ticket); else openLogs.delete(ticket);
+    });
+    if (openLogs.has(ticket)) {
+      el.open = true;
+      const pre = el.querySelector("pre");
+      if (pre) pre.scrollTop = pre.scrollHeight;
+    }
+  });
+}
+
+async function resume(ticket, decision) {
+  const noteEl = document.getElementById(`note-${ticket}`);
+  const note = noteEl ? noteEl.value : "";
+  await fetch(`/batches/${batchId}/resume`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({decision, note}),
+  });
+  poll();
+}
+
+function cardHtml(t) {
+  const steps = t.events.map(e => `
+    <div class="step ${e.state}">
+      <div class="marker">${e.state === "ok" ? "✓" : e.state === "crit" ? "✕" : "…"}</div>
+      <div>
+        <div class="step-name">${esc(e.label)}</div>
+        ${e.elapsed ? `<div class="step-meta"><span>${esc(e.elapsed)}</span></div>` : ""}
+        ${e.highlight ? `<div class="step-hi">${esc(e.highlight)}</div>` : ""}
+      </div>
+    </div>`).join("");
+
+  let gate = "";
+  if (t.status === "paused") {
+    if (t.paused_gate === "qa_review_gate") {
+      gate = `<div class="gate">
+        <div class="msg">${esc(t.paused_message)}</div>
+        <div class="actions">
+          <button data-qa-for="${t.ticket}" data-decision="approve_testrail">Approve + TestRail</button>
+          <button data-qa-for="${t.ticket}" data-decision="approve_no_testrail">Approve, no TestRail</button>
+          <button data-qa-for="${t.ticket}" data-decision="changes">Request changes</button>
+        </div>
+        <textarea id="note-${t.ticket}" placeholder="Feedback for a redraft (optional)"></textarea>
+      </div>`;
+    } else {
+      gate = `<div class="gate">
+        <div class="msg">${esc(t.paused_message)}</div>
+        <div class="actions">
+          <button id="gate-approve-${t.ticket}">Approve</button>
+          <button id="gate-reject-${t.ticket}" class="ghost">Reject</button>
+        </div>
+      </div>`;
+    }
+  }
+
+  const foot = (t.status === "done" || t.status === "failed") ? `
+    <div class="foot">
+      <b>${esc(t.final_status || t.status)}</b> — ${esc(t.final_outcome || "")}
+      ${t.pr_number ? ` — PR #${t.pr_number}` : ""}
+    </div>` : "";
+
+  return `
+    <div class="card">
+      <div class="card-head">
+        <div class="ticket">${esc(t.ticket)}</div>
+        <div class="pill ${t.status}"><span class="d"></span>${esc(t.status)}</div>
+        ${t.execution_id ? `<div class="step-meta" style="margin-top:6px">${esc(t.execution_id)}</div>` : ""}
+        ${t.log_path ? `<div class="step-meta" title="tail -f this file for the FULL verbose stream">${esc(t.log_path)}</div>` : ""}
+      </div>
+      <div class="stepper">${steps}</div>
+      ${gate}
+      ${foot}
+      <details class="rawlog" data-ticket="${esc(t.ticket)}">
+        <summary>Team-level log (${(t.raw_tail || []).length} lines) — verbose stream is in the terminal &amp; log file</summary>
+        <pre>${esc((t.raw_tail || []).join("\n"))}</pre>
+      </details>
+    </div>`;
+}
+</script>
+</body>
+</html>
