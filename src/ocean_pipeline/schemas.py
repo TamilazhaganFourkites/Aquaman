@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 # ---- generic per-node verdicts (written via run_agent's contract) -------
@@ -75,6 +75,21 @@ class ReviewVerdict(BaseModel):
     verdict: Literal["APPROVE", "CHANGES_REQUIRED"]
     findings: list[dict] = Field(default_factory=list)   # [{severity, file, summary}]
 
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _normalize_verdict(cls, v):
+        """Normalize the near-miss forms a reviewer naturally writes so a wording variant can't crash
+        Station 5 (A1-5): case, and APPROVED→APPROVE / CHANGES_REQUESTED→CHANGES_REQUIRED. Anything that
+        isn't clearly an approval maps to CHANGES_REQUIRED (fail-safe — never auto-approve on ambiguity)."""
+        if not isinstance(v, str):
+            return v
+        s = v.strip().upper().replace("-", "_").replace(" ", "_")
+        if s in ("APPROVE", "APPROVED", "APPROVAL", "LGTM", "PASS"):
+            return "APPROVE"
+        if s in ("CHANGES_REQUIRED", "CHANGES_REQUESTED", "REQUEST_CHANGES", "REJECT", "REJECTED", "FAIL"):
+            return "CHANGES_REQUIRED"
+        return "CHANGES_REQUIRED"
+
     # R3: the review worker emits critical_count/major_count/minor_count but often leaves them
     # null even when findings[] is non-empty, so telemetry/gating that reads counts sees nothing.
     # Derive them here from findings[] (the single source of truth) so they are ALWAYS populated
@@ -101,7 +116,7 @@ class ReviewVerdict(BaseModel):
 
 # ---- Station 6: mirrors ocean-automation-testing SKILL.md Station 3 verdict --
 class AutomationTest(BaseModel):
-    name: str
+    name: str = ""            # was required; defaulted so a test element missing `name` can't crash the run
     testrail_id: int = 0
     result: str = ""
     detail: str = ""
@@ -149,6 +164,59 @@ class AutomationVerdict(BaseModel):
     # that never emits these is fully backward-compatible.
     needs_onboarding: bool = False
     onboard_repo: str = ""            # the ocean repo the SIT could not run because it is unsupported
+
+    @field_validator("changed_repos", "dependencies", "tests", "findings_for_coder", mode="before")
+    @classmethod
+    def _coerce_list_fields(cls, v, info):
+        """Tolerate the shapes a triage worker naturally emits, so a run that ACTUALLY completed the SIT
+        never dies at the finish line on a JSON-shape nit (EXE-968500e9: a 70-min run FAILED only because
+        the verdict serialized `changed_repos` as bare strings and `dependencies` as null). Works for
+        single- AND multi-repo tickets — it maps a list of ANY length:
+          * `null` → `[]`  (a worker often nulls an empty list field)
+          * repo-bearing lists (`changed_repos`/`dependencies`): a bare string `"repo-name"` (the
+            CHANGED_REPOS input form) → `{"repo": "repo-name"}`
+          * `tests`: a bare string `"test_x"` → `{"name": "test_x"}` (A1-4)
+          * already-correct objects pass through untouched."""
+        if v is None:
+            return []
+        if isinstance(v, list):
+            if info.field_name in ("changed_repos", "dependencies"):
+                return [{"repo": x} if isinstance(x, str) else x for x in v]
+            if info.field_name == "tests":
+                return [{"name": x} if isinstance(x, str) else x for x in v]
+        return v
+
+    @field_validator("automation_result", mode="before")
+    @classmethod
+    def _coerce_result(cls, v):
+        """Only `passed`/`failed` are canonical, but the skill's prose invites `could_not_run` /
+        `could_not_verify` / `error` at the top level (A1-2). Map every non-pass to `failed` (the real
+        pass/fail lives in tests[]; the failure NUANCE lives in failure_class), so a vocabulary slip
+        can't crash the run at model_validate. FAIL-SAFE: only the exact `passed`/`pass` count as a pass —
+        NOT weak synonyms like `ok`/`green` (which a worker might mean as 'the process ran ok', not 'tests
+        passed'), so this validator can never manufacture a false-green flip to ready (judge MINOR-4)."""
+        if not isinstance(v, str):
+            return v
+        return "passed" if v.strip().lower() in ("passed", "pass") else "failed"
+
+    @field_validator("failure_class", mode="before")
+    @classmethod
+    def _coerce_failure_class(cls, v):
+        """Keep only the 4 canonical classes; fold the skill's other triage words in (A1-3): `test_fault`
+        is never terminal → "" (cleared); `could_not_run` → `could_not_verify`; an obvious code-fault
+        SYNONYM → `code_fault` so the coder rework loop still fires (judge MINOR-5: `after_sit_triage`
+        loops back to the coder ONLY on exact `code_fault`); anything else unknown → `could_not_verify`
+        (the safe non-looping terminal). None/"" stays ""."""
+        if not isinstance(v, str):
+            return ""
+        s = v.strip().lower()
+        if s in ("", "code_fault", "could_not_verify", "environment_failure"):
+            return s
+        if s == "test_fault":
+            return ""
+        if s in ("code_defect", "coder_fault", "code_bug", "bug", "defect", "codefault"):
+            return "code_fault"
+        return "could_not_verify"
     # AC traceability (ocean-qa-agent-ac-driven-plan.md): which acceptance criterion each test verifies.
     # Additive + optional — a skill that doesn't emit this yet is fully backward-compatible.
     ac_coverage: list[dict] = Field(default_factory=list)   # [{"ac": "AC3", "test": "test_...", "result": "passed"}]

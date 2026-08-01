@@ -9,11 +9,13 @@ Two kinds of node:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from . import agents, config, gitops, jira, schemas, telemetry
@@ -42,6 +44,156 @@ def _docker_resources() -> tuple[float, int] | None:
         return info["MemTotal"] / (1024 ** 3), info["NCPU"]
     except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
         return None
+
+
+# ---- SIT concurrency slots (manual-findings #18): a cross-process counting semaphore over N flock files.
+# Held for the lifetime of a run's SIT stack (sit_run acquires → teardown_container releases). The fd lives
+# in this module-global registry keyed by execution_id (one graph == one process); the FILE lock is what
+# coordinates across separate terminals/processes. A crashed holder's flock auto-releases (kernel), so a
+# slot can never leak permanently.
+_SIT_SLOT_FDS: dict = {}
+
+
+def _sit_slot_dir() -> Path:
+    d = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline")) / "sit-slots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _try_acquire_sit_slot(execution_id: str) -> bool:
+    """ONE non-blocking pass: grab a free slot if any is free, else return False. Fast + synchronous (the
+    flock attempts are LOCK_NB), so it's safe to call from the async waiter without an executor. Idempotent
+    per exec_id (a retry re-entering sit_run keeps its existing slot)."""
+    if execution_id in _SIT_SLOT_FDS:
+        return True
+    n = max(1, config.MAX_CONCURRENT_SIT)
+    for i in range(n):
+        fd = open(_sit_slot_dir() / f"slot-{i}.lock", "w")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fd.close()
+            continue
+        _SIT_SLOT_FDS[execution_id] = fd
+        return True
+    return False
+
+
+async def _acquire_sit_slot(execution_id: str) -> str:
+    """Wait (INTERRUPTIBLY) for a free SIT slot, then hold it. Polls `_try_acquire_sit_slot` between
+    `await asyncio.sleep`s — so a cancel/Ctrl-C is observed immediately (unlike a blocking thread, which
+    the interpreter would have to join at exit — review #1). Gives up after SIT_SLOT_WAIT_SECONDS and
+    proceeds anyway (the preflight over-commit check is the backstop) so a wedged holder can't deadlock."""
+    if _try_acquire_sit_slot(execution_id):
+        return "held" if execution_id in _SIT_SLOT_FDS else "acquired"
+    deadline = time.monotonic() + max(0, config.SIT_SLOT_WAIT_SECONDS)
+    while True:
+        await asyncio.sleep(5.0)
+        if _try_acquire_sit_slot(execution_id):
+            return "acquired after waiting"
+        if time.monotonic() >= deadline:
+            return f"no free slot after {config.SIT_SLOT_WAIT_SECONDS}s — proceeding (preflight is the backstop)"
+
+
+def _release_sit_slot(execution_id: str) -> None:
+    fd = _SIT_SLOT_FDS.pop(execution_id, None)
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    finally:
+        fd.close()
+
+
+def _any_docker_repo(target_repos) -> bool:
+    """True if ANY repo in target_repos is Ruby/Docker-run (per AGENT_GUARDRAILS in agents.py — Go/Java
+    run native, 0 Docker-VM footprint). Same predicate prep_image/prep_container already use inline
+    (kept inline there too, not refactored, to keep this change additive-only) — a ticket touching only
+    Go/Java repos must never wait on the build-slot pool below at all."""
+    return any(
+        "docker" in (r.get("build_env") or "").lower() or (r.get("language") or "").lower() == "ruby"
+        for r in (target_repos or []) if isinstance(r, dict)
+    )
+
+
+# ---- Build-slot concurrency pool: a SEPARATE cross-process counting semaphore (config.MAX_CONCURRENT_BUILDS)
+# from the SIT slot above, gating prep_image / prep_container / coder / harsh_reviewer / reachability_gate —
+# the Docker-heavy stages that had ZERO capacity protection before this (only sit_run did, via the SIT slot).
+# Unlike the SIT slot, a free flock slot here is NOT sufficient on its own: _try_acquire_build_slot ALSO
+# requires live Docker headroom (via _docker_resources/_docker_used_gb) for
+# config.docker_budget_for_build(target_repos) before reporting success — a fixed slot COUNT doesn't bound
+# real memory (one ticket's Ruby bundle install could be 1.5 GB, another's much heavier), so the live read
+# is the actual safety backstop; the count only bounds how many things can be TRYING at once. This is what
+# lets the two pools compose safely: both ultimately defer to the same `docker stats` ground truth, so a
+# live SIT stack from another process is visible to a build-slot acquisition attempt, and vice versa.
+_BUILD_SLOT_FDS: dict = {}
+
+
+def _build_slot_dir() -> Path:
+    d = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline")) / "build-slots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _try_acquire_build_slot(execution_id: str, target_repos=None) -> bool:
+    """ONE non-blocking pass: grab a free slot AND confirm live Docker headroom, else return False (and
+    release any slot grabbed along the way — never hold a slot while denying the acquisition). Idempotent
+    per exec_id (a retry keeps its existing hold). If Docker usage can't be measured
+    (_docker_resources/_docker_used_gb return None), proceed permissively — this is best-effort capacity
+    protection layered onto whatever already-fallback-safe stage calls it, not a hard preflight gate (that
+    contract belongs to _docker_preflight_reason, used only by sit_run)."""
+    if execution_id in _BUILD_SLOT_FDS:
+        return True
+    n = max(1, config.MAX_CONCURRENT_BUILDS)
+    fd = None
+    for i in range(n):
+        candidate = open(_build_slot_dir() / f"slot-{i}.lock", "w")
+        try:
+            fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            candidate.close()
+            continue
+        fd = candidate
+        break
+    if fd is None:
+        return False
+    resources = _docker_resources()
+    if resources is not None:
+        mem_gb, _cpus = resources
+        used_gb = _docker_used_gb(exclude_name_substr=execution_id)
+        needed_gb = config.docker_budget_for_build(target_repos)
+        if used_gb is not None and (mem_gb - used_gb) < needed_gb:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            fd.close()
+            return False
+    _BUILD_SLOT_FDS[execution_id] = fd
+    return True
+
+
+async def _acquire_build_slot(execution_id: str, target_repos=None) -> str:
+    """Wait (INTERRUPTIBLY) for a free build slot + headroom, then hold it. Same shape as
+    _acquire_sit_slot: polls _try_acquire_build_slot between `await asyncio.sleep(5.0)`s (a cancel is
+    observed immediately), gives up after config.BUILD_SLOT_WAIT_SECONDS and proceeds anyway — a queue,
+    not a crash, same philosophy as the SIT slot."""
+    if _try_acquire_build_slot(execution_id, target_repos):
+        return "held" if execution_id in _BUILD_SLOT_FDS else "acquired"
+    deadline = time.monotonic() + max(0, config.BUILD_SLOT_WAIT_SECONDS)
+    while True:
+        await asyncio.sleep(5.0)
+        if _try_acquire_build_slot(execution_id, target_repos):
+            return "acquired after waiting"
+        if time.monotonic() >= deadline:
+            return f"no free build slot/headroom after {config.BUILD_SLOT_WAIT_SECONDS}s — proceeding"
+
+
+def _release_build_slot(execution_id: str) -> None:
+    fd = _BUILD_SLOT_FDS.pop(execution_id, None)
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    finally:
+        fd.close()
 
 
 def _docker_used_gb(exclude_name_substr: str = "") -> float | None:
@@ -359,35 +511,46 @@ async def prep_image(state: OceanState) -> dict:
     ruby_image_cache, so a warm cache returns fast."""
     exec_id = state["execution_id"]
     telemetry.station_event(exec_id, 0.6, "start")
-    tool = config.FK_AIDEVELOPER_DIR / "skills" / "ocean-qa-agent" / "tools" / "ruby_image_cache.py"
-    results: list[str] = []
-    for r in (state.get("target_repos") or []):
-        repo = r.get("repo", "")
-        name = repo.split("/")[-1]
-        is_ruby = "docker" in (r.get("build_env") or "").lower() or (r.get("language") or "").lower() == "ruby"
-        worktree = config.PROJECTS_ROOT / name
-        if not repo or not is_ruby:
-            continue
-        if not tool.exists():
-            results.append(f"{name}: skip (image-cache tool not found)"); continue
-        if not (worktree / ".git").exists():
-            results.append(f"{name}: skip (no local checkout to build from)"); continue
-        try:
-            env, has_token = _image_cache_env()
-            proc = await asyncio.create_subprocess_exec(
-                *_image_cache_argv(tool, name, worktree, has_token), env=env,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    target_repos = state.get("target_repos") or []
+    # Build-slot capacity gate (only for Ruby/Docker tickets — a Go/Java-only ticket never even
+    # attempts this): non-blocking single try, matching this function's own already-fallback-safe
+    # posture. No slot/headroom -> skip the WHOLE prewarm cleanly (not a partial run) — the coder just
+    # builds normally, exactly like every other "no-op" path this function already has.
+    if _any_docker_repo(target_repos) and not _try_acquire_build_slot(exec_id, target_repos):
+        telemetry.station_event(exec_id, 0.6, "skip", reason="no build capacity (slot/headroom)")
+        return {}
+    try:
+        tool = config.FK_AIDEVELOPER_DIR / "skills" / "ocean-qa-agent" / "tools" / "ruby_image_cache.py"
+        results: list[str] = []
+        for r in target_repos:
+            repo = r.get("repo", "")
+            name = repo.split("/")[-1]
+            is_ruby = "docker" in (r.get("build_env") or "").lower() or (r.get("language") or "").lower() == "ruby"
+            worktree = config.PROJECTS_ROOT / name
+            if not repo or not is_ruby:
+                continue
+            if not tool.exists():
+                results.append(f"{name}: skip (image-cache tool not found)"); continue
+            if not (worktree / ".git").exists():
+                results.append(f"{name}: skip (no local checkout to build from)"); continue
             try:
-                out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                results.append(f"{name}: prewarm timed out (coder will build)"); continue
-            tail = ((out or b"").decode(errors="replace").strip().splitlines() or [""])[-1]
-            results.append(f"{name}: {'ready' if proc.returncode == 0 else 'build failed'} ({tail[:80]})")
-        except OSError as e:
-            results.append(f"{name}: prewarm error ({e})")
-    telemetry.station_event(exec_id, 0.6, "end", prewarm="; ".join(results) or "no ruby target to prewarm")
-    return {}
+                env, has_token = _image_cache_env()
+                proc = await asyncio.create_subprocess_exec(
+                    *_image_cache_argv(tool, name, worktree, has_token), env=env,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                try:
+                    out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    results.append(f"{name}: prewarm timed out (coder will build)"); continue
+                tail = ((out or b"").decode(errors="replace").strip().splitlines() or [""])[-1]
+                results.append(f"{name}: {'ready' if proc.returncode == 0 else 'build failed'} ({tail[:80]})")
+            except OSError as e:
+                results.append(f"{name}: prewarm error ({e})")
+        telemetry.station_event(exec_id, 0.6, "end", prewarm="; ".join(results) or "no ruby target to prewarm")
+        return {}
+    finally:
+        _release_build_slot(exec_id)
 
 
 # ------------------------------------------------------------------ Station 3.5 — persistent container
@@ -410,6 +573,16 @@ async def prep_container(state: OceanState) -> dict:
     if not shutil.which("docker") or not tool.exists() or not (worktree / ".git").exists():
         telemetry.station_event(exec_id, 3.5, "skip", reason="docker / image-cache tool / checkout absent")
         return {"container_ready": False}
+    # Build-slot capacity gate: non-blocking single try (this function is already best-effort/
+    # fallback-safe — coder/harsh_reviewer/reachability_gate all have their own recipe for
+    # container_ready=False). Deliberately NOT released here on success: this hold spans the whole
+    # PERSISTENT_CONTAINER lifetime (coder -> harsh_reviewer -> sit_run all REUSE this same container
+    # via _container_directive) and is released only by teardown_container — a container sitting idle
+    # between stages is still consuming real Docker memory the whole time, so the capacity hold must
+    # reflect that, not just the moment this function itself is running.
+    if not _try_acquire_build_slot(exec_id, state.get("target_repos")):
+        telemetry.station_event(exec_id, 3.5, "skip", reason="no build capacity (slot/headroom)")
+        return {"container_ready": False}
     container = f"ocean-{name}-{exec_id}"
     try:
         # Resolve (cache-hit if prep_image already built it) the pre-warmed image tag.
@@ -422,19 +595,24 @@ async def prep_container(state: OceanState) -> dict:
         except asyncio.TimeoutError:
             proc.kill()
             telemetry.station_event(exec_id, 3.5, "skip", reason="image resolve timed out")
+            _release_build_slot(exec_id)   # nothing came up — don't hold capacity for it
             return {"container_ready": False}
         tag = (((out or b"").decode(errors="replace").strip().splitlines() or [""])[-1]) if proc.returncode == 0 else ""
         if not tag:
             telemetry.station_event(exec_id, 3.5, "skip", reason="image tag unresolved")
+            _release_build_slot(exec_id)
             return {"container_ready": False}
         await _docker(["rm", "-f", container])           # clear any stale same-named container
         started = await _docker(["run", "-d", "--name", container, "--entrypoint", "sleep", tag, "infinity"])
         ready = started == 0
         telemetry.station_event(exec_id, 3.5, "end",
                                 container=container if ready else f"start failed (docker exit {started})")
+        if not ready:
+            _release_build_slot(exec_id)   # start failed — nothing to hold capacity for
         return {"container_name": container if ready else "", "container_ready": ready}
     except OSError as e:
         telemetry.station_event(exec_id, 3.5, "skip", reason=f"prep error ({e})")
+        _release_build_slot(exec_id)
         return {"container_ready": False}
 
 
@@ -453,6 +631,12 @@ async def teardown_container(state: OceanState) -> dict:
         # remove the compose project AND any stray containers labeled/named for it (best-effort both ways)
         await _docker(["compose", "-p", project, "down", "-v", "--remove-orphans"], timeout=180)
         removed.append(project)
+    # Release the SIT concurrency slot (manual-findings #18) so a queued run can proceed. Safe/no-op if
+    # this run never acquired one; the stack is being torn down above, so the slot is genuinely free now.
+    _release_sit_slot(exec_id)
+    # Release the build-slot hold prep_container acquired (spans coder/harsh_reviewer/sit_run's reuse
+    # of the same persistent container) — safe/no-op if this run never acquired one.
+    _release_build_slot(exec_id)
     if removed:
         telemetry.station_event(exec_id, 3.6, "end", removed="; ".join(removed))
     return {}
@@ -480,17 +664,29 @@ async def dep_resolver(state: OceanState) -> dict:
 # ------------------------------------------------------------------ Station 1.5
 async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
-    v: schemas.ReachabilityVerdict = await agents.run_agent(
-        agent_md="reachability.md",   # ocean-coding-agent worker (fk-aideveloper single source)
-        node="reachability_gate",
-        ticket_id=state["ticket_id"],
-        execution_id=state["execution_id"],
-        task_prompt=(
-            f"Execution-verify every ALREADY_MET / self-solve / blocked / cross-repo claim for "
-            f"{state['ticket_id']}. Emit the binding reachability-report.json.\n\n{_summary(state)}"
-        ),
-        verdict_model=schemas.ReachabilityVerdict,
-    )
+    # Same build-slot gate as coder/harsh_reviewer — defensive here specifically: reachability's own
+    # Docker usage (a fallback ruby_image_cache.py call in reachability.md) isn't confirmed wired to
+    # _container_directive today, so this errs toward protecting it; can be removed later if a
+    # transcript audit shows reachability never actually touches Docker in practice.
+    own_build_slot = _any_docker_repo(state.get("target_repos")) and not state.get("container_ready")
+    if own_build_slot:
+        slot = await _acquire_build_slot(state["execution_id"], state.get("target_repos"))
+        telemetry.station_event(state["execution_id"], 1.5, "build_slot", build_slot=slot)
+    try:
+        v: schemas.ReachabilityVerdict = await agents.run_agent(
+            agent_md="reachability.md",   # ocean-coding-agent worker (fk-aideveloper single source)
+            node="reachability_gate",
+            ticket_id=state["ticket_id"],
+            execution_id=state["execution_id"],
+            task_prompt=(
+                f"Execution-verify every ALREADY_MET / self-solve / blocked / cross-repo claim for "
+                f"{state['ticket_id']}. Emit the binding reachability-report.json.\n\n{_summary(state)}"
+            ),
+            verdict_model=schemas.ReachabilityVerdict,
+        )
+    finally:
+        if own_build_slot:
+            _release_build_slot(state["execution_id"])
     telemetry.station_event(state["execution_id"], 1.5, "end", blocking=v.blocking)
     return {"reachability_report": _load_json(v.report_path), "reachability_blocking": v.blocking}
 
@@ -519,27 +715,56 @@ async def coder(state: OceanState) -> dict:
     # The graph owns the clone location: the coder clones into a per-run workspace and works
     # there, so the reviewer and any rework pass run against the SAME tree (reuse on re-entry).
     workspace = config.workspace_dir(state["execution_id"])
-    v: schemas.CoderVerdict = await agents.run_agent(
-        agent_md="code.md",   # ocean-coding-agent worker (fk-aideveloper single source)
-        node="coder",
-        ticket_id=state["ticket_id"],
-        execution_id=state["execution_id"],
-        cwd=workspace,
-        task_prompt=(
-            f"Decompose and implement {state['ticket_id']} per FK North Star. isbu: commit + PUSH "
-            f"the branch and STOP (no PR — the graph opens it).{rework}\n\n"
-            f"WORKSPACE: clone the target repo into {workspace} and do all work there. If the clone "
-            f"already exists (a rework pass re-enters here), reuse it — `git fetch` + checkout the "
-            f"ticket branch — do NOT re-clone. Report its absolute path as repo_dir.\n\n"
-            f"Binding reachability report (build what it says is NOT_YET_BUILT; do not re-litigate "
-            f"its verdicts):\n{_brief(state.get('reachability_report'), limit=12000)}\n\n"
-            f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}\n\n"
-            f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
-            f"{_summary(state)}"
-            f"{_container_directive(state, str(workspace))}"
-        ),
-        verdict_model=schemas.CoderVerdict,
-    )
+
+    # Resume-awareness (manual-findings #16): if a PRIOR attempt was killed mid-run, run_agent left a
+    # coder.partial.json breadcrumb with its committed git state. Tell the coder to CONTINUE that branch
+    # instead of starting over — so a kill mid-coder no longer discards the committed work.
+    partial = config.artifacts_dir(state["execution_id"]) / "coder.partial.json"
+    resume_hint = ""
+    if partial.exists():
+        resume_hint = (
+            f"\n\nRESUME — a PRIOR coder attempt was interrupted (killed/timed out) before it finished or "
+            f"wrote a verdict. Its captured git state:\n{_brief(_load_json(str(partial)))}\n"
+            f"Do NOT start over. `git fetch` + checkout the ticket branch, run `git log --oneline "
+            f"<base>..HEAD` to see what that attempt already committed, VERIFY it against the ticket, then "
+            f"implement ONLY what is still missing, re-push, and STOP.\n"
+        )
+
+    # Build-slot capacity gate: the worker below runs Ruby `bundle install`/rspec IN DOCKER for a
+    # Docker-run repo (AGENT_GUARDRAILS) — invisible to a Python-level check unless the slot is held
+    # by THIS parent process before the worker is even spawned (the worker's own direct calls to
+    # ruby_image_cache.py are then already covered, since it can only run while this hold exists).
+    # Skip entirely when prep_container already holds a hold spanning this whole persistent-container
+    # phase (container_ready), or when no target repo is Docker/Ruby at all (Go/Java tickets never wait).
+    own_build_slot = _any_docker_repo(state.get("target_repos")) and not state.get("container_ready")
+    if own_build_slot:
+        slot = await _acquire_build_slot(state["execution_id"], state.get("target_repos"))
+        telemetry.station_event(state["execution_id"], 4, "build_slot", build_slot=slot)
+    try:
+        v: schemas.CoderVerdict = await agents.run_agent(
+            agent_md="code.md",   # ocean-coding-agent worker (fk-aideveloper single source)
+            node="coder",
+            ticket_id=state["ticket_id"],
+            execution_id=state["execution_id"],
+            cwd=workspace,
+            task_prompt=(
+                f"Decompose and implement {state['ticket_id']} per FK North Star. isbu: commit + PUSH "
+                f"the branch and STOP (no PR — the graph opens it).{rework}{resume_hint}\n\n"
+                f"WORKSPACE: clone the target repo into {workspace} and do all work there. If the clone "
+                f"already exists (a rework pass re-enters here), reuse it — `git fetch` + checkout the "
+                f"ticket branch — do NOT re-clone. Report its absolute path as repo_dir.\n\n"
+                f"Binding reachability report (build what it says is NOT_YET_BUILT; do not re-litigate "
+                f"its verdicts):\n{_brief(state.get('reachability_report'), limit=12000)}\n\n"
+                f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}\n\n"
+                f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
+                f"{_summary(state)}"
+                f"{_container_directive(state, str(workspace))}"
+            ),
+            verdict_model=schemas.CoderVerdict,
+        )
+    finally:
+        if own_build_slot:
+            _release_build_slot(state["execution_id"])
     telemetry.station_event(state["execution_id"], 4, "end")
     # A fresh code pass supersedes prior SIT findings; clear them once addressed.
     # Persist WHICH repo the coder pushed to + WHERE the clone lives + the PR title/body it
@@ -560,24 +785,34 @@ async def harsh_reviewer(state: OceanState) -> dict:
     # Review in the SAME clone the coder pushed from, so `git diff` + independent test
     # re-execution see the real tree (falls back to the default cwd if unset).
     wt = state.get("worktree_dir") or ""
-    v: schemas.ReviewVerdict = await agents.run_agent(
-        agent_md="review.md",   # ocean-coding-agent worker (fk-aideveloper single source)
-        node="harsh_reviewer",
-        ticket_id=state["ticket_id"],
-        execution_id=state["execution_id"],
-        cwd=Path(wt) if wt else None,
-        task_prompt=(
-            f"Adversarially review the pushed committed diff on branch {state.get('branch')} for "
-            f"{state['ticket_id']} (review round {iteration + 1}) in the clone at "
-            f"{wt or '(the current directory)'}. Get the diff with `git diff <base>...HEAD`. "
-            f"Classify every finding CRITICAL/MAJOR/MINOR. APPROVE only at zero CRITICAL and zero "
-            f"MAJOR.\n\n"
-            f"Research summary (for AC context):\n{_brief(state.get('research_packet'))}\n\n"
-            f"{_summary(state)}"
-            f"{_container_directive(state, wt)}"
-        ),
-        verdict_model=schemas.ReviewVerdict,
-    )
+    # Same build-slot gate as coder — skipped when prep_container's hold already covers this phase
+    # (container_ready) or the ticket has no Docker/Ruby repo at all.
+    own_build_slot = _any_docker_repo(state.get("target_repos")) and not state.get("container_ready")
+    if own_build_slot:
+        slot = await _acquire_build_slot(state["execution_id"], state.get("target_repos"))
+        telemetry.station_event(state["execution_id"], 5, "build_slot", build_slot=slot)
+    try:
+        v: schemas.ReviewVerdict = await agents.run_agent(
+            agent_md="review.md",   # ocean-coding-agent worker (fk-aideveloper single source)
+            node="harsh_reviewer",
+            ticket_id=state["ticket_id"],
+            execution_id=state["execution_id"],
+            cwd=Path(wt) if wt else None,
+            task_prompt=(
+                f"Adversarially review the pushed committed diff on branch {state.get('branch')} for "
+                f"{state['ticket_id']} (review round {iteration + 1}) in the clone at "
+                f"{wt or '(the current directory)'}. Get the diff with `git diff <base>...HEAD`. "
+                f"Classify every finding CRITICAL/MAJOR/MINOR. APPROVE only at zero CRITICAL and zero "
+                f"MAJOR.\n\n"
+                f"Research summary (for AC context):\n{_brief(state.get('research_packet'))}\n\n"
+                f"{_summary(state)}"
+                f"{_container_directive(state, wt)}"
+            ),
+            verdict_model=schemas.ReviewVerdict,
+        )
+    finally:
+        if own_build_slot:
+            _release_build_slot(state["execution_id"])
     telemetry.station_event(state["execution_id"], 5, "end", verdict=v.verdict)
     return {"review_verdict": v.verdict, "review_findings": v.findings,
             "review_iteration": iteration + 1}
@@ -745,6 +980,12 @@ async def sit_run(state: OceanState) -> dict:
                                 failure_class="environment_failure", preflight="insufficient_resources")
         return {"preflight_failed": True, "preflight_reason": reason}
 
+    # SIT-stage concurrency slot (manual-findings #18): WAIT here for a free slot instead of standing up
+    # a heavy stack that would over-commit Docker alongside other runs. Held until the run ends (released
+    # in cli.py::_execute's finally — guaranteed on success/failure/crash). Interruptible + idempotent.
+    slot = await _acquire_sit_slot(exec_id)
+    telemetry.station_event(exec_id, 6.2, "slot", sit_slot=slot)
+
     # Retry-aware prompt: prep_env_retry bumped env_retry_attempts before re-entering here. Without
     # this, a retry would just re-run identical steps and fail identically -- the point of a retry is
     # remediation (rebuild a stale image, bring infra up fresh), not repetition.
@@ -774,7 +1015,16 @@ async def sit_run(state: OceanState) -> dict:
             f"The SIT was authored + human-approved already — do NOT re-author. EXECUTE it local + "
             f"mock-first: run ONLY the changed repo locally per its language-scoped build_env "
             f"(ruby=docker) and mock the rest (ocean_mock_helper + route_local); never present a "
-            f"native-host Ruby run as passed. Capture per-test pass/fail to reports/junit.xml. Do NOT "
+            f"native-host Ruby run as passed. "
+            f"TEST-DATA (FIX A2-1): BEFORE pytest, materialize this ticket's authored-scenario payload "
+            f"templates (the seq1/seq4 local test-data the SIT loads via get_pay_load_from_json_file / "
+            f"get_pay_load_from_db, keyed by the test's TestRail-case-id placeholders) as LOCAL json files, "
+            f"synthesized from the approved scenarios — do NOT depend on TestRail case creation (this headless "
+            f"run may be approve-no-testrail, where no TestRail cases exist). The templates MUST exist before "
+            f"collection/setup or every test errors at setup (could_not_run). "
+            f"Capture per-test pass/fail to "
+            f"reports/junit_${{OCEAN_PIPELINE_EXEC_ID:-{tid}}}.xml (the run-scoped junit, #17 — the same "
+            f"shell-expansion name Station 3 reads back, so they always agree). Do NOT "
             f"run Station 3 (report/verdict) — the graph's sit_triage node does that next."
             f"{retry_note}"
             f"\n\n{_summary(state)}"
@@ -806,7 +1056,10 @@ async def sit_testrail(state: OceanState) -> dict:
             f"create the TestRail cases for the SIT already authored + approved via ocean-qa-agent "
             f"(Project 22 / Suite 197 — its Steps 6/6a). Do ONLY TestRail case creation "
             f"for the EXISTING authored test at {state.get('qa_test_path') or '(the ticket SIT)'} — do "
-            f"NOT re-author, execute, or open any PR. This runs in parallel with the local SIT run, so "
+            f"NOT re-author, execute, or open any PR. DECOUPLING (FIX A2-1): the LOCAL seq payload templates "
+            f"/ test-data are materialized by sit_run (Station 2), NOT here — this node touches ONLY the "
+            f"TestRail API, so the local SIT never depends on TestRail case creation to resolve its payloads. "
+            f"This runs in parallel with the local SIT run, so "
             f"touch ONLY TestRail (respect its rate limits). Write ONLY the integer TestRail run id to "
             f"{tr_path}.\n\n{_summary(state)}"
         ),
@@ -851,7 +1104,9 @@ async def sit_triage(state: OceanState) -> dict:
         ticket_id=tid,
         task_prompt=(
             f"Run ocean-automation-testing Station 3 (report) ONLY for {tid} (`--only report`): parse "
-            f"reports/junit.xml for the authoritative per-test pass/fail; TRIAGE any failure — test_fault "
+            f"reports/junit_${{OCEAN_PIPELINE_EXEC_ID:-{tid}}}.xml (the run-scoped junit, #17 — same "
+            f"shell-expansion name Station 2 wrote) for the authoritative per-test pass/fail; "
+            f"TRIAGE any failure — test_fault "
             f"(fix + re-run, capped) vs code_fault (real defect -> findings_for_coder) vs could_not_verify. "
             f"On PASS, commit the SIT into cloudqwest/test-automation on an {tid}/… branch, open a DRAFT PR "
             f"(reuse an existing {tid} test-automation PR — do not duplicate), and set test_automation_pr_url. "
@@ -866,7 +1121,19 @@ async def sit_triage(state: OceanState) -> dict:
                 "needs_onboarding": False, "sit_report": {}, "sit_findings": [],
                 "final_outcome": "sit skill wrote no verdict"}
 
-    v = schemas.AutomationVerdict.model_validate_json(verdict_path.read_text())
+    # A1-1 (master guard): the skill writes AutomationVerdict from SKILL.md PROSE, not an injected schema,
+    # so its SHAPE can drift (EXE-968500e9: `changed_repos` as strings crashed the whole run here). The
+    # model's field_validators coerce the known slips, but ANY residual schema violation must DOWNGRADE to
+    # could_not_verify — never crash a run that actually executed the SIT. A present-but-invalid verdict is
+    # treated exactly like a missing one.
+    try:
+        v = schemas.AutomationVerdict.model_validate_json(verdict_path.read_text())
+    except Exception as e:  # noqa: BLE001 — malformed/schema-invalid verdict → non-fatal could_not_verify
+        telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
+                                failure_class="could_not_verify", verdict_parse_error=type(e).__name__)
+        return {"automation_result": "failed", "failure_class": "could_not_verify",
+                "needs_onboarding": False, "sit_report": {}, "sit_findings": [],
+                "final_outcome": f"sit verdict failed schema validation: {type(e).__name__}: {e}"[:300]}
     telemetry.station_event(exec_id, 6.4, "end", automation_result=v.automation_result,
                             failure_class=v.failure_class, execution_mode=v.execution_mode,
                             needs_onboarding=v.needs_onboarding)

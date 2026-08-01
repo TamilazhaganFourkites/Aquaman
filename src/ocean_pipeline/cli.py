@@ -34,6 +34,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from . import config, metrics, report, telemetry, tracing, ui
 from .graph import build_graph, compile_app
+from .nodes import _release_build_slot, _release_sit_slot
 from .state import OceanState
 
 # Loops (review x code_fault) can chain well past LangGraph's default of 25 node
@@ -318,6 +319,19 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
                 if cleaned:
                     print(f"  Cleaned {len(cleaned)} run Docker resource(s): "
                           + ", ".join(cleaned[:8]) + (" …" if len(cleaned) > 8 else ""))
+        except Exception:
+            pass
+        try:
+            # Release the SIT concurrency slot (#18) on any TERMINAL exit — guaranteed here even when the
+            # conditional teardown_container node didn't run (both container features off) or a StationError
+            # aborted the graph before it. Kept on a PAUSE (the stack stays up; a resume re-holds it).
+            if not paused_on:
+                _release_sit_slot(execution_id)
+                # Same backstop for the build-slot hold: a crash mid-coder/mid-harsh_reviewer/mid-
+                # reachability_gate (before that node's own `finally` runs) or mid-prep_container (before
+                # teardown_container runs) must still free it on process exit. Safe/no-op if this
+                # execution never held one.
+                _release_build_slot(execution_id)
         except Exception:
             pass
         if handler is not None:

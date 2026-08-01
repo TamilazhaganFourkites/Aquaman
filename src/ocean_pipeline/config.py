@@ -86,6 +86,35 @@ WARM_SIT_INFRA = os.environ.get("OCEAN_PIPELINE_WARM_SIT_INFRA", "0").lower() in
 # on Apple Silicon (ruby_image_cache reads it) to also drop Rosetta (manual-findings #15).
 BAKE_TEST_GROUP = os.environ.get("OCEAN_PIPELINE_BAKE_TEST_GROUP", "0").lower() in ("1", "true", "yes")
 
+# Max number of SIT stacks allowed to run CONCURRENTLY across all pipeline runs on this machine
+# (manual-findings #18). The SIT stage stands up a heavy stack (localstack/es/redis/mock + the changed
+# repos); several at once over-commit the one Docker VM (EXE-caa5c082 died at Step-0 for this). sit_run
+# acquires one of N cross-process file-lock slots BEFORE bring-up and holds it until teardown, so a 2nd/3rd
+# run WAITS for a free slot instead of failing preflight — a queue, not a crash. Default 1 = serialize SIT
+# (the safe default given the observed over-commit); raise it on a big-memory machine. The lock is a flock,
+# so a crashed holder auto-frees its slot.
+MAX_CONCURRENT_SIT = int(os.environ.get("OCEAN_PIPELINE_MAX_CONCURRENT_SIT", "1"))
+# How long a run waits for a free SIT slot before giving up and proceeding anyway (so a wedged holder can't
+# block forever — the preflight over-commit check is still the backstop). Default 2h.
+SIT_SLOT_WAIT_SECONDS = int(os.environ.get("OCEAN_PIPELINE_SIT_SLOT_WAIT_SECONDS", "7200"))
+
+# Separate concurrency pool for the BUILD-type stages (prep_image, prep_container's `docker run -d`,
+# coder/harsh_reviewer/reachability_gate's Ruby `bundle install`/rspec-in-Docker) — deliberately not
+# folded into MAX_CONCURRENT_SIT above. A SIT stack is long (~20-30 min bring-up) and heavy (the shared
+# infra floor below plus N repos); a build-type session is one repo's image/container (~2.5-3 GB per
+# _REPO_FOOTPRINT_GB) and much shorter. Forcing both through one pool sized for SIT (default 1 slot, 2h
+# wait) would serialize a 3-5 min coder Docker phase behind a run that's mid-SIT for two hours. A slot
+# COUNT alone doesn't bound real memory, though (a fixed count says nothing about how big any one
+# session actually is) — _try_acquire_build_slot (nodes.py) pairs this count with a live
+# _docker_used_gb() headroom read as a HARD condition, not just an advisory log line, which is what
+# lets this compose safely with MAX_CONCURRENT_SIT above: both ultimately defer to the same `docker
+# stats` ground truth, so a live SIT stack from another process is visible to a build-slot acquisition
+# attempt (and vice versa, since SIT's own preflight already reads that same signal).
+MAX_CONCURRENT_BUILDS = int(os.environ.get("OCEAN_PIPELINE_MAX_CONCURRENT_BUILDS", "2"))
+# Shorter than SIT_SLOT_WAIT_SECONDS (2h) since build-type stages are lighter/shorter-lived — same
+# "proceed anyway past the deadline, the live headroom check is the real backstop" philosophy.
+BUILD_SLOT_WAIT_SECONDS = int(os.environ.get("OCEAN_PIPELINE_BUILD_SLOT_WAIT_SECONDS", "1800"))
+
 
 def sit_infra_project(execution_id: str) -> str:
     """Deterministic compose project name for a run's SIT infra, so a retry reuses the SAME stack and
@@ -236,6 +265,21 @@ def docker_budget_for_repos(target_repos) -> tuple[float, int]:
     cpus = 2 + max(0, docker_count - 1)
     return round(max(gb, MIN_DOCKER_MEMORY_GB), 1), max(cpus, MIN_DOCKER_CPUS)
 
+
+def docker_budget_for_build(target_repos) -> float:
+    """(min_gb) to run a single BUILD-type stage (prep_image/prep_container's boot, or coder/
+    harsh_reviewer/reachability_gate's Ruby bundle-install-in-Docker) for one repo out of
+    `target_repos`. Unlike docker_budget_for_repos, this is deliberately NOT the SIT-stage budget:
+    no _BASE_INFRA_GB floor (a build/coder session doesn't bring up the shared kafka/es/localstack/
+    mock stack SIT does — only its own image/container), and max() not sum() (prep_container/coder
+    operate on ONE Ruby repo's image/container at a time, matching prep_container's own single-repo
+    selection — never every target repo's footprint added together). Empty/None -> a small flat
+    floor (nothing Docker-heavy to budget for)."""
+    names = [(r.get("repo") or "").split("/")[-1] for r in (target_repos or [])
+             if isinstance(r, dict) and r.get("repo")]
+    footprints = [_REPO_FOOTPRINT_GB.get(n, _DEFAULT_REPO_GB) for n in names if _REPO_FOOTPRINT_GB.get(n, _DEFAULT_REPO_GB) > 0]
+    return round(max(footprints) if footprints else 0.5, 1)
+
 # Claude Agent SDK permission mode. This pipeline runs fully headless — every
 # station shells out (git push, gh pr create/ready, docker, pytest), and "acceptEdits"
 # only auto-approves Edit/Write, NOT Bash, so a non-bypass mode would stall with no
@@ -250,11 +294,29 @@ SKILL_PERMISSION_MODE = os.environ.get("OCEAN_PIPELINE_SKILL_PERMISSION_MODE", "
 # fk-execute (draft PR). Widen this set when the ocean-pipeline is rolled out to them.
 ISBU_PROJECTS = {"MM"}
 
+# Isolate the spawned claude CLI from UNREACHABLE ambient MCP servers. Each station shells out to a
+# `claude` CLI subprocess (via the claude-agent-sdk); by default that subprocess inherits the ambient
+# MCP config from ~/.claude.json, which can list servers whose host is currently DOWN (e.g. fk-code-graph
+# at http://neo4j-mcp-server.fourkites.internal/mcp, which fails DNS with NXDOMAIN). When the CLI hangs/
+# crashes trying to connect to a dead server, the SDK's transport pipe to the subprocess breaks and the
+# station dies with `BrokenPipeError: [Errno 32] Broken pipe` at a station transition (2 of 3 recent SIT
+# runs). When ON (default), agents._station_mcp_config() probes each ambient MCP server's reachability
+# ONCE per process and, if it can drop the dead ones while keeping >=1 reachable, hands the spawned CLI an
+# explicit reachable-only mcp_servers set with strict_mcp_config=True (so the CLI ignores the broken
+# ambient config). Fully fallback-safe: if ~/.claude.json can't be read, probing errors, nothing is dead,
+# or every server looks unreachable (likely a total false-negative), it sets NOTHING and today's ambient
+# behavior is preserved — this can never make things worse. Disable per-run with
+# OCEAN_PIPELINE_ISOLATE_UNREACHABLE_MCP=0.
+ISOLATE_UNREACHABLE_MCP = os.environ.get("OCEAN_PIPELINE_ISOLATE_UNREACHABLE_MCP", "1").lower() in ("1", "true", "yes")
+
 # Node-level resilience. A single transient claude-CLI/SDK failure (e.g. a ProcessError
 # that the SDK surfaces as `Claude Code returned an error result: ...`, seen in run.log for
 # MM-14472) must NOT abort a whole run. The agent/skill driver retries with exponential
 # backoff before giving up; the checkpointer still allows a full --resume if all retries fail.
-MAX_AGENT_RETRIES = int(os.environ.get("OCEAN_PIPELINE_MAX_AGENT_RETRIES", "2"))
+# Default 4 (raised from 2): cheap insurance for a transient BURST (e.g. an MCP server flapping
+# during a station transition) — ISOLATE_UNREACHABLE_MCP above removes the PERSISTENT dead-server
+# case, and these extra retries cover the remaining short-lived transport blips.
+MAX_AGENT_RETRIES = int(os.environ.get("OCEAN_PIPELINE_MAX_AGENT_RETRIES", "4"))
 AGENT_RETRY_BACKOFF_SECONDS = float(os.environ.get("OCEAN_PIPELINE_AGENT_RETRY_BACKOFF", "3"))
 
 # Default GitHub org for FK service repos. Branches are pushed to upstream, never forked

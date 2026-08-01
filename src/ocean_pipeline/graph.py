@@ -71,6 +71,12 @@ def after_sit_resolve(state: OceanState) -> str:
 def after_qa_review(state: OceanState):
     # Human 3-way review of the drafted SIT (or auto-approved). "changes" redrafts (capped);
     # approve-with-TestRail fans out to run + TestRail in parallel; approve-without-TestRail just runs.
+    # FIX A2-1: the HEADLESS DEFAULT is approve_no_testrail (config QA_TESTRAIL off) -> sit_run ONLY, so
+    # sit_testrail never runs. That path is now SAFE because sit_run itself materializes the authored
+    # scenario payload templates BEFORE pytest (nodes.sit_run), so test-data no longer depends on the
+    # TestRail branch running. No routing change is needed here — the fix is that sit_run owns test-data on
+    # BOTH the testrail and no-testrail paths (making it racy-fan-out-proof: the template synthesis is
+    # ordered before pytest inside sit_run, not concurrently in the parallel sit_testrail branch).
     d = state.get("qa_decision")
     if d == "changes" and state.get("qa_review_iteration", 0) < config.MAX_QA_REVIEW_ITERATIONS:
         return "sit_author"

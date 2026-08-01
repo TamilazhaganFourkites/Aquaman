@@ -24,8 +24,11 @@ import json
 import os
 import re
 import shlex
+import socket
+import subprocess
 from pathlib import Path
 from typing import Type, TypeVar
+from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
@@ -322,6 +325,47 @@ def _guard_bash():
     return _hook
 
 
+def _guard_repeated_read(threshold: int = 3):
+    """A PreToolUse hook that DENIES the Nth consecutive Read of the SAME file, so a worker waiting on a
+    background task can't burn its window re-reading an unchanged `<task>.output` (manual-findings #3:
+    EXE-b1f09c5a spun re-reading `bh2kir9p4.output`, the harness rejecting each as a 'Wasted call').
+    Orchestrator-enforced: a prose 'don't busy-poll' rule was not enough. State is per-run (closure) and
+    resets the moment ANY other tool runs or a DIFFERENT file is read — so normal repeated reads of
+    changing files are unaffected, and the intended recovery (run `sleep`/wait in Bash, which resets the
+    counter, THEN read once) is allowed immediately."""
+    state = {"key": None, "count": 0}
+
+    async def _hook(input_data, tool_use_id, context):  # noqa: ARG001 — SDK hook signature
+        if input_data.get("tool_name") != "Read":
+            state["key"], state["count"] = None, 0   # any other action breaks a busy-wait
+            return {}
+        ti = input_data.get("tool_input") or {}
+        # Key on file_path AND the page window: a large file read in pages (offset 0/2000/4000) is NOT a
+        # busy-wait — each page returns new content. Only an IDENTICAL re-read (same path+offset+limit) is.
+        path = str(ti.get("file_path", ""))
+        key = (path, ti.get("offset"), ti.get("limit"))
+        if key == state["key"]:
+            state["count"] += 1
+        else:
+            state["key"], state["count"] = key, 1
+        if state["count"] < threshold:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"You have Read {path!r} {state['count']} times in a row with no other action — this is a "
+                    f"busy-wait and makes no progress (the file is unchanged). Do NOT re-Read it. If you are "
+                    f"waiting on a background task, WAIT first — run a bounded `sleep` in Bash (e.g. "
+                    f"`sleep 30`) or block on the task — and only THEN Read once. Running any other tool "
+                    f"clears this guard."
+                ),
+            }
+        }
+    return _hook
+
+
 def _emit(label: str, line: str) -> None:
     print(f"    [{label}] {line}", flush=True)
 
@@ -512,6 +556,106 @@ def _format_message(msg) -> list[str]:
     return out
 
 
+# ---- MCP isolation (BrokenPipeError-at-station-transition fix) -----------------------------------
+# Each station spawns a `claude` CLI subprocess that inherits the ambient MCP config from ~/.claude.json.
+# If that config lists an UNREACHABLE server (e.g. fk-code-graph at neo4j-mcp-server.fourkites.internal,
+# which fails DNS with NXDOMAIN), the CLI hangs/crashes trying to connect and the SDK's transport pipe to
+# the subprocess breaks -> `BrokenPipeError: [Errno 32] Broken pipe`. We probe reachability ONCE per
+# process and hand the CLI an explicit reachable-only mcp_servers set with strict_mcp_config=True so it
+# never touches the dead server. Everything here is fallback-safe: any doubt -> return None -> ambient.
+# 5s (not 2s) so a reachable-but-slow server isn't mistaken for dead and dropped for the WHOLE process
+# (the probe result is cached once per run) — a false-drop makes graph-using SME stations run blind
+# (judge MINOR-7). A genuinely dead host still fails fast on NXDOMAIN/refused; this only widens the
+# grace for a slow TCP accept.
+_MCP_PROBE_TIMEOUT_S = 5.0
+_STATION_MCP_UNSET = object()
+_station_mcp_cache = _STATION_MCP_UNSET   # module global: the probe runs ONCE per process, not per station
+
+
+def _load_ambient_mcp_servers() -> dict | None:
+    """The `mcpServers` map from ~/.claude.json. Its entries are already in the exact raw shape the SDK's
+    `mcp_servers` dict accepts (http/sse -> {"type","url","headers?"}; stdio -> {"command","args","env"}),
+    so we pass the reachable subset straight through. Returns None if the file is absent/unreadable/malformed
+    or carries no mcpServers — the caller treats None as 'preserve ambient behavior'."""
+    try:
+        raw = json.loads((Path.home() / ".claude.json").read_text())
+    except Exception:  # noqa: BLE001 — absent / unreadable / bad JSON -> ambient fallback
+        return None
+    servers = raw.get("mcpServers")
+    return servers if isinstance(servers, dict) and servers else None
+
+
+def _mcp_entry_reachable(entry, timeout: float = _MCP_PROBE_TIMEOUT_S) -> bool:
+    """Is one ~/.claude.json MCP-server entry reachable right now?
+      * url-based (http/sse): its host must DNS-resolve (socket.getaddrinfo) AND a short TCP connect to its
+        port must succeed. A non-resolving host (NXDOMAIN) or a refused/timed-out port is UNREACHABLE — that
+        is exactly what wedges the spawned CLI and breaks the SDK pipe.
+      * stdio/command (no url): a LOCAL subprocess, never the DNS-broken-pipe culprit -> keep it (True), so
+        working local servers (jira, clickhouse, ...) survive the isolation."""
+    if not isinstance(entry, dict):
+        return False
+    url = entry.get("url")
+    if not url:
+        return True   # stdio/local — not a network MCP; keep today's behavior for it
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host:
+            return False
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)   # NXDOMAIN -> gaierror (OSError)
+    except OSError:
+        return False
+    for family, socktype, proto, _canon, sockaddr in infos:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return True
+        except OSError:
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+    return False
+
+
+def _filter_reachable_mcp_servers(ambient: dict) -> dict:
+    """Subset of `ambient` whose servers are reachable right now (see _mcp_entry_reachable)."""
+    return {name: cfg for name, cfg in ambient.items() if _mcp_entry_reachable(cfg)}
+
+
+def _station_mcp_config() -> dict | None:
+    """Explicit `mcp_servers` dict of ONLY the ambient servers reachable right now, for the spawned CLI to
+    use with strict_mcp_config=True — so it never connects to a dead server (the BrokenPipeError source).
+    Returns None to signal 'set NEITHER mcp_servers NOR strict_mcp_config — keep ambient behavior', the
+    SAFE fallback whenever we can't confidently improve on ambient: flag off, ~/.claude.json unreadable,
+    a probe error, nothing dead to drop, or an all-unreachable result (more likely a total false-negative
+    than reality). Result is cached in a module global so the reachability probe runs ONCE per process."""
+    global _station_mcp_cache
+    if _station_mcp_cache is not _STATION_MCP_UNSET:
+        return _station_mcp_cache
+    result: dict | None = None
+    try:
+        if config.ISOLATE_UNREACHABLE_MCP:
+            ambient = _load_ambient_mcp_servers()
+            if ambient:
+                reachable = _filter_reachable_mcp_servers(ambient)
+                # Override ONLY when the probe confirmed >=1 reachable AND it actually drops something.
+                # Nothing dropped -> strict config == ambient, so keep ambient (no added risk). Empty
+                # reachable -> treat as a false-negative and keep ambient (never strip ALL servers).
+                if reachable and len(reachable) < len(ambient):
+                    dropped = sorted(set(ambient) - set(reachable))
+                    ui.milestone(f"MCP isolation: using {len(reachable)}/{len(ambient)} reachable "
+                                 f"server(s); skipping unreachable {dropped}")
+                    result = reachable
+    except Exception:  # noqa: BLE001 — any probe/parse error -> ambient fallback (never make it worse)
+        result = None
+    _station_mcp_cache = result
+    return result
+
+
 async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str,
                  label: str = "station", allowed_tools: list[str] | None = None) -> None:
     # Imported lazily so the graph/routing test suite runs without the SDK (or the
@@ -521,7 +665,7 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     # PreToolUse hooks (run regardless of permission_mode — see _deny_outside_allowlist). Always guard
     # against a whole-disk recursive search (the EXE-0417bc97 hang); additionally enforce the worker's
     # declared tool allowlist when it declared one.
-    _pre = [_guard_bash()]
+    _pre = [_guard_bash(), _guard_repeated_read()]
     if allowed_tools is not None:
         _pre.append(_deny_outside_allowlist(allowed_tools))
     hooks = {"PreToolUse": [HookMatcher(hooks=_pre)]}
@@ -548,13 +692,23 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     os.environ.setdefault("BASH_DEFAULT_TIMEOUT_MS", config.BASH_DEFAULT_TIMEOUT_MS)
     os.environ.setdefault("BASH_MAX_TIMEOUT_MS", config.BASH_MAX_TIMEOUT_MS)
 
-    options = ClaudeAgentOptions(
+    options_kwargs = dict(
         model=config.STATION_MODEL,
         system_prompt=system_prompt,
         cwd=str(cwd),
         permission_mode=permission_mode,
         hooks=hooks,
     )
+    # Isolate the spawned CLI from unreachable ambient MCP servers (fk-code-graph NXDOMAIN etc.) that break
+    # the SDK transport pipe with BrokenPipeError at station transitions. Only when the helper hands back a
+    # reachable-only set do we pin the CLI to it (strict_mcp_config=True makes it IGNORE the ambient config);
+    # otherwise we set neither key and preserve today's ambient behavior. Covers BOTH run_agent and run_skill
+    # stations — both route through here (the sole ClaudeAgentOptions construction). See config.ISOLATE_UNREACHABLE_MCP.
+    _mcp = _station_mcp_config()
+    if _mcp is not None:
+        options_kwargs["mcp_servers"] = _mcp
+        options_kwargs["strict_mcp_config"] = True
+    options = ClaudeAgentOptions(**options_kwargs)
     ui.station_start(label)   # "▶ <station>" header; milestones stream underneath
     tools = 0
     in_tok = out_tok = 0
@@ -612,6 +766,58 @@ async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
     raise last
 
 
+def _capture_partial(node: str, execution_id: str, cwd: Path | None, fast: bool = False) -> None:
+    """Best-effort breadcrumb written when a station dies WITHOUT a verdict — a kill/timeout mid-run
+    (manual-findings #16). Records the workspace git state so the coder's committed-but-interrupted work
+    isn't an opaque loss: a resume reads `<node>.partial.json` and the coder is told to CONTINUE that
+    branch instead of starting over. Never raises. `fast=True` (the KILL path) does ONE quick git probe
+    (branch+HEAD) so a killed process still exits fast (~seconds); the SDK-error path does the full probe."""
+    if cwd is None:
+        return
+    repo_dir = cwd
+    try:
+        if cwd.exists():
+            for child in cwd.iterdir():   # the coder clones the repo into a subdir of the workspace
+                if (child / ".git").exists():
+                    repo_dir = child
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _git(*args: str, timeout: float = 5.0) -> str:
+        try:
+            r = subprocess.run(["git", "-C", str(repo_dir), *args],
+                               capture_output=True, text=True, timeout=timeout)
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    try:
+        note = ("station was killed/interrupted before writing a verdict; any committed work is on the "
+                "branch above — a resume should CONTINUE it, not start over")
+        if fast:
+            # Two quick probes, not the full status/commits-ahead set below — tight timeout each, since
+            # the kill path must not spend ~20s before the CancelledError re-propagates. (A single combined
+            # `rev-parse --abbrev-ref HEAD HEAD` does NOT give branch+SHA: --abbrev-ref applies to every
+            # following ref arg, so it prints the branch name TWICE — confirmed by direct reproduction.)
+            info = {"node": node, "repo_dir": str(repo_dir),
+                    "branch": _git("rev-parse", "--abbrev-ref", "HEAD", timeout=2.0),
+                    "head": _git("rev-parse", "HEAD", timeout=2.0),
+                    "note": note}
+        else:
+            info = {
+                "node": node, "repo_dir": str(repo_dir),
+                "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+                "head": _git("rev-parse", "HEAD"),
+                "commits_ahead": _git("rev-list", "--count", "@{upstream}..HEAD") or _git("rev-list", "--count", "HEAD"),
+                "dirty": bool(_git("status", "--porcelain")),
+                "note": note,
+            }
+        (config.artifacts_dir(execution_id) / f"{node}.partial.json").write_text(json.dumps(info, indent=2))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def run_agent(
     *,
     agent_md: str,
@@ -644,7 +850,13 @@ async def run_agent(
             allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
+        if not verdict_path.exists():
+            _capture_partial(node, execution_id, cwd)   # SDK crash / timeout with no verdict (full probe)
         raise StationError(node, agent_md, f"agent run failed: {type(e).__name__}: {e}") from e
+    except BaseException:   # noqa: BLE001 — a KILL / Ctrl-C / cancel: fast breadcrumb, then let it propagate
+        if not verdict_path.exists():
+            _capture_partial(node, execution_id, cwd, fast=True)   # tight budget — exit fast on a kill
+        raise
 
     if not verdict_path.exists():
         raise StationError(node, agent_md, f"no verdict written to {verdict_path}")
