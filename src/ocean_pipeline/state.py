@@ -83,6 +83,12 @@ class OceanState(TypedDict, total=False):
     preflight_failed: bool
     preflight_reason: str
 
+    # --- SIT junit handoff (sit_run -> sit_triage): the exact run-scoped junit + whether THIS run made it.
+    # MUST be declared or LangGraph drops them and sit_triage can't tell this run's evidence from a prior
+    # run's (EXE-f749212a: triage scored a stale/prior junit and false-verdicted a passing run).
+    sit_junit_path: str
+    sit_junit_present: bool
+
     # --- qa_scenarios: GAN-hardened test scenarios, authored pre-code right after reachability_gate
     # (MM-14738) — sit_author reads this back post-review and passes it to ocean-qa-agent as
     # `--use-scenarios` so the pytest is written from these, not designed fresh.

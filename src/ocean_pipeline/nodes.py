@@ -742,6 +742,10 @@ async def qa_scenarios(state: OceanState) -> dict:
     telemetry.station_event(exec_id, 1.6, "start")
     scenarios_path = config.qa_scenarios_path(tid)
     scenarios_path.parent.mkdir(parents=True, exist_ok=True)
+    if scenarios_path.exists():
+        scenarios_path.unlink()  # fresh attempt -- don't let a stale prior-attempt file fool the
+                                  # verdict_path retry-guard below into thinking THIS attempt already
+                                  # succeeded (same pattern as sit_resolve's automation_verdict_path).
     await agents.run_skill(
         skill_name="ocean-qa-agent",
         node="qa_scenarios",
@@ -757,6 +761,8 @@ async def qa_scenarios(state: OceanState) -> dict:
             f"Reachability report (for AC/behavior context):\n{_brief(state.get('reachability_report'), limit=8000)}\n\n"
             f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}"
         ),
+        verdict_path=scenarios_path,  # EXE-2755f777: a transient post-success error must not blindly
+                                       # redrive this whole (expensive, multi-step) invocation from scratch
     )
     partial = _load_json(str(scenarios_path))
     telemetry.station_event(exec_id, 1.6, "end", qa_gan_verdict=partial.get("qa_gan_verdict", ""))
@@ -974,6 +980,8 @@ async def sit_resolve(state: OceanState) -> dict:
             f"profile, or commit — set needs_onboarding=true + onboard_repo=<repo> in {verdict_path} and "
             f"STOP. Do NOT author or run the SIT here.\n\n{_summary(state)}"
         ),
+        verdict_path=verdict_path,  # EXE-2755f777: unlinked fresh above, so its existence here is a
+                                     # trustworthy signal that THIS attempt (not a stale prior one) succeeded
     )
     partial = _load_json(str(verdict_path))
     needs = bool(partial.get("needs_onboarding"))
@@ -1070,6 +1078,49 @@ async def qa_review_gate(state: OceanState) -> dict:
     return {"qa_decision": decision, "qa_note": note}
 
 
+def _sit_junit_path(exec_id: str):
+    """The run-scoped junit BOTH sit_run (writer) and sit_triage (reader) agree on: an ABSOLUTE path in
+    the run's own artifacts dir. The old `reports/junit_${EXEC}.xml` was CHECKOUT-RELATIVE — the filename
+    matched but the directory did not (sit_run ran in its clone e.g. /tmp/ta-<tkt>, sit_triage in another
+    checkout), so triage found no junit and the skill SILENTLY fell back to a PRIOR run's junit → a false
+    could_not_verify on a genuinely PASSING run (EXE-f749212a: authored+ran auto_populate 6/6, triage
+    scored the stale vessel_inference file + EXE-6fca4a71's 0/6). An absolute artifacts-dir path removes
+    the ambiguity and survives the clone teardown."""
+    return config.artifacts_dir(exec_id) / f"junit_{exec_id}.xml"
+
+
+def _recover_sit_junit(exec_id: str, junit_path) -> None:
+    """Judge-A hardening: if the sit_run agent wrote only the skill's own `reports/junit_<exec>.xml`
+    (relative) instead of honoring the absolute `--junitxml`, recover it DETERMINISTICALLY from the
+    KNOWN exec-scoped copies the skill produces — its durable `memory/tickets` preserve and the SIT
+    checkout's `reports/`. The filenames are EXEC-SCOPED, so this can NEVER pick up a prior run's junit
+    (the whole point of the run-scoped name) — it only closes the "agent used the relative path" gap so a
+    genuinely-passing run isn't turned into a loud (but still wrong) could_not_verify (EXE-f749212a)."""
+    if junit_path.exists() and junit_path.stat().st_size > 0:
+        return
+    pat = f"*{exec_id}*.xml"
+    candidates = []
+    try:
+        candidates += sorted((Path(str(config.FK_AIDEVELOPER_DIR)) / "memory" / "tickets").glob(pat))
+    except OSError:
+        pass
+    try:  # SIT clones live at /tmp/ta-*/system_integration_test/reports/
+        candidates += sorted(Path("/tmp").glob(f"ta-*/system_integration_test/reports/{pat}"))
+    except OSError:
+        pass
+    try:
+        candidates += sorted((Path.home() / "Documents/projects/test-automation/system_integration_test/reports").glob(pat))
+    except OSError:
+        pass
+    for c in candidates:
+        try:
+            if c.is_file() and c.stat().st_size > 0:
+                shutil.copyfile(str(c), str(junit_path))
+                return
+        except OSError:
+            continue
+
+
 # ------------------------------------------------------------------ Station 6c — execute the approved SIT
 async def sit_run(state: OceanState) -> dict:
     """Execute the approved SIT local + mock-first (skill Station 2). Authoring + human review already
@@ -1099,6 +1150,13 @@ async def sit_run(state: OceanState) -> dict:
     # in cli.py::_execute's finally — guaranteed on success/failure/crash). Interruptible + idempotent.
     slot = await _acquire_sit_slot(exec_id)
     telemetry.station_event(exec_id, 6.2, "slot", sit_slot=slot)
+
+    # The authoritative junit for THIS run — absolute, so it lands in the run's artifacts dir regardless
+    # of which clone pytest executes in, and sit_triage reads the SAME file (no checkout-relative drift,
+    # no fallback to a prior run — EXE-f749212a). Unlink stale first so its presence is a per-run signal.
+    junit_path = _sit_junit_path(exec_id)
+    if junit_path.exists():
+        junit_path.unlink()
 
     # Retry-aware prompt: prep_env_retry bumped env_retry_attempts before re-entering here. Without
     # this, a retry would just re-run identical steps and fail identically -- the point of a retry is
@@ -1136,9 +1194,10 @@ async def sit_run(state: OceanState) -> dict:
             f"synthesized from the approved scenarios — do NOT depend on TestRail case creation (this headless "
             f"run may be approve-no-testrail, where no TestRail cases exist). The templates MUST exist before "
             f"collection/setup or every test errors at setup (could_not_run). "
-            f"Capture per-test pass/fail to "
-            f"reports/junit_${{OCEAN_PIPELINE_EXEC_ID:-{tid}}}.xml (the run-scoped junit, #17 — the same "
-            f"shell-expansion name Station 3 reads back, so they always agree). Do NOT "
+            f"Capture per-test pass/fail by passing pytest `--junitxml={junit_path}` — this ABSOLUTE path "
+            f"is THIS run's authoritative junit that Station 3 (sit_triage) reads back. Write it there "
+            f"(an extra copy under the checkout's reports/ is fine, but {junit_path} is the one that "
+            f"matters — it must exist and be non-empty when this step ends). Do NOT "
             f"run Station 3 (report/verdict) — the graph's sit_triage node does that next."
             f"{retry_note}"
             f"\n\n{_summary(state)}"
@@ -1146,8 +1205,12 @@ async def sit_run(state: OceanState) -> dict:
             f"{_sit_infra_directive(state)}"
         ),
     )
-    telemetry.station_event(exec_id, 6.2, "end")
-    return {}
+    _recover_sit_junit(exec_id, junit_path)  # judge-A: if the agent wrote only reports/, recover the exec-scoped copy
+    junit_present = junit_path.exists() and junit_path.stat().st_size > 0
+    telemetry.station_event(exec_id, 6.2, "end", junit_present=junit_present)
+    # Publish the exact junit path + whether THIS run produced it, so sit_triage scores this run's
+    # evidence (or fails loud) instead of re-discovering a file and falling back to a prior run.
+    return {"sit_junit_path": str(junit_path), "sit_junit_present": junit_present}
 
 
 # ------------------------------------------------------------------ Station 6c' — TestRail cases (parallel)
@@ -1177,6 +1240,7 @@ async def sit_testrail(state: OceanState) -> dict:
             f"touch ONLY TestRail (respect its rate limits). Write ONLY the integer TestRail run id to "
             f"{tr_path}.\n\n{_summary(state)}"
         ),
+        verdict_path=tr_path,  # EXE-2755f777: unlinked fresh above, exclusively owned by this node
     )
     run_id = 0
     if tr_path.exists():
@@ -1203,6 +1267,10 @@ async def sit_triage(state: OceanState) -> dict:
     # this IS a harness/infra limit, just a non-retriable one (after_sit_triage checks preflight_failed
     # separately and never routes this specific case to the environment_failure retry).
     if state.get("preflight_failed"):
+        # No run_skill call on this path -- do NOT unlink verdict_path here, or it destroys
+        # sit_resolve/sit_author's still-relevant forensic record (resolved repo set, domain bucket,
+        # pr_number, test_path) for zero benefit (the retry-guard this would serve is never exercised
+        # since run_skill is never invoked below).
         telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
                                 failure_class="environment_failure", preflight_short_circuit=True)
         return {"automation_result": "failed", "failure_class": "environment_failure",
@@ -1212,14 +1280,41 @@ async def sit_triage(state: OceanState) -> dict:
                 "sit_report": {"tests": [], "changed_repos": [], "dependencies": [],
                                "evidence": state.get("preflight_reason", ""), "testrail_run_id": 0,
                                "ac_coverage": []}}
+    # EVIDENCE GUARD (EXE-f749212a): score ONLY this run's junit. If sit_run produced none, refuse to
+    # triage — do NOT let the skill re-discover a file and silently fall back to a PRIOR run's junit and
+    # emit a confident could_not_verify on a run whose real result is unknown. Fail loud + specific.
+    junit_path = Path(state.get("sit_junit_path") or str(_sit_junit_path(exec_id)))
+    junit_present = state.get("sit_junit_present")
+    if junit_present is None:  # resilient if sit_run's state key didn't propagate — check disk
+        junit_present = junit_path.exists() and junit_path.stat().st_size > 0
+    if not junit_present:
+        telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
+                                failure_class="could_not_verify", sit_junit_missing=True)
+        return {"automation_result": "failed", "failure_class": "could_not_verify",
+                "needs_onboarding": False, "sit_findings": [],
+                "sit_report": {"tests": [], "changed_repos": [], "dependencies": [],
+                               "evidence": f"current-run junit absent: {junit_path}", "ac_coverage": []},
+                "final_outcome": (f"SIT_JUNIT_MISSING: this run produced no junit at {junit_path}; refused "
+                                  f"to score a prior run's evidence")}
+    if verdict_path.exists():
+        # Fresh Station-3 attempt, right before the one call that's actually about to run: this
+        # node's own contract fully OVERWRITES the file with the final AutomationVerdict schema
+        # (never merges with sit_resolve/sit_author's earlier, different-shaped writes to the same
+        # path) — so unlinking here is safe, and makes its existence afterward a trustworthy
+        # per-attempt signal for the verdict_path retry-guard below (EXE-2755f777).
+        verdict_path.unlink()
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_triage",
         ticket_id=tid,
         task_prompt=(
             f"Run ocean-automation-testing Station 3 (report) ONLY for {tid} (`--only report`): parse "
-            f"reports/junit_${{OCEAN_PIPELINE_EXEC_ID:-{tid}}}.xml (the run-scoped junit, #17 — same "
-            f"shell-expansion name Station 2 wrote) for the authoritative per-test pass/fail; "
+            f"EXACTLY this junit — THIS run's authoritative evidence — for the per-test pass/fail:\n"
+            f"  {junit_path}\n"
+            f"Do NOT search for, guess, or fall back to any OTHER junit (a different exec-id, a bare "
+            f"junit.xml, a checkout `reports/` copy, or a prior run): scoring another run's junit "
+            f"false-verdicted a PASSING run in EXE-f749212a. If {junit_path} is absent/empty, report "
+            f"could_not_verify with reason 'current-run junit missing' — never substitute another file. "
             f"TRIAGE any failure — test_fault "
             f"(fix + re-run, capped) vs code_fault (real defect -> findings_for_coder) vs could_not_verify. "
             f"On PASS, commit the SIT into cloudqwest/test-automation on an {tid}/… branch, open a DRAFT PR "
@@ -1227,6 +1322,7 @@ async def sit_triage(state: OceanState) -> dict:
             f"Write the verdict object to {verdict_path} exactly per SKILL.md Station 3. Do NOT flip the "
             f"service PR, merge, or deploy.\n\n{_summary(state)}"
         ),
+        verdict_path=verdict_path,  # EXE-2755f777: unlinked fresh above
     )
     if not verdict_path.exists():
         telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",

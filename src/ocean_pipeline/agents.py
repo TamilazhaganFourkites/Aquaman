@@ -944,12 +944,20 @@ async def run_skill(
     task_prompt: str,
     cwd: Path | None = None,
     permission_mode: str | None = None,
+    verdict_path: Path | None = None,
 ) -> None:
     """Run a skills/<skill_name>/SKILL.md skill headless.
 
     The skill owns its output contract; the caller reads whatever canonical file
     the skill writes. Returns nothing.
-    """
+
+    EXE-2755f777: pass the canonical file this skill call is expected to write (when the caller has
+    one — e.g. qa_scenarios' scenarios_path, sit_resolve/sit_author/sit_triage's automation_verdict_path)
+    so `_drive_with_retry` can detect "the skill already finished and wrote it, a transient
+    teardown-time error doesn't mean redo the whole thing" — the same guard `run_agent` already has.
+    Without it (the default), a BlockingIOError-class transient AFTER real success still blindly
+    re-drives this entire (potentially very expensive, multi-step) skill invocation from scratch.
+    The caller owns unlinking any stale prior-attempt file BEFORE calling this, same as before."""
     skill_md = config.FK_AIDEVELOPER_DIR / "skills" / skill_name / "SKILL.md"
     guardrails = AGENT_GUARDRAILS.format(ticket_id=ticket_id)
     try:
@@ -960,6 +968,7 @@ async def run_skill(
             permission_mode=permission_mode or config.SKILL_PERMISSION_MODE,
             label=node,
             allowed_tools=_frontmatter_tools(skill_md),
+            verdict_path=verdict_path,
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}") from e
