@@ -741,20 +741,56 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     metrics.add(in_tok, out_tok, tools)
 
 
+def _looks_like_complete_json(path: Path) -> bool:
+    """True only if `path` exists AND parses as JSON — a SIGKILL mid-write (the verdict re-drive
+    backstop's own failure mode, EXE-928fd700) can leave a truncated file that merely EXISTING
+    would wrongly count as "done". Any real (even schema-invalid) verdict a worker finishes writing
+    is well-formed JSON; a torn write essentially never is. Full schema validation stays the
+    caller's job — this is just enough to not mistake "cut off mid-write" for "complete"."""
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
                             permission_mode: str, label: str,
-                            allowed_tools: list[str] | None = None) -> None:
+                            allowed_tools: list[str] | None = None,
+                            verdict_path: Path | None = None) -> None:
     """Run the worker, retrying on any transient SDK/CLI failure with exponential backoff.
 
     A single claude-CLI ProcessError (e.g. the `Claude Code returned an error result: ...`
     crash in run.log) must not abort the whole run. Only after MAX_AGENT_RETRIES do we give
-    up and let the caller raise StationError."""
+    up and let the caller raise StationError.
+
+    EXE-2755f777: a transient error (a BlockingIOError, observed during SDK session teardown)
+    can fire AFTER the agent already finished its real work and wrote the verdict — retrying
+    blindly in that case re-drives the ENTIRE station from scratch (a fresh session, re-reading
+    the ticket, redoing every search) even though nothing was actually wrong, nearly doubling
+    that station's wall-clock time for no reason. `run_agent` unlinks verdict_path exactly once,
+    before this function is ever called, so its existence here is a trustworthy signal for THIS
+    invocation specifically (not a stale leftover from an earlier legitimate rework pass) — the
+    same verdict-file-is-ground-truth pattern run_agent already uses at every other decision
+    point. verdict_path is None for run_skill (no generic per-node verdict file there), which
+    keeps that caller's retry behavior exactly as before.
+
+    Checks the file PARSES as JSON, not just that it exists: the backstop this composes with
+    (run_agent's "verdict re-drive", EXE-928fd700) kills a worker's background task mid-write on a
+    bad turn, which can leave a truncated/partial file on disk — existence alone would let a
+    transient error right after THAT wrongly read as "done" and skip retrying a station that
+    actually never finished. A real, fully-written verdict is always valid JSON at minimum (schema
+    validation is the caller's job once this returns); a still-truncated one almost never is."""
     last: Exception | None = None
     for attempt in range(config.MAX_AGENT_RETRIES + 1):
         try:
             await _drive(system_prompt, prompt, cwd, permission_mode, label, allowed_tools)
             return
         except Exception as e:  # noqa: BLE001 — retry ANY transport/SDK failure
+            if verdict_path is not None and _looks_like_complete_json(verdict_path):
+                ui.milestone(f"transient error ({type(e).__name__}) after the verdict was already "
+                             f"written — ignoring it, not re-driving the station")
+                return
             last = e
             if attempt >= config.MAX_AGENT_RETRIES:
                 break
@@ -848,6 +884,7 @@ async def run_agent(
             permission_mode=permission_mode or config.STATION_PERMISSION_MODE,
             label=node,
             allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
+            verdict_path=verdict_path,
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         if not verdict_path.exists():
@@ -880,6 +917,7 @@ async def run_agent(
                 permission_mode=permission_mode or config.STATION_PERMISSION_MODE,
                 label=f"{node}:verdict-redrive",
                 allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
+                verdict_path=verdict_path,
             )
         except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
             if not verdict_path.exists():

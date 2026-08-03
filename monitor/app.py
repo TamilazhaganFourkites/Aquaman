@@ -124,7 +124,9 @@ def _parse_step_line(line: str):
         return None
     icon = s[2]
     rest = s[5:]
-    m = re.search(r"(\d+m\d+s|\d+s)", rest)
+    # ui.py::_fmt_elapsed puts a space between the minutes and seconds tokens ("20m 03s") — \s?
+    # tolerates it (and the older no-space form, for any already-running process still printing it).
+    m = re.search(r"(\d+m\s?\d+s|\d+s)", rest)
     if not m:
         return None
     label = rest[: m.start()].rstrip()

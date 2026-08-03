@@ -869,8 +869,9 @@ function esc(s) {
 function formatElapsed(startedAt, finishedAt) {
   if (!startedAt) return null;
   const total = Math.max(0, Math.round((finishedAt || (Date.now() / 1000)) - startedAt));
-  const m = Math.floor(total / 60), s = total % 60;
-  return m > 0 ? `${m}m${s}s` : `${s}s`;
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
 // A markdown recap of a ticket's whole run — station list, outcome, PR, log path — ready to
@@ -1631,10 +1632,14 @@ const PARALLEL_GROUPS = [
 function predictNextLabel(events) {
   const last = events.length ? events[events.length - 1] : null;
   if (!last || last.state === "running") return null;
-  const doneNodes = new Set(events.filter(e => e.state !== "running").map(e => e.node));
+  // A sibling already has its OWN real event — done OR still running — is already accounted for
+  // and must never be guessed as "next": excluding only done ones (state !== "running") let a
+  // sibling that's genuinely mid-flight (its own real running event, just not the LAST one in the
+  // array) get predicted again as a bogus duplicate "predicted — hasn't reported in yet" step.
+  const accountedFor = new Set(events.map(e => e.node));
   const group = PARALLEL_GROUPS.find(g => g.members.includes(last.node));
   if (group) {
-    const pending = group.members.find(m => m !== last.node && !doneNodes.has(m));
+    const pending = group.members.find(m => m !== last.node && !accountedFor.has(m));
     return NODE_LABEL[pending || group.join] || null;
   }
   const nextNode = HAPPY_NEXT[last.node];

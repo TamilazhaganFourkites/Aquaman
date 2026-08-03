@@ -89,7 +89,7 @@ def outcome_line(node: str, update: dict) -> str:
 
 def _fmt_elapsed(sec: float) -> str:
     m, s = divmod(int(sec), 60)
-    return f"{m}m{s:02d}s" if m else f"{s}s"
+    return f"{m}m {s:02d}s" if m else f"{s}s"
 
 
 def _details(node: str, upd: dict) -> list[str]:

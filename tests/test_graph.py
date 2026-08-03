@@ -861,6 +861,77 @@ def test_drive_with_retry_propagates_after_budget(monkeypatch):
             permission_mode="bypassPermissions", label="test"))
 
 
+def test_drive_with_retry_does_not_redrive_once_verdict_already_written(tmp_path, monkeypatch):
+    """EXE-2755f777: a real production run hit a BlockingIOError AFTER the researcher had already
+    completed and written its verdict — the retry loop, blind to that, re-drove the ENTIRE station
+    from scratch (fresh session, re-read the ticket, redid every search), nearly doubling its
+    wall-clock time for no reason. Once verdict_path exists, a subsequent transient error must be
+    ignored (logged, not retried) rather than re-driving a station that already finished."""
+    monkeypatch.setattr(config, "MAX_AGENT_RETRIES", 2)
+    monkeypatch.setattr(config, "AGENT_RETRY_BACKOFF_SECONDS", 0)
+    verdict_path = tmp_path / "researcher.verdict.json"
+    calls = {"n": 0}
+
+    async def writes_then_blows_up(*a, **kw):
+        calls["n"] += 1
+        verdict_path.write_text('{"route": "coding"}')   # the real work already completed
+        raise BlockingIOError("transient teardown error")   # then a harmless post-completion error
+
+    monkeypatch.setattr(agents, "_drive", writes_then_blows_up)
+    asyncio.run(agents._drive_with_retry(
+        system_prompt="sp", prompt="p", cwd=Path("/tmp"),
+        permission_mode="bypassPermissions", label="test", verdict_path=verdict_path))
+    assert calls["n"] == 1   # must NOT have re-driven a second time — the verdict already existed
+
+
+def test_drive_with_retry_still_retries_when_verdict_absent(monkeypatch):
+    """The flip side: verdict_path is passed but the failure happens BEFORE any verdict is written
+    (the normal transient-failure case) — must still retry exactly as before, verdict-awareness
+    must not accidentally swallow a genuine failure."""
+    monkeypatch.setattr(config, "MAX_AGENT_RETRIES", 2)
+    monkeypatch.setattr(config, "AGENT_RETRY_BACKOFF_SECONDS", 0)
+    calls = {"n": 0}
+
+    async def flaky_no_verdict(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient claude-CLI error")
+        return
+
+    monkeypatch.setattr(agents, "_drive", flaky_no_verdict)
+    never_written = Path("/tmp/does-not-exist-EXE-test.verdict.json")
+    asyncio.run(agents._drive_with_retry(
+        system_prompt="sp", prompt="p", cwd=Path("/tmp"),
+        permission_mode="bypassPermissions", label="test", verdict_path=never_written))
+    assert calls["n"] == 2   # still retried and recovered, same as before this fix
+
+
+def test_drive_with_retry_still_retries_on_a_truncated_verdict_file(tmp_path, monkeypatch):
+    """Adversarial-review finding: the verdict re-drive backstop (EXE-928fd700) kills a worker's
+    background task mid-write on a bad turn, which can leave a TRUNCATED verdict file on disk —
+    bare existence would wrongly read that as "done" and skip retrying a station that never
+    actually finished. A torn/invalid-JSON file must NOT short-circuit the retry."""
+    monkeypatch.setattr(config, "MAX_AGENT_RETRIES", 2)
+    monkeypatch.setattr(config, "AGENT_RETRY_BACKOFF_SECONDS", 0)
+    verdict_path = tmp_path / "researcher.verdict.json"
+    calls = {"n": 0}
+
+    async def writes_garbage_then_blows_up(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            verdict_path.write_text('{"route": "cod')   # SIGKILL'd mid-write — truncated, invalid JSON
+            raise BlockingIOError("transient teardown error")
+        verdict_path.write_text('{"route": "coding"}')   # second attempt finishes cleanly
+        return
+
+    monkeypatch.setattr(agents, "_drive", writes_garbage_then_blows_up)
+    asyncio.run(agents._drive_with_retry(
+        system_prompt="sp", prompt="p", cwd=Path("/tmp"),
+        permission_mode="bypassPermissions", label="test", verdict_path=verdict_path))
+    assert calls["n"] == 2   # must have retried despite the file existing — it wasn't valid JSON
+    assert json.loads(verdict_path.read_text()) == {"route": "coding"}   # final content is the good one
+
+
 # ----------------------------------------------------------------- A3: RCA report posted by plain code
 def test_rca_report_posts_worker_report_via_jira(tmp_path, monkeypatch):
     """A3: the RCA report is posted by the plain-code rca_report node via jira.py — NOT by the worker
