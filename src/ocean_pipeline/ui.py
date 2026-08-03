@@ -187,7 +187,8 @@ def _highlight(node: str, upd: dict) -> str:
     if node == "qa_review_gate" and upd.get("qa_decision"):
         return upd["qa_decision"].replace("_", " ")
     if node == "sit_testrail":
-        return f"TestRail run {upd['testrail_run_id']}" if upd.get("testrail_run_id") else "TestRail cases written"
+        n = len(upd.get("qa_testrail_case_map") or {})
+        return f"TestRail: {n} case(s) created" if n else "TestRail cases written"
     if node == "sit_triage" and upd.get("automation_result"):
         fc = upd.get("failure_class")
         return f"SIT {upd['automation_result']}" + (f" ({fc})" if fc else "")

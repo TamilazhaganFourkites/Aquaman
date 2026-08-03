@@ -114,8 +114,16 @@ def _install(script: Script, tmp_path, monkeypatch):
                 "ticket_id": kw["ticket_id"], "qa_gan_verdict": "APPROVE", "qa_gan_phase0_gaps": [],
             }))
             return
-        if node == "learn_repo" or node == "sit_run":
-            return  # onboarding pass / execute phase write no final verdict
+        if node == "learn_repo":
+            return  # onboarding pass writes no final verdict
+        if node == "sit_run":
+            # sit_triage now refuses to triage without THIS run's own junit (EXE-f749212a evidence
+            # guard) — nodes.sit_run's real code embeds the exact absolute --junitxml path literally
+            # in the prompt text (there's no execution_id kwarg on run_skill to derive it from), so
+            # the mock reads it out the same way sit_testrail's mock already has to for its own path.
+            m = re.search(r"--junitxml=(\S+)`", kw["task_prompt"])
+            Path(m.group(1)).write_text("<testsuite/>")
+            return
         if node == "sit_author":
             path.write_text(json.dumps({"ticket_id": kw["ticket_id"], "test_path": "test_MM_1_ocean.py"}))
             return
@@ -123,8 +131,13 @@ def _install(script: Script, tmp_path, monkeypatch):
             # run_skill has no execution_id parameter -- the real skill only ever sees the target
             # path embedded literally in the prompt text (nodes.py's sit_testrail interpolates
             # `tr_path` there), so the mock reads it out the same way a real skill would have to.
-            m = re.search(r"TestRail run id to (\S+)\.", kw["task_prompt"])
-            Path(m.group(1)).write_text("555")
+            # MM-14738: sit_testrail now expects the FULL <TICKET>_testrail_result.json (case_map),
+            # not a bare run-id int -- and the exact filename is the script's own naming convention,
+            # not an arbitrary caller-chosen name (adversarial review finding).
+            m = re.search(r"writes exactly (\S+) there", kw["task_prompt"])
+            Path(m.group(1)).write_text(json.dumps({
+                "section_ids": [15005], "case_map": {"TCNOTADDED1": 555}, "failed": {},
+            }))
             return
         if node == "sit_resolve":
             script._cur = script.next_sit()  # passed | code_fault | could_not_verify | needs_onboarding
@@ -410,6 +423,142 @@ def test_qa_review_gate_surfaces_gan_verdict_and_gaps(monkeypatch):
     asyncio.run(nodes.qa_review_gate(state))
     assert captured.get("qa_gan_verdict") == "REJECT"
     assert captured.get("qa_gan_phase0_gaps") == [{"severity": "HIGH", "title": "g1"}]
+
+
+def test_sit_triage_substitutes_testrail_case_ids_before_commit(tmp_path, monkeypatch):
+    """MM-14738: sit_testrail no longer authors the file, so the real TestRail case IDs it creates
+    would otherwise never reach the committed test (the pre-existing gap this change closes). Verify
+    sit_triage does the TCNOTADDED{N} -> real-case-id substitution, in plain code, BEFORE its own
+    run_skill call -- the call that commits the file into cloudqwest/test-automation on PASS."""
+    # TCNOTADDED1/TCNOTADDED10/TCNOTADDED11 deliberately included together: "TCNOTADDED1" is a
+    # PREFIX of the other two, so a naive replace-in-arbitrary-order loop corrupts them (e.g.
+    # "TCNOTADDED10" -> "<id-for-1>0", a fabricated case id) -- this is the actual bug a prior
+    # version of this fix shipped with (caught by adversarial review, not by this test, until now).
+    test_file = tmp_path / "test_MM_1_ocean.py"
+    test_file.write_text(
+        '@pytest.mark.parametrize("test_case_id", ["TCNOTADDED1"])\n'
+        "def test_a(): ...\n"
+        '@pytest.mark.parametrize("test_case_id", ["TCNOTADDED2"])\n'
+        "def test_b(): ...\n"
+        '@pytest.mark.parametrize("test_case_id", ["TCNOTADDED10"])\n'
+        "def test_c(): ...\n"
+        '@pytest.mark.parametrize("test_case_id", ["TCNOTADDED11"])\n'
+        "def test_d(): ...\n"
+    )
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text("<testsuite/>")
+    monkeypatch.setattr(config, "automation_verdict_path", lambda tid: tmp_path / f"{tid}.json")
+    state = {
+        "execution_id": "EXE-sub", "ticket_id": "MM-1",
+        "qa_test_path": str(test_file),
+        "qa_testrail_case_map": {
+            "TCNOTADDED1": 39614943, "TCNOTADDED2": 39614944,
+            "TCNOTADDED10": 39614950, "TCNOTADDED11": 39614951,
+        },
+        "sit_junit_present": True, "sit_junit_path": str(junit_path),
+    }
+    seen_at_commit_time = {}
+
+    async def fake_run_skill(**kw):
+        # By the time this (the commit-skill call) fires, substitution must already be on disk.
+        seen_at_commit_time["text"] = test_file.read_text()
+        config.automation_verdict_path(kw["ticket_id"]).write_text(json.dumps({
+            "ticket_id": kw["ticket_id"], "automation_result": "passed", "failure_class": "",
+            "execution_mode": "local-mock-first", "tests": [], "changed_repos": [], "dependencies": [],
+            "test_automation_pr_url": "", "findings_for_coder": [], "needs_onboarding": False,
+            "onboard_repo": "",
+        }))
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+
+    result = asyncio.run(nodes.sit_triage(state))
+
+    assert result["automation_result"] == "passed"
+    text = seen_at_commit_time["text"]
+    assert "TCNOTADDED" not in text
+    assert '"39614943"' in text
+    assert '"39614944"' in text
+    # The collision check: TCNOTADDED10/11 must carry THEIR OWN case ids, not a corrupted
+    # concatenation of TCNOTADDED1's id with a leftover digit.
+    assert '"39614950"' in text
+    assert '"39614951"' in text
+    assert "396149430" not in text and "396149431" not in text
+    # And the substitution is durable on disk, not just visible to the mock's in-flight read.
+    final_text = test_file.read_text()
+    assert "TCNOTADDED" not in final_text
+
+
+def test_sit_triage_skips_substitution_without_case_map(tmp_path, monkeypatch):
+    """No TestRail cases created this run (approve_no_testrail / TestRail off) -> qa_testrail_case_map
+    is absent/empty. sit_triage must leave the file untouched, not crash or blank it."""
+    test_file = tmp_path / "test_MM_1_ocean.py"
+    original = '@pytest.mark.parametrize("test_case_id", ["TCNOTADDED1"])\ndef test_a(): ...\n'
+    test_file.write_text(original)
+    junit_path = tmp_path / "junit.xml"
+    junit_path.write_text("<testsuite/>")
+    monkeypatch.setattr(config, "automation_verdict_path", lambda tid: tmp_path / f"{tid}.json")
+    state = {
+        "execution_id": "EXE-sub2", "ticket_id": "MM-1",
+        "qa_test_path": str(test_file),
+        "sit_junit_present": True, "sit_junit_path": str(junit_path),
+    }
+
+    async def fake_run_skill(**kw):
+        config.automation_verdict_path(kw["ticket_id"]).write_text(json.dumps({
+            "ticket_id": kw["ticket_id"], "automation_result": "passed", "failure_class": "",
+            "execution_mode": "local-mock-first", "tests": [], "changed_repos": [], "dependencies": [],
+            "test_automation_pr_url": "", "findings_for_coder": [], "needs_onboarding": False,
+            "onboard_repo": "",
+        }))
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+
+    asyncio.run(nodes.sit_triage(state))
+    assert test_file.read_text() == original
+
+
+def test_sit_testrail_passes_scenario_path_to_skill(tmp_path, monkeypatch):
+    """MM-14738: sit_author always authors with --skip-testrail (the TestRail decision is made LATER,
+    at qa_review_gate) so ocean-qa-agent's Step 6a (rows.json) never ran during authoring. Station 1b
+    has to build rows.json itself when sit_testrail fires, from the SAME GAN-hardened scenario artifact
+    sit_author read -- verify that pointer actually reaches the skill's task_prompt, not just qa_test_path."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    captured = {}
+
+    async def fake_run_skill(**kw):
+        captured["task_prompt"] = kw["task_prompt"]
+        Path(kw["verdict_path"]).write_text(json.dumps({
+            "section_ids": [1], "case_map": {"TCNOTADDED1": 555}, "failed": {},
+        }))
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+
+    state = {
+        "ticket_id": "MM-1", "execution_id": "EXE-scn",
+        "qa_test_path": "test_MM_1_ocean.py",
+        "qa_scenarios_path": "/some/path/MM-1-qa-scenarios.json",
+    }
+    result = asyncio.run(nodes.sit_testrail(state))
+
+    assert "/some/path/MM-1-qa-scenarios.json" in captured["task_prompt"]
+    assert result["qa_testrail_case_map"] == {"TCNOTADDED1": 555}
+
+
+def test_sit_testrail_prompt_falls_back_to_scenario_plan_docstring(tmp_path, monkeypatch):
+    """When qa_scenarios_path isn't in state (older checkpoint, or standalone use with no such
+    artifact), the prompt must still tell the executing agent WHERE to source rows.json's content
+    from -- the test file's own SCENARIO PLAN docstring -- not silently drop the instruction."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    captured = {}
+
+    async def fake_run_skill(**kw):
+        captured["task_prompt"] = kw["task_prompt"]
+        Path(kw["verdict_path"]).write_text(json.dumps({
+            "section_ids": [], "case_map": {}, "failed": {},
+        }))
+    monkeypatch.setattr(agents, "run_skill", fake_run_skill)
+
+    state = {"ticket_id": "MM-1", "execution_id": "EXE-scn2", "qa_test_path": "test_MM_1_ocean.py"}
+    asyncio.run(nodes.sit_testrail(state))
+
+    assert "SCENARIO PLAN" in captured["task_prompt"]
 
 
 # ----------------------------------------------------------------- full paths
@@ -1011,7 +1160,7 @@ def test_human_gate_reject_stops(tmp_path, monkeypatch):
 
 def test_qa_gate_auto_with_testrail(tmp_path, monkeypatch):
     """Auto mode + TestRail on: the gate auto-approves with TestRail; sit_testrail runs (in parallel
-    with sit_run) and its run id lands in the report."""
+    with sit_run) and its case_map (MM-14738) lands in state."""
     s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
     _install(s, tmp_path, monkeypatch)
     monkeypatch.setattr(config, "QA_TESTRAIL", True)   # override _install default
@@ -1020,7 +1169,8 @@ def test_qa_gate_auto_with_testrail(tmp_path, monkeypatch):
     assert s.calls["sit_author"] == 1
     assert s.calls["sit_run"] == 1
     assert s.calls["sit_testrail"] == 1
-    assert final["sit_report"]["testrail_run_id"] == 555
+    assert final["qa_testrail_case_map"] == {"TCNOTADDED1": 555}
+    assert final["sit_report"]["testrail_case_count"] == 1
 
 
 def test_qa_gate_auto_no_testrail(tmp_path, monkeypatch):

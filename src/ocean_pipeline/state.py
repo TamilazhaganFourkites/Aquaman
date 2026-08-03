@@ -102,7 +102,11 @@ class OceanState(TypedDict, total=False):
     qa_decision: str                 # approve_testrail | approve_no_testrail | changes
     qa_note: str                     # reviewer feedback carried back to sit_author on "changes"
     qa_review_iteration: int         # capped by MAX_QA_REVIEW_ITERATIONS
-    testrail_run_id: int             # from the parallel sit_testrail branch (via state, not the verdict file)
+    testrail_run_id: int             # VESTIGIAL (MM-14738): no add_run call exists in either skill, so
+                                      # nothing has ever populated this from a real TestRail run. Declared
+                                      # for schema back-compat only -- use qa_testrail_case_map below.
+    qa_testrail_case_map: dict       # {"TCNOTADDED{N}": <real_case_id>} from sit_testrail (MM-14738); sit_triage
+                                      # substitutes these into qa_test_path before the commit-skill call fires
 
     # --- graph-owned repo onboarding (MM-14621): unsupported ocean repo -> learn_repo -> re-run SIT ---
     needs_onboarding: bool           # Station 6 reported the changed repo is unsupported locally

@@ -1220,13 +1220,24 @@ async def sit_run(state: OceanState) -> dict:
 async def sit_testrail(state: OceanState) -> dict:
     """Create the TestRail cases for the approved SIT (Project 22 / Suite 197). Runs IN PARALLEL with
     sit_run — TestRail's API is slow + rate-limited, so it must not block the functional gate. Returns
-    the run id via STATE (a dedicated file, not the shared verdict json) to avoid a write race with
-    the concurrent sit_run/sit_triage."""
+    the case map via STATE (a dedicated file, not the shared verdict json) to avoid a write race with
+    the concurrent sit_run/sit_triage. sit_triage substitutes these real case IDs into the committed
+    test file's TCNOTADDED{N} placeholders (MM-14738)."""
     tid, exec_id = state["ticket_id"], state["execution_id"]
     telemetry.station_event(exec_id, 6.3, "start")
-    tr_path = config.artifacts_dir(exec_id) / "testrail_run.txt"
+    tr_dir = config.artifacts_dir(exec_id)
+    # create_testrail_cases.py always names its own output "<TICKET>_testrail_result.json" under
+    # whatever --outdir it's given -- there is no flag to target an arbitrary filename, so tr_path
+    # must match that convention exactly (not an arbitrary name) or nothing writes here at all.
+    tr_path = tr_dir / f"{tid}_testrail_result.json"
     if tr_path.exists():
         tr_path.unlink()
+    scenario_source = state.get("qa_scenarios_path") or (
+        "none passed -- there is no persisted SCENARIO PLAN block on disk, that only exists in the "
+        "interactive terminal review and is never written to the file. Reconstruct rows.json instead "
+        "from the AC MAP comment block right after the module docstring, plus each test methods own "
+        "one-line AC-citing docstring and its TCNOTADDED{N} parametrize marker"
+    )
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_testrail",
@@ -1234,25 +1245,42 @@ async def sit_testrail(state: OceanState) -> dict:
         task_prompt=(
             f"Run ocean-automation-testing Station 1b (testrail) ONLY for {tid} (`--only testrail`): "
             f"create the TestRail cases for the SIT already authored + approved via ocean-qa-agent "
-            f"(Project 22 / Suite 197 — its Steps 6/6a). Do ONLY TestRail case creation "
-            f"for the EXISTING authored test at {state.get('qa_test_path') or '(the ticket SIT)'} — do "
-            f"NOT re-author, execute, or open any PR. DECOUPLING (FIX A2-1): the LOCAL seq payload templates "
+            f"(Project 22 / Suite 197 — its Step 6, tools/create_testrail_cases.py). Do ONLY TestRail "
+            f"case creation for the EXISTING authored test at "
+            f"{state.get('qa_test_path') or '(the ticket SIT)'} — do "
+            f"NOT re-author, execute, or open any PR. rows.json does NOT already exist -- sit_author "
+            f"always authors with --skip-testrail (this TestRail decision is made later, at the review "
+            f"gate), so ocean-qa-agent's Step 6a never ran. Build it yourself first, per Station 1b's "
+            f"own instructions, from the SAME GAN-hardened scenario list at "
+            f"{scenario_source}. "
+            f"DECOUPLING (FIX A2-1): the LOCAL seq payload templates "
             f"/ test-data are materialized by sit_run (Station 2), NOT here — this node touches ONLY the "
             f"TestRail API, so the local SIT never depends on TestRail case creation to resolve its payloads. "
             f"This runs in parallel with the local SIT run, so "
-            f"touch ONLY TestRail (respect its rate limits). Write ONLY the integer TestRail run id to "
-            f"{tr_path}.\n\n{_summary(state)}"
+            f"touch ONLY TestRail (respect its rate limits). Run "
+            f"ocean-qa-agent/tools/create_testrail_cases.py with --outdir {tr_dir} -- its own naming "
+            f"convention writes exactly {tr_path} there (section_ids + case_map + failed, per "
+            f"ocean-qa-agent/SKILL.md Step 6). Do NOT rename, move, or write to a different "
+            f"filename.\n\n{_summary(state)}"
         ),
         verdict_path=tr_path,  # EXE-2755f777: unlinked fresh above, exclusively owned by this node
     )
-    run_id = 0
+    case_map: dict[str, int] = {}
     if tr_path.exists():
         try:
-            run_id = int(tr_path.read_text().strip())
+            payload = json.loads(tr_path.read_text())
         except (ValueError, OSError):
-            run_id = 0
-    telemetry.station_event(exec_id, 6.3, "end", testrail_run_id=run_id)
-    return {"testrail_run_id": run_id}
+            payload = {}
+        # Per-entry resilient, matching create_testrail_cases.py's own per-row-isolation contract:
+        # one malformed entry (e.g. a null value from a row the script itself recorded into `failed`)
+        # must not discard every OTHER entry's already-created, perfectly valid case id.
+        for k, v in (payload.get("case_map") or {}).items():
+            try:
+                case_map[str(k)] = int(v)
+            except (ValueError, TypeError):
+                continue
+    telemetry.station_event(exec_id, 6.3, "end", testrail_case_count=len(case_map))
+    return {"qa_testrail_case_map": case_map}
 
 
 # ------------------------------------------------------------------ Station 6c — report + triage + verdict
@@ -1281,7 +1309,7 @@ async def sit_triage(state: OceanState) -> dict:
                 "test_automation_pr_url": "", "sit_findings": [],
                 "needs_onboarding": False, "onboard_repo": "",
                 "sit_report": {"tests": [], "changed_repos": [], "dependencies": [],
-                               "evidence": state.get("preflight_reason", ""), "testrail_run_id": 0,
+                               "evidence": state.get("preflight_reason", ""), "testrail_case_count": 0,
                                "ac_coverage": []}}
     # EVIDENCE GUARD (EXE-f749212a): score ONLY this run's junit. If sit_run produced none, refuse to
     # triage — do NOT let the skill re-discover a file and silently fall back to a PRIOR run's junit and
@@ -1306,6 +1334,25 @@ async def sit_triage(state: OceanState) -> dict:
         # path) — so unlinking here is safe, and makes its existence afterward a trustworthy
         # per-attempt signal for the verdict_path retry-guard below (EXE-2755f777).
         verdict_path.unlink()
+
+    # MM-14738: fan-in point -- both sit_run (already executed against the placeholder-keyed file)
+    # and sit_testrail (created the real cases) are guaranteed done by here. Plain-code substitution,
+    # no agent: replace TCNOTADDED{N} with its real case id BEFORE the commit-skill call below, so
+    # cloudqwest/test-automation never receives a placeholder for a case that actually exists.
+    case_map = state.get("qa_testrail_case_map") or {}
+    test_path_str = state.get("qa_test_path") or ""
+    if case_map and test_path_str:
+        test_file = Path(test_path_str)
+        if test_file.exists():
+            content = test_file.read_text()
+            # Longest-placeholder-first: "TCNOTADDED1" is a PREFIX of "TCNOTADDED10"/"TCNOTADDED11" --
+            # replacing the short one first corrupts the long one ("TCNOTADDED10" -> "<id1>0", a
+            # fabricated case id silently committed). Sorting by length descending guarantees the
+            # 2-digit placeholders are gone before any 1-digit placeholder's replace call can touch them.
+            for placeholder in sorted(case_map, key=len, reverse=True):
+                content = content.replace(placeholder, str(case_map[placeholder]))
+            test_file.write_text(content)
+
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_triage",
@@ -1363,8 +1410,11 @@ async def sit_triage(state: OceanState) -> dict:
             "changed_repos": [c.model_dump() for c in v.changed_repos],
             "dependencies": [d.model_dump() for d in v.dependencies],
             "evidence": v.evidence,
-            # prefer the id from the parallel sit_testrail branch (via state) over the skill's verdict
-            "testrail_run_id": state.get("testrail_run_id") or v.testrail_run_id,
+            # MM-14738: sit_testrail returns qa_testrail_case_map (via state), not a run id -- no
+            # add_run call exists anywhere in either skill, so "testrail_run_id" never reflected a
+            # real TestRail run; this is the actually-meaningful signal (0 when TestRail was skipped
+            # or every case create failed).
+            "testrail_case_count": len(state.get("qa_testrail_case_map") or {}),
             # AC traceability (additive, optional — [] if the skill hasn't started emitting it yet).
             "ac_coverage": v.ac_coverage,
         },
