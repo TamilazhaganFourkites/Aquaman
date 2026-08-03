@@ -2,6 +2,11 @@
 is now deterministic edges:
 
   - the RCA router,
+  - MM-14738: TDD-style test authoring -- `qa_scenarios` GAN-hardens the SIT test scenarios right
+    after `reachability_gate`, BEFORE `coder` runs, so the coder builds against a fixed, adversarially
+    -hardened spec. `sit_author` (Station 6b, still post-review) writes the actual pytest from that
+    artifact instead of designing scenarios itself; a code_fault rework re-enters at `coder` and never
+    re-runs `qa_scenarios`.
   - the Station 5 <-> Station 4 review loop (capped at MAX_REVIEW_ITERATIONS),
   - the Station 6 outcomes: PASS -> flip service PR ready; code_fault -> FULL loop
     back through coder -> review -> Station 6 (capped at MAX_CODING_ATTEMPTS);
@@ -128,6 +133,7 @@ def build_graph():
     g.add_node("unsupported_route", nodes.unsupported_route)
     g.add_node("dep_resolver", nodes.dep_resolver)
     g.add_node("reachability_gate", nodes.reachability_gate)
+    g.add_node("qa_scenarios", nodes.qa_scenarios)   # MM-14738: GAN-hardened test scenarios, pre-code
     if config.PERSISTENT_CONTAINER:
         g.add_node("prep_container", nodes.prep_container)        # #1: start ONE shared test container
     if config.PERSISTENT_CONTAINER or config.WARM_SIT_INFRA:
@@ -186,11 +192,14 @@ def build_graph():
 
     g.add_edge("dep_resolver", _analysis_join)
     if config.PERSISTENT_CONTAINER:
-        # prep_container (shared boot) -> reachability_gate -> coder.
-        g.add_edge("prep_container", "reachability_gate")
-        g.add_edge("reachability_gate", "coder")
-    else:
-        g.add_edge("reachability_gate", "coder")
+        g.add_edge("prep_container", "reachability_gate")   # prep_container (shared boot) -> reachability_gate
+    # reachability_gate -> qa_scenarios -> coder, regardless of PERSISTENT_CONTAINER (the only thing
+    # that toggle changes is whether prep_container sits in front of reachability_gate, above).
+    g.add_edge("reachability_gate", "qa_scenarios")
+    # MM-14738: GAN-hardened test scenarios are designed pre-code, right after reachability -- the
+    # fixed target `coder` must satisfy. A code_fault rework re-enters at `coder` (below) and never
+    # loops back through `qa_scenarios`, by construction (this is qa_scenarios' only outbound edge).
+    g.add_edge("qa_scenarios", "coder")
     g.add_edge("coder", "harsh_reviewer")
     g.add_conditional_edges("harsh_reviewer", after_review,
                             {"rework": "coder", "approve": "open_pr"})

@@ -353,3 +353,10 @@ def automation_verdict_path(ticket_id: str) -> Path:
     """Canonical machine-readable verdict the ocean-automation-testing skill writes
     (SKILL.md Station 3). This orchestrator reads it rather than imposing its own schema."""
     return FK_AIDEVELOPER_DIR / "memory" / "tickets" / f"{ticket_id}-automation-testing.json"
+
+
+def qa_scenarios_path(ticket_id: str) -> Path:
+    """GAN-hardened scenario artifact ocean-qa-agent writes on `--scenarios-only` (SKILL.md Step
+    5d/10, MM-14738). The qa_scenarios node writes this pre-code; sit_author reads it back and
+    passes it down as `--use-scenarios` so the pytest is written from these, not designed fresh."""
+    return FK_AIDEVELOPER_DIR / "memory" / "tickets" / f"{ticket_id}-qa-scenarios.json"

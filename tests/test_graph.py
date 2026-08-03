@@ -64,6 +64,7 @@ def _install(script: Script, tmp_path, monkeypatch):
     vdir = tmp_path / "verdicts"
     vdir.mkdir()
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")
+    monkeypatch.setattr(config, "qa_scenarios_path", lambda tid: vdir / f"{tid}-qa-scenarios.json")
     nowhere = str(tmp_path / "nonexistent.json")  # -> _load_json returns {}
 
     async def fake_run_agent(**kw):
@@ -106,6 +107,13 @@ def _install(script: Script, tmp_path, monkeypatch):
         node = kw["node"]
         script.calls[node] += 1
         path = config.automation_verdict_path(kw["ticket_id"])
+        if node == "qa_scenarios":
+            # MM-14738: GAN-hardened scenarios, written pre-code to their OWN artifact -- must not
+            # touch automation_verdict_path, or it'd pollute what sit_resolve/sit_triage read later.
+            config.qa_scenarios_path(kw["ticket_id"]).write_text(json.dumps({
+                "ticket_id": kw["ticket_id"], "qa_gan_verdict": "APPROVE", "qa_gan_phase0_gaps": [],
+            }))
+            return
         if node == "learn_repo" or node == "sit_run":
             return  # onboarding pass / execute phase write no final verdict
         if node == "sit_author":
@@ -167,7 +175,15 @@ def _run(ticket="MM-1"):
         "ticket_id": ticket, "execution_id": "EXE-test", "profile": "isbu", "context": "",
         "review_iteration": 0, "review_findings": [], "coding_attempts": 0, "sit_findings": [],
     }
-    return asyncio.run(app.ainvoke(initial, config={"recursion_limit": 100}))
+    try:
+        return asyncio.run(app.ainvoke(initial, config={"recursion_limit": 100}))
+    finally:
+        # Real runs release their SIT slot in cli.py::_execute's finally (see nodes._acquire_sit_slot's
+        # docstring) -- this helper calls ainvoke directly and bypasses that, so any test whose run
+        # reaches sit_run would otherwise leak its slot for the rest of THIS pytest process. Every test
+        # using this helper shares execution_id="EXE-test", so this is idempotent/safe even for tests
+        # that never reach sit_run (nodes._release_sit_slot no-ops if the slot was never acquired).
+        nodes._release_sit_slot("EXE-test")
 
 
 # ----------------------------------------------------------------- pure routing
@@ -257,12 +273,15 @@ def test_teardown_container_is_safe_noop(monkeypatch):
 
 def test_graph_persistent_container_wiring(monkeypatch):
     # On: the shared container boots BEFORE reachability so reachability reuses it too — the fan-out
-    # joins at prep_container -> reachability_gate -> coder; both terminals -> teardown_container -> END.
+    # joins at prep_container -> reachability_gate -> qa_scenarios -> coder (MM-14738: GAN-hardened
+    # scenarios designed pre-code); both terminals -> teardown_container -> END.
     monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
     monkeypatch.setattr(config, "PARALLEL_ANALYSIS", True)
     edges = {(e.source, e.target) for e in graph.build_graph().compile().get_graph().edges}
     assert ("prep_container", "reachability_gate") in edges
-    assert ("reachability_gate", "coder") in edges
+    assert ("reachability_gate", "qa_scenarios") in edges
+    assert ("qa_scenarios", "coder") in edges
+    assert ("reachability_gate", "coder") not in edges              # no direct edge -- qa_scenarios sits between
     assert ("reachability_gate", "prep_container") not in edges     # old order must be gone
     # fan-out / dep_resolver now join at prep_container (the barrier)
     assert ("dep_resolver", "prep_container") in edges
@@ -270,10 +289,11 @@ def test_graph_persistent_container_wiring(monkeypatch):
     assert ("prep_image", "prep_container") in edges
     assert ("flip_ready", "teardown_container") in edges
     assert ("stop_run", "teardown_container") in edges
-    # Off: coder is fed directly, no container nodes.
+    # Off: qa_scenarios still sits between reachability and coder, no container nodes.
     monkeypatch.setattr(config, "PERSISTENT_CONTAINER", False)
     edges = {(e.source, e.target) for e in graph.build_graph().compile().get_graph().edges}
-    assert ("reachability_gate", "coder") in edges
+    assert ("reachability_gate", "qa_scenarios") in edges
+    assert ("qa_scenarios", "coder") in edges
     assert not any("container" in a or "container" in b for a, b in edges)
 
 
@@ -321,7 +341,8 @@ def test_graph_warm_sit_infra_wiring_without_container(monkeypatch):
     edges = {(e.source, e.target) for e in app.get_graph().edges}
     assert ("flip_ready", "teardown_container") in edges
     assert ("stop_run", "teardown_container") in edges
-    assert ("reachability_gate", "coder") in edges   # no prep_container inserted
+    assert ("reachability_gate", "qa_scenarios") in edges   # no prep_container inserted
+    assert ("qa_scenarios", "coder") in edges
 
 
 def test_after_review():
@@ -362,7 +383,84 @@ def test_after_rca_review():
     assert graph.after_rca_review({"rca_fix_needed": False, "rca_approval_decision": "reject"}) == "reject"
 
 
+def test_qa_review_gate_surfaces_gan_verdict_and_gaps(monkeypatch):
+    """MM-14738: qa_scenarios' GAN verdict + Phase-0 gaps must reach a human (interrupt payload) or at
+    least the run log (auto-approve telemetry) — qa_review_gate is the only place either ever surfaces,
+    so a silent drop here means a REJECT verdict never gets seen by anyone."""
+    state = {"execution_id": "EXE1", "ticket_id": "MM-1", "qa_test_path": "t.py",
+             "qa_gan_verdict": "REJECT", "qa_gan_phase0_gaps": [{"severity": "HIGH", "title": "g1"}]}
+    # Auto path: the decision alone doesn't prove anything -- assert the GAN fields reach telemetry.
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", True)
+    monkeypatch.setattr(config, "QA_TESTRAIL", False)
+    events = []
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: events.append((a, kw)))
+    asyncio.run(nodes.qa_review_gate(state))
+    assert events, "qa_review_gate must emit a telemetry event on the auto path"
+    kw = events[-1][1]
+    assert kw.get("qa_gan_verdict") == "REJECT"
+    assert kw.get("qa_gan_phase0_gap_count") == 1
+    # Human path: the interrupt() payload itself must carry both fields, not just test_path/prompt.
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", False)
+    captured = {}
+
+    def fake_interrupt(payload):
+        captured.update(payload)
+        return {"decision": "approve_no_testrail", "note": ""}
+    monkeypatch.setattr("langgraph.types.interrupt", fake_interrupt)
+    asyncio.run(nodes.qa_review_gate(state))
+    assert captured.get("qa_gan_verdict") == "REJECT"
+    assert captured.get("qa_gan_phase0_gaps") == [{"severity": "HIGH", "title": "g1"}]
+
+
 # ----------------------------------------------------------------- full paths
+def test_full_node_tree_happy_path_single_pass(tmp_path, monkeypatch):
+    """MM-14738 complete-tree smoke test: a clean single pass (no rework, no retries, no onboarding,
+    no TestRail) exercises every agent/skill-backed node in the story-ticket coding-route tree EXACTLY
+    once, in the right order, and never touches any of the rework/retry/onboarding/testrail branches.
+    Complements the narrower test_happy_path (which only asserts a handful of nodes) with a full
+    accounting, and complements the structural wiring tests (which check edges exist but never run
+    the graph) by actually driving it end to end."""
+    monkeypatch.setattr(config, "PARALLEL_ANALYSIS", True)
+    monkeypatch.setattr(config, "PERSISTENT_CONTAINER", True)
+    s = Script(route="coding", sme_bucket="callback_notification",
+               review_seq=["APPROVE"], sit_seq=["passed"])
+    _install(s, tmp_path, monkeypatch)
+    final = _run()
+
+    assert final["final_status"] == "completed"
+    assert final["ready_flipped"] is True
+
+    # Every agent/skill/gitops-backed node on the coding route's happy path, exactly once.
+    expected_once = [
+        "researcher", "sme_consult", "dep_resolver", "reachability_gate",
+        "qa_scenarios",                                    # MM-14738: pre-code, once
+        "coder", "harsh_reviewer",
+        "sit_resolve", "sit_author",                        # post-review, once (no rework here)
+        "sit_run", "sit_triage",
+        "open_pr", "flip_ready",
+    ]
+    for node in expected_once:
+        assert s.calls[node] == 1, f"{node}: expected exactly 1 call, got {s.calls[node]}"
+
+    # Rework/retry/onboarding/TestRail branches: a clean single pass must never enter any of them.
+    for node in ["learn_repo", "prep_rework", "prep_env_retry", "sit_testrail"]:
+        assert s.calls[node] == 0, f"{node}: expected 0 calls on a clean pass, got {s.calls[node]}"
+
+    # Structural completeness: every node this test relies on (plus the plain-code ones it can't
+    # track via Script -- prep_container/human_gate/stop_run/teardown_container) actually exists in
+    # the compiled graph for this config, independent of whether THIS run's branch happened to visit it.
+    node_set = set(graph.build_graph().compile().get_graph().nodes)
+    full_tree = {
+        "researcher", "sme_consult", "dep_resolver", "prep_image", "prep_container",
+        "reachability_gate", "qa_scenarios", "coder", "harsh_reviewer", "open_pr",
+        "sit_resolve", "sit_author", "qa_review_gate", "sit_run", "sit_testrail", "sit_triage",
+        "learn_repo", "prep_rework", "prep_env_retry", "human_gate", "flip_ready", "stop_run",
+        "teardown_container", "rca_agent", "rca_report", "rca_review_gate", "rca_done",
+        "unsupported_route",
+    }
+    assert full_tree <= node_set, f"missing from compiled graph: {full_tree - node_set}"
+
+
 def test_happy_path(tmp_path, monkeypatch):
     s = Script(review_seq=["APPROVE"], sit_seq=["passed"])
     _install(s, tmp_path, monkeypatch)
@@ -371,6 +469,7 @@ def test_happy_path(tmp_path, monkeypatch):
     assert final["ready_flipped"] is True
     assert final["worktree_dir"] == "/tmp/ws/ocean-worker"  # coder's clone threaded into state
     assert s.calls["sme_consult"] == 0   # no domain_bucket -> SME node is a no-op
+    assert s.calls["qa_scenarios"] == 1  # MM-14738: GAN-hardened scenarios, once, before coder
     assert s.calls["coder"] == 1
     assert s.calls["harsh_reviewer"] == 1
     assert s.calls["sit_triage"] == 1
@@ -403,6 +502,17 @@ def test_code_fault_loop_then_pass(tmp_path, monkeypatch):
     assert s.calls["sit_triage"] == 2
     assert s.calls["coder"] == 2      # initial + one code_fault rework
     assert s.calls["open_pr"] == 1  # opened once; re-entry is a no-op
+    # MM-14738: the code_fault rework re-enters at coder directly (prep_rework -> coder) and never
+    # loops back through qa_scenarios -- the GAN-hardened scenarios are the fixed target the rework
+    # must satisfy, not something that gets redesigned per rework.
+    assert s.calls["qa_scenarios"] == 1
+    # sit_author DOES legitimately re-run here -- unchanged, pre-existing behavior: every open_pr
+    # completion (including this rework's re-entry, even though open_pr itself no-ops) still falls
+    # through to sit_resolve -> sit_author, which is Station 1's own "diff moved -> re-author/update"
+    # check (ocean-automation-testing SKILL.md) -- the code changed between passes, so it re-checks
+    # whether the pytest needs updating. MM-14738 only changed scenario *design* (qa_scenarios); it
+    # did not change sit_author's per-pass diff-awareness.
+    assert s.calls["sit_author"] == 2
 
 
 def test_code_fault_budget_exhausted(tmp_path, monkeypatch):
@@ -450,6 +560,7 @@ def test_environment_failure_retries_sit_run_only_then_passes(tmp_path, monkeypa
     assert s.calls["sit_resolve"] == 1      # NOT re-resolved -- retry skips straight to sit_run
     assert s.calls["sit_author"] == 1       # NOT re-authored -- the draft/review already happened
     assert s.calls["coder"] == 1            # NOT the code_fault loop -- this isn't a code problem
+    assert s.calls["qa_scenarios"] == 1     # NOT re-run either -- same reasoning (MM-14738)
 
 
 def test_environment_failure_budget_exhausted(tmp_path, monkeypatch):
@@ -976,6 +1087,7 @@ def test_resume_recovers_real_ticket_id_from_checkpoint(tmp_path, monkeypatch):
             await app.ainvoke(_initial(ticket="MM-9999", exe="EXE-resume-test"), config=thread)
 
     asyncio.run(_pause_at_gate())
+    nodes._release_sit_slot("EXE-resume-test")  # see _run()'s comment -- ainvoke bypasses cli.py's release
 
     recovered = asyncio.run(cli._resume_ticket_id("EXE-resume-test", thread))
     assert recovered == "MM-9999"
@@ -1010,6 +1122,7 @@ def test_resume_passes_recovered_ticket_id_to_execute(tmp_path, monkeypatch):
             await app.ainvoke(_initial(ticket="MM-8888", exe="EXE-resume-e2e"), config=thread)
 
     asyncio.run(_pause_at_gate())
+    nodes._release_sit_slot("EXE-resume-e2e")  # see _run()'s comment -- ainvoke bypasses cli.py's release
 
     captured: dict = {}
 

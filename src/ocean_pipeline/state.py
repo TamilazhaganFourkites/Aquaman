@@ -83,6 +83,13 @@ class OceanState(TypedDict, total=False):
     preflight_failed: bool
     preflight_reason: str
 
+    # --- qa_scenarios: GAN-hardened test scenarios, authored pre-code right after reachability_gate
+    # (MM-14738) — sit_author reads this back post-review and passes it to ocean-qa-agent as
+    # `--use-scenarios` so the pytest is written from these, not designed fresh.
+    qa_scenarios_path: str            # artifact path ocean-qa-agent wrote on `--scenarios-only`
+    qa_gan_verdict: str               # APPROVE | APPROVE WITH FIXES | REJECT (Step 5d) -- surfaced at qa_review_gate
+    qa_gan_phase0_gaps: list          # HIGH spec gaps from Step 2e, headless-deferred to qa_review_gate
+
     # --- QA review gate (human 3-way: approve+TestRail / approve / changes) ---
     qa_test_path: str                # drafted SIT file, shown to the reviewer
     qa_decision: str                 # approve_testrail | approve_no_testrail | changes

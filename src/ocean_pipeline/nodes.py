@@ -730,6 +730,41 @@ async def reachability_gate(state: OceanState) -> dict:
     return {"reachability_report": _load_json(v.report_path), "reachability_blocking": v.blocking}
 
 
+# ------------------------------------------------------------------ 1.6 — GAN-hardened test scenarios (MM-14738)
+async def qa_scenarios(state: OceanState) -> dict:
+    """Design + GAN-harden the SIT test scenarios BEFORE any code exists (skill Station-independent —
+    calls `ocean-qa-agent` directly, not `ocean-automation-testing`, since that skill's own contract
+    is post-code/post-PR; see ocean-qa-agent SKILL.md Steps 2e/5d + `--scenarios-only`). TDD-style: the
+    hardened scenarios become the fixed target `coder` must satisfy, and `sit_author` later writes the
+    actual pytest from them (post-review) rather than designing fresh. A code_fault rework re-enters at
+    `coder` directly and never re-runs this node — the scenarios don't change because the code did."""
+    tid, exec_id = state["ticket_id"], state["execution_id"]
+    telemetry.station_event(exec_id, 1.6, "start")
+    scenarios_path = config.qa_scenarios_path(tid)
+    scenarios_path.parent.mkdir(parents=True, exist_ok=True)
+    await agents.run_skill(
+        skill_name="ocean-qa-agent",
+        node="qa_scenarios",
+        ticket_id=tid,
+        task_prompt=(
+            f"Run /ocean-qa-agent {tid} --scenarios-only --no-review, HEADLESS. No code or PR exists "
+            f"yet for this ticket -- design the test scenarios from the ticket's ACs alone (Steps "
+            f"1-2e, 4/4a, 5, 5b, 5d), GAN-harden them (Step 2e spec-completeness, Step 5d test-case "
+            f"GAN), and persist the hardened scenario list + qa_gan_verdict + any Step 2e HIGH spec "
+            f"gaps to {scenarios_path}. Do NOT search for a PR/diff (Step 3/3b) -- there isn't one yet "
+            f"-- and do NOT write a pytest file (Step 7) -- that happens later, post-review, in "
+            f"sit_author.\n\n{_summary(state)}\n\n"
+            f"Reachability report (for AC/behavior context):\n{_brief(state.get('reachability_report'), limit=8000)}\n\n"
+            f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}"
+        ),
+    )
+    partial = _load_json(str(scenarios_path))
+    telemetry.station_event(exec_id, 1.6, "end", qa_gan_verdict=partial.get("qa_gan_verdict", ""))
+    return {"qa_scenarios_path": str(scenarios_path),
+            "qa_gan_verdict": partial.get("qa_gan_verdict", ""),
+            "qa_gan_phase0_gaps": partial.get("qa_gan_phase0_gaps", [])}
+
+
 # ------------------------------------------------------------------ Station 4
 async def coder(state: OceanState) -> dict:
     iteration = state.get("review_iteration", 0)
@@ -896,6 +931,13 @@ async def open_pr(state: OceanState) -> dict:
 # ocean-automation-testing skill one `--only <phase>` at a time (state flows through the skill's own
 # memory/tickets/<TICKET>-automation-testing.json). The graph branches at the two real decision points:
 # after resolve (onboard an unsupported repo) and after triage (pass / code_fault / could_not_verify).
+#
+# NOTE on numbering vs. execution order (MM-14738): these "Station 6.x" labels are historical, not
+# execution order. `sit_author` (6.1) no longer designs scenarios from scratch here — `qa_scenarios`
+# (Station 1.6, defined above with `coder`) already GAN-hardened them pre-code, right after
+# reachability_gate; `sit_author` runs post-review as before and just writes the pytest from that
+# artifact. Actual execution order: reachability_gate -> qa_scenarios -> coder -> harsh_reviewer ->
+# open_pr -> sit_resolve -> sit_author -> qa_review_gate -> sit_run[+testrail] -> sit_triage.
 
 # ------------------------------------------------------------------ Station 6a — resolve (+ gate)
 async def sit_resolve(state: OceanState) -> dict:
@@ -941,26 +983,49 @@ async def sit_resolve(state: OceanState) -> dict:
 
 # ------------------------------------------------------------------ Station 6b — author (draft + STOP)
 async def sit_author(state: OceanState) -> dict:
-    """Draft the SIT scenarios + sample test (skill Station 1) and STOP — no TestRail cases, no run.
-    A human reviews the draft at qa_review_gate before anything executes or gets committed. On a
-    'changes' loop-back, the reviewer's note is fed in so ocean-qa-agent revises the draft."""
+    """Write the SIT pytest (skill Station 1) from the GAN-hardened scenarios `qa_scenarios` already
+    produced pre-code, and STOP — no TestRail cases, no run. A human reviews the draft at
+    qa_review_gate before anything executes or gets committed.
+
+    On the FIRST pass (no reviewer note yet): pass `--use-scenarios` through to ocean-qa-agent so it
+    finds the real diff/helpers (Step 3/3b/4/4a) and writes the pytest from the pre-hardened scenarios
+    — it does NOT redesign them. On a 'changes' loop-back: the reviewer already looked at the concrete
+    draft and their feedback supersedes the earlier automated hardening, so this pass runs a full
+    design+write instead (no `--use-scenarios`) — same as before MM-14738 — letting the note reshape
+    the scenarios themselves, not just the pytest mechanics."""
     tid, exec_id = state["ticket_id"], state["execution_id"]
     it = state.get("qa_review_iteration", 0)
     telemetry.station_event(exec_id, 6.1, "start", qa_review_iteration=it)
     note = state.get("qa_note") or ""
-    revise = (f"\nThe reviewer requested CHANGES to the prior draft — revise the scenarios/test to "
-              f"address this feedback:\n{note}\n") if note else ""
+    scenarios_path = state.get("qa_scenarios_path") or ""
+    if note:
+        # Revise pass: human feedback on the concrete draft outranks the pre-hardened scenarios --
+        # redesign + rewrite in one shot, exactly as ocean-qa-agent did before this ticket.
+        author_directive = (
+            f"Draft the invariant-compliant SIT scenarios + the pytest file via ocean-qa-agent with "
+            f"`--no-review --skip-testrail`: AUTHOR/UPDATE the test file (reuse only if it still "
+            f"covers the current diff) and record the scenarios + the test path, then STOP.\n"
+            f"The reviewer requested CHANGES to the prior draft — revise the scenarios/test to "
+            f"address this feedback:\n{note}\n"
+        )
+    else:
+        # First pass: the scenarios are already GAN-hardened (qa_scenarios ran pre-code) -- do not
+        # redesign them, just find the real diff and write the pytest from them.
+        author_directive = (
+            f"Write the pytest file via ocean-qa-agent with `--use-scenarios {scenarios_path} "
+            f"--no-review --skip-testrail`: it will find the real diff/helpers (Step 3/3b/4/4a) and "
+            f"write the file from the ALREADY GAN-hardened scenarios at that path -- do NOT let it "
+            f"redesign the scenarios. Record the test path, then STOP.\n"
+        )
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_author",
         ticket_id=tid,
         task_prompt=(
             f"Run ocean-automation-testing Station 1 (author) ONLY for {tid} (`--only author`), HEADLESS. "
-            f"Station 0 (resolve) already ran — do NOT re-resolve. Draft the invariant-compliant SIT "
-            f"scenarios + the pytest file via ocean-qa-agent with `--no-review --skip-testrail`: "
-            f"AUTHOR/UPDATE the test file (reuse only if it still covers the current diff) and record the "
-            f"scenarios + the test path, then STOP. Do NOT create TestRail cases and do NOT execute the "
-            f"SIT — a human reviews this draft next.{revise}\n\n{_summary(state)}"
+            f"Station 0 (resolve) already ran — do NOT re-resolve. {author_directive}"
+            f"Do NOT create TestRail cases and do NOT execute the SIT — a human reviews this draft "
+            f"next.\n\n{_summary(state)}"
         ),
     )
     partial = _load_json(str(config.automation_verdict_path(tid)))
@@ -974,17 +1039,27 @@ async def qa_review_gate(state: OceanState) -> dict:
     """Human review of the drafted SIT — the same 3-way choice ocean-qa-agent offers interactively
     (approve-with-TestRail / approve-without-TestRail / changes), surfaced at the graph level so it
     works headless. Default ON (interrupt + wait). QA_REVIEW_AUTO skips the pause and auto-approves
-    (with TestRail only if QA_TESTRAIL is set)."""
+    (with TestRail only if QA_TESTRAIL is set).
+
+    MM-14738: this is also where qa_scenarios' GAN verdict + Phase-0 spec gaps finally surface --
+    qa_scenarios ran headless (no human watching) and sit_author never re-inspects them, so if either
+    is dropped here they're dropped for good. Both the interrupt payload (human path) and the auto
+    telemetry (headless path, so it's at least in the run log) carry them."""
     exec_id = state["execution_id"]
+    gan_verdict = state.get("qa_gan_verdict", "")
+    phase0_gaps = state.get("qa_gan_phase0_gaps", [])
     if config.QA_REVIEW_AUTO:
         decision = "approve_testrail" if config.QA_TESTRAIL else "approve_no_testrail"
-        telemetry.station_event(exec_id, 6.15, "auto", qa_decision=decision)
+        telemetry.station_event(exec_id, 6.15, "auto", qa_decision=decision,
+                                qa_gan_verdict=gan_verdict, qa_gan_phase0_gap_count=len(phase0_gaps))
         return {"qa_decision": decision, "qa_note": ""}
     from langgraph.types import interrupt
     raw = interrupt({
         "action": "qa_review",
         "ticket_id": state["ticket_id"],
         "test_path": state.get("qa_test_path"),
+        "qa_gan_verdict": gan_verdict,      # APPROVE | APPROVE WITH FIXES | REJECT (Step 5d)
+        "qa_gan_phase0_gaps": phase0_gaps,  # HIGH spec gaps from Step 2e, if the ticket itself has holes
         "prompt": ("Review the drafted SIT scenarios + sample test, then resume with ONE of: "
                    "`--qa approve-testrail` | `--qa approve-no-testrail` | "
                    "`--qa changes --note '<feedback>'`."),
