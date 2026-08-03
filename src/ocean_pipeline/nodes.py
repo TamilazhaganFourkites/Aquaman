@@ -753,9 +753,9 @@ async def qa_scenarios(state: OceanState) -> dict:
         task_prompt=(
             f"Run /ocean-qa-agent {tid} --scenarios-only --no-review, HEADLESS. No code or PR exists "
             f"yet for this ticket -- design the test scenarios from the ticket's ACs alone (Steps "
-            f"1-2e, 4/4a, 5, 5b, 5d), GAN-harden them (Step 2e spec-completeness, Step 5d test-case "
-            f"GAN), and persist the hardened scenario list + qa_gan_verdict + any Step 2e HIGH spec "
-            f"gaps to {scenarios_path}. Do NOT search for a PR/diff (Step 3/3b) -- there isn't one yet "
+            f"1-2d, 4/4a, 5, 5b, 5d -- Step 2e is disabled, skip it), GAN-harden them (Step 5d "
+            f"test-case GAN), and persist the hardened scenario list + qa_gan_verdict to "
+            f"{scenarios_path}. Do NOT search for a PR/diff (Step 3/3b) -- there isn't one yet "
             f"-- and do NOT write a pytest file (Step 7) -- that happens later, post-review, in "
             f"sit_author.\n\n{_summary(state)}\n\n"
             f"Reachability report (for AC/behavior context):\n{_brief(state.get('reachability_report'), limit=8000)}\n\n"
@@ -1052,7 +1052,9 @@ async def qa_review_gate(state: OceanState) -> dict:
     MM-14738: this is also where qa_scenarios' GAN verdict + Phase-0 spec gaps finally surface --
     qa_scenarios ran headless (no human watching) and sit_author never re-inspects them, so if either
     is dropped here they're dropped for good. Both the interrupt payload (human path) and the auto
-    telemetry (headless path, so it's at least in the run log) carry them."""
+    telemetry (headless path, so it's at least in the run log) carry them. (Phase 0 / Step 2e is
+    currently DISABLED in ocean-qa-agent/SKILL.md -- qa_gan_phase0_gaps is always [] until it's
+    re-enabled there; this plumbing is left in place so re-enabling needs no code change here.)"""
     exec_id = state["execution_id"]
     gan_verdict = state.get("qa_gan_verdict", "")
     phase0_gaps = state.get("qa_gan_phase0_gaps", [])
@@ -1067,7 +1069,8 @@ async def qa_review_gate(state: OceanState) -> dict:
         "ticket_id": state["ticket_id"],
         "test_path": state.get("qa_test_path"),
         "qa_gan_verdict": gan_verdict,      # APPROVE | APPROVE WITH FIXES | REJECT (Step 5d)
-        "qa_gan_phase0_gaps": phase0_gaps,  # HIGH spec gaps from Step 2e, if the ticket itself has holes
+        "qa_gan_phase0_gaps": phase0_gaps,  # HIGH spec gaps from Step 2e -- always [] while Step 2e
+                                            # is disabled in ocean-qa-agent/SKILL.md (MM-14738)
         "prompt": ("Review the drafted SIT scenarios + sample test, then resume with ONE of: "
                    "`--qa approve-testrail` | `--qa approve-no-testrail` | "
                    "`--qa changes --note '<feedback>'`."),

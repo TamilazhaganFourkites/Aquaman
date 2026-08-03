@@ -95,6 +95,7 @@ class OceanState(TypedDict, total=False):
     qa_scenarios_path: str            # artifact path ocean-qa-agent wrote on `--scenarios-only`
     qa_gan_verdict: str               # APPROVE | APPROVE WITH FIXES | REJECT (Step 5d) -- surfaced at qa_review_gate
     qa_gan_phase0_gaps: list          # HIGH spec gaps from Step 2e, headless-deferred to qa_review_gate
+                                      # -- always [] while Step 2e is disabled in ocean-qa-agent/SKILL.md (MM-14738)
 
     # --- QA review gate (human 3-way: approve+TestRail / approve / changes) ---
     qa_test_path: str                # drafted SIT file, shown to the reviewer
