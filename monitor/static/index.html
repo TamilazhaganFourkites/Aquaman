@@ -318,7 +318,10 @@
   }
 
   /* ── Live: master-detail layout ──────────────────────────────────── */
-  .live-layout { display:grid; grid-template-columns:360px 1fr; gap:var(--sp-4); align-items:start; }
+  /* minmax(0, 1fr), not bare 1fr — same reason as .step below: without it, long unbroken
+     content anywhere inside the detail column (the activity ticker, a long log path, raw
+     tool-call JSON) forces this whole track wider instead of letting the child truncate. */
+  .live-layout { display:grid; grid-template-columns:minmax(220px, 300px) minmax(0, 1fr); gap:var(--sp-4); align-items:start; }
   .list-panel { border:1px solid var(--line); border-radius:var(--radius); background:var(--surface);
     box-shadow:var(--shadow); overflow:hidden; position:sticky; top:calc(var(--header-h) + var(--toolbar-h) + var(--sp-4));
     max-height:calc(100vh - var(--header-h) - var(--toolbar-h) - var(--sp-4) * 2); display:flex; flex-direction:column; }
@@ -401,8 +404,15 @@
     font-variant-numeric:tabular-nums; }
   .meta-line.path { max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; }
 
-  .stepper { padding:var(--sp-4) var(--sp-5) 4px; }
-  .step { position:relative; display:grid; grid-template-columns:20px 1fr; column-gap:12px; padding-bottom:14px; }
+  /* Scrolls INTERNALLY once a run accumulates enough steps — card-head above and the gate/rawlog
+     below stay put instead of getting pushed further down the page on every long-running ticket. */
+  .stepper { padding:var(--sp-4) var(--sp-5) 4px; max-height:min(560px, 60vh); overflow-y:auto; overscroll-behavior:contain; }
+  /* grid-template-columns uses minmax(0, 1fr), NOT bare 1fr: a bare 1fr track's implicit min
+     width is its content's min-content size, so a long unbroken line (the activity ticker,
+     raw tool-call JSON) forces the whole track — and everything above it up to .detail-card —
+     to grow to fit instead of letting the child's own overflow:hidden/ellipsis truncate it.
+     minmax(0, 1fr) is what actually lets the track shrink to the available width first. */
+  .step { position:relative; display:grid; grid-template-columns:20px minmax(0, 1fr); column-gap:12px; padding-bottom:14px; }
   .step:not(:last-child)::after {
     content:""; position:absolute; left:9px; top:23px; bottom:-8px; width:1.5px; background:var(--line-strong);
   }
@@ -563,7 +573,11 @@
     @keyframes rowin { from{ opacity:0; transform:translateY(4px);} to{ opacity:1; transform:none;} }
   }
 
-  @media (max-width:900px) {
+  /* Below ~760px the list column's minmax(220,300) floor leaves the detail column (card head,
+     ticket-row step captions, log lines) too cramped to be usable — stack instead of squeezing
+     both into a dead zone. 760px keeps the detail column at a comfortable ~380px+ whenever the
+     2-column layout is actually shown. */
+  @media (max-width:760px) {
     .live-layout { grid-template-columns:1fr; }
     .list-panel { position:static; max-height:none; }
   }

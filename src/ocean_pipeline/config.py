@@ -79,12 +79,14 @@ WARM_SIT_INFRA = os.environ.get("OCEAN_PIPELINE_WARM_SIT_INFRA", "0").lower() in
 # --include-test-group) so the coder's unit rspec and the SIT run start test-ready and NEVER re-run
 # `bundle install` at runtime. WHY: EXE-1e3d6530 observed the coder running 49 runtime `bundle install`s
 # across two repos, each crawling under Rosetta, which pushed it past its wait window and the run was
-# killed with no verdict (manual-findings #4 / tracker #1+#16). DEFAULT OFF + fully fallback-safe: the
-# test-group child build is best-effort; if it fails, prep falls back to the prod image and the station
-# installs as it does today. Turn on per-run with OCEAN_PIPELINE_BAKE_TEST_GROUP=1 to validate, then flip
-# the default once a run confirms the -test image boots green. Pair with OCEAN_IMAGE_PLATFORM=linux/arm64
-# on Apple Silicon (ruby_image_cache reads it) to also drop Rosetta (manual-findings #15).
-BAKE_TEST_GROUP = os.environ.get("OCEAN_PIPELINE_BAKE_TEST_GROUP", "0").lower() in ("1", "true", "yes")
+# killed with no verdict (manual-findings #4 / tracker #1+#16). DEFAULT ON (B5): EXE-6fca4a71 confirmed the
+# prod image can't run specs — reachability AND coder each fell back to a separate `--units` test image, and
+# the SIT couldn't reuse the shared prod container. Fully fallback-safe: the test-group child build is
+# best-effort; if it fails, prep falls back to the prod image and the station installs as it does today.
+# Set OCEAN_PIPELINE_BAKE_TEST_GROUP=0 to disable; a follow-up run should confirm the -test image boots
+# green. Pair with OCEAN_IMAGE_PLATFORM=linux/arm64 on Apple Silicon (ruby_image_cache reads it) to also
+# drop Rosetta (manual-findings #15).
+BAKE_TEST_GROUP = os.environ.get("OCEAN_PIPELINE_BAKE_TEST_GROUP", "1").lower() in ("1", "true", "yes")
 
 # Max number of SIT stacks allowed to run CONCURRENTLY across all pipeline runs on this machine
 # (manual-findings #18). The SIT stage stands up a heavy stack (localstack/es/redis/mock + the changed
@@ -204,7 +206,10 @@ MAX_ENV_RETRY_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ENV_RETRY_ATTEMP
 
 # Wall-clock cap for the prep_image pre-warm (a cold Ruby image build can be minutes). On timeout the
 # pre-warm is abandoned best-effort and the coder builds normally -- pre-warm never blocks the run.
-IMAGE_PREWARM_TIMEOUT = int(os.environ.get("OCEAN_PIPELINE_IMAGE_PREWARM_TIMEOUT", "900"))
+# B1: a COLD MMCUW build (many private FK git-gems, each a clone + native build) exceeds 15 min, so 900s
+# made prep_image ALWAYS time out on a fresh lockfile → orphaned build (B2) + a duplicate rebuild by
+# prep_container (B3). 1800s lets a cold build finish in-stage. (EXE-6fca4a71.)
+IMAGE_PREWARM_TIMEOUT = int(os.environ.get("OCEAN_PIPELINE_IMAGE_PREWARM_TIMEOUT", "1800"))
 
 # Local mock-first SIT: the LocalStack SQS endpoint the test-automation SQS client must target.
 # Without this exported, that client silently constructs as None and crashes on `.meta`, so the

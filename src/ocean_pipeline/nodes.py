@@ -12,6 +12,7 @@ import asyncio
 import fcntl
 import json
 import os
+import signal
 import re
 import shutil
 import subprocess
@@ -141,7 +142,12 @@ def _try_acquire_build_slot(execution_id: str, target_repos=None) -> bool:
     per exec_id (a retry keeps its existing hold). If Docker usage can't be measured
     (_docker_resources/_docker_used_gb return None), proceed permissively — this is best-effort capacity
     protection layered onto whatever already-fallback-safe stage calls it, not a hard preflight gate (that
-    contract belongs to _docker_preflight_reason, used only by sit_run)."""
+    contract belongs to _docker_preflight_reason, used only by sit_run).
+    SYNCHRONOUS on purpose (matches _try_acquire_sit_slot's contract, and what tests/test_build_slots.py
+    calls directly) — but unlike the SIT slot this also runs `docker info`/`docker stats`
+    (subprocess.run, ~10-20s worst case), so every async caller MUST invoke this via
+    `await asyncio.to_thread(_try_acquire_build_slot, ...)`, never call it directly from an async
+    function — a direct call would block the entire event loop for that long on every attempt."""
     if execution_id in _BUILD_SLOT_FDS:
         return True
     n = max(1, config.MAX_CONCURRENT_BUILDS)
@@ -174,13 +180,15 @@ async def _acquire_build_slot(execution_id: str, target_repos=None) -> str:
     """Wait (INTERRUPTIBLY) for a free build slot + headroom, then hold it. Same shape as
     _acquire_sit_slot: polls _try_acquire_build_slot between `await asyncio.sleep(5.0)`s (a cancel is
     observed immediately), gives up after config.BUILD_SLOT_WAIT_SECONDS and proceeds anyway — a queue,
-    not a crash, same philosophy as the SIT slot."""
-    if _try_acquire_build_slot(execution_id, target_repos):
+    not a crash, same philosophy as the SIT slot. Off-thread (see _try_acquire_build_slot's docstring):
+    this polls every 5s for up to BUILD_SLOT_WAIT_SECONDS, so keeping the docker subprocess calls off
+    the event loop here matters even more than on the first attempt."""
+    if await asyncio.to_thread(_try_acquire_build_slot, execution_id, target_repos):
         return "held" if execution_id in _BUILD_SLOT_FDS else "acquired"
     deadline = time.monotonic() + max(0, config.BUILD_SLOT_WAIT_SECONDS)
     while True:
         await asyncio.sleep(5.0)
-        if _try_acquire_build_slot(execution_id, target_repos):
+        if await asyncio.to_thread(_try_acquire_build_slot, execution_id, target_repos):
             return "acquired after waiting"
         if time.monotonic() >= deadline:
             return f"no free build slot/headroom after {config.BUILD_SLOT_WAIT_SECONDS}s — proceeding"
@@ -501,6 +509,21 @@ async def sme_consult(state: OceanState) -> dict:
 
 
 # ------------------------------------------------------------------ Station 0.6 — pre-warm Ruby image
+def _kill_proc_group(proc) -> None:
+    """SIGKILL the subprocess AND its whole process group (B2). ruby_image_cache spawns `docker build`
+    as a grandchild; a plain proc.kill() reaps only the Python wrapper, leaving the build ORPHANED and
+    running (~1hr observed in EXE-6fca4a71 — wasted CPU + a duplicate rebuild by prep_container, B3).
+    Requires the child to be spawned with start_new_session=True so it leads its own group."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
 async def prep_image(state: OceanState) -> dict:
     """#2 latency: pre-build/cache the Ruby ocean Docker image CONCURRENTLY with sme_consult/
     dep_resolver, so it is hot before the coder (the ~32m station) and reachability need it -- moving
@@ -516,7 +539,7 @@ async def prep_image(state: OceanState) -> dict:
     # attempts this): non-blocking single try, matching this function's own already-fallback-safe
     # posture. No slot/headroom -> skip the WHOLE prewarm cleanly (not a partial run) — the coder just
     # builds normally, exactly like every other "no-op" path this function already has.
-    if _any_docker_repo(target_repos) and not _try_acquire_build_slot(exec_id, target_repos):
+    if _any_docker_repo(target_repos) and not await asyncio.to_thread(_try_acquire_build_slot, exec_id, target_repos):
         telemetry.station_event(exec_id, 0.6, "skip", reason="no build capacity (slot/headroom)")
         return {}
     try:
@@ -537,12 +560,20 @@ async def prep_image(state: OceanState) -> dict:
                 env, has_token = _image_cache_env()
                 proc = await asyncio.create_subprocess_exec(
                     *_image_cache_argv(tool, name, worktree, has_token), env=env,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True)   # B2: own process group so a timeout kills the docker build too
                 try:
                     out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
                 except asyncio.TimeoutError:
-                    proc.kill()
+                    _kill_proc_group(proc)   # B2: kill the whole group, not just the Python wrapper
                     results.append(f"{name}: prewarm timed out (coder will build)"); continue
+                except BaseException:
+                    # start_new_session=True moved this child OUT of the pipeline's own process
+                    # group (B2's fix for the timeout case), so a Ctrl-C/kill of the pipeline itself
+                    # (CancelledError here) no longer reaches it via the parent's group — it would
+                    # otherwise be orphaned exactly like the timeout case this same fix targets.
+                    _kill_proc_group(proc)
+                    raise
                 tail = ((out or b"").decode(errors="replace").strip().splitlines() or [""])[-1]
                 results.append(f"{name}: {'ready' if proc.returncode == 0 else 'build failed'} ({tail[:80]})")
             except OSError as e:
@@ -580,7 +611,7 @@ async def prep_container(state: OceanState) -> dict:
     # via _container_directive) and is released only by teardown_container — a container sitting idle
     # between stages is still consuming real Docker memory the whole time, so the capacity hold must
     # reflect that, not just the moment this function itself is running.
-    if not _try_acquire_build_slot(exec_id, state.get("target_repos")):
+    if not await asyncio.to_thread(_try_acquire_build_slot, exec_id, state.get("target_repos")):
         telemetry.station_event(exec_id, 3.5, "skip", reason="no build capacity (slot/headroom)")
         return {"container_ready": False}
     container = f"ocean-{name}-{exec_id}"
@@ -589,14 +620,22 @@ async def prep_container(state: OceanState) -> dict:
         env, has_token = _image_cache_env()
         proc = await asyncio.create_subprocess_exec(
             *_image_cache_argv(tool, name, worktree, has_token), env=env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)   # B2: own process group so a timeout kills the docker build too
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.IMAGE_PREWARM_TIMEOUT)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_proc_group(proc)   # B2: kill the whole group, not just the Python wrapper
             telemetry.station_event(exec_id, 3.5, "skip", reason="image resolve timed out")
             _release_build_slot(exec_id)   # nothing came up — don't hold capacity for it
             return {"container_ready": False}
+        except BaseException:
+            # Same reasoning as prep_image: start_new_session=True took this child out of the
+            # pipeline's own process group, so a Ctrl-C/kill of the pipeline (CancelledError here)
+            # no longer reaches it via the parent's group — orphaned unless killed explicitly.
+            _kill_proc_group(proc)
+            _release_build_slot(exec_id)   # aborting before the container ever started — free the hold
+            raise
         tag = (((out or b"").decode(errors="replace").strip().splitlines() or [""])[-1]) if proc.returncode == 0 else ""
         if not tag:
             telemetry.station_event(exec_id, 3.5, "skip", reason="image tag unresolved")

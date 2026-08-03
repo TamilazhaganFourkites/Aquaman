@@ -62,19 +62,30 @@ def sync_local_checkout(slug: str) -> str:
         return subprocess.run(["git", "-C", str(repo_dir), *args],
                               capture_output=True, text=True, timeout=config.GH_TIMEOUT_SECONDS)
     try:
-        if _git(["status", "--porcelain"]).stdout.strip():
-            return f"skip: {name} checkout has uncommitted changes (left as-is)"
-        # origin's default branch (e.g. develop/main), e.g. "origin/develop"
+        # Only TRACKED modifications are "local work" a fast-forward could clobber. `git merge
+        # --ff-only` never touches UNtracked files, so untracked tooling artifacts (.vscode/,
+        # .claude/worktree/, .fourkites_docker_build_hash) must NOT block the sync — blocking on them
+        # left the checkout on a stale base, so prep_image keyed the pre-warm image to an OLD
+        # Gemfile.lock and the coder (cloning the current ref fresh) ALWAYS cache-missed and rebuilt
+        # mid-station (EXE-928fd700). Check tracked changes only.
+        if _git(["status", "--porcelain", "--untracked-files=no"]).stdout.strip():
+            return f"skip: {name} checkout has tracked local changes (left as-is)"
+        # Resolve origin's default branch (e.g. develop/main) FIRST, from the local origin/HEAD; if
+        # unset, ask the remote once (`set-head --auto` is a light ls-remote, not a full fetch).
         head = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).stdout.strip()
         default = head.rsplit("/", 1)[-1] if head else ""
-        if _git(["fetch", "--quiet", "origin"]).returncode != 0:
-            return f"skip: {name} fetch failed"
-        if not default:  # HEAD ref not set locally; resolve it from the remote once
+        if not default:
             _git(["remote", "set-head", "origin", "--auto"])
             default = (_git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
                        .stdout.strip().rsplit("/", 1)[-1])
         if not default:
             return f"skip: {name} default branch unresolved"
+        # Fetch ONLY the default branch — NOT `git fetch origin` (all refs), which aborts on a
+        # pre-existing origin D/F ref conflict (e.g. refs/heads/test vs refs/heads/test/unit-2), skips
+        # the whole sync, and leaves prep_image to build a STALE Gemfile.lock (MM-14622 / EXE-2fe18c28:
+        # a plain `git pull`/targeted fetch works by hand; the all-refs fetch here did not).
+        if _git(["fetch", "--quiet", "origin", default]).returncode != 0:
+            return f"skip: {name} fetch of origin/{default} failed"
         current = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
         if current != default:
             return f"skip: {name} on '{current}', not default '{default}' (left as-is)"

@@ -859,7 +859,39 @@ async def run_agent(
         raise
 
     if not verdict_path.exists():
-        raise StationError(node, agent_md, f"no verdict written to {verdict_path}")
+        # Backstop: the agent ended its turn WITHOUT writing the verdict. The common cause is that it
+        # offloaded slow work (an image build / test suite) to a BACKGROUND task and then stopped to
+        # "wait for a completion notification" — but a station is a SINGLE turn, so stopping tears it
+        # down and kills that background task (EXE-928fd700). Re-drive ONCE with a corrective
+        # instruction to finish synchronously, before failing the station.
+        _emit(node, "no verdict on first turn — re-driving once (finish synchronously, no background-and-yield)")
+        try:
+            await _drive_with_retry(
+                system_prompt=_read(path),
+                prompt=(
+                    f"{guardrails}\n\nYou ENDED YOUR TURN without writing the required verdict to "
+                    f"{verdict_path}. Do NOT run long work (image builds, test suites) as a BACKGROUND "
+                    f"task and then stop to wait for a notification — this station is a SINGLE turn, so "
+                    f"any background task is killed the instant you stop. Run all such work "
+                    f"SYNCHRONOUSLY in the FOREGROUND (one blocking Bash call with an explicit long "
+                    f"timeout), then WRITE THE VERDICT before you finish.\n\n{task_prompt}\n{contract}"
+                ),
+                cwd=cwd or config.FK_AIDEVELOPER_DIR,
+                permission_mode=permission_mode or config.STATION_PERMISSION_MODE,
+                label=f"{node}:verdict-redrive",
+                allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
+            )
+        except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
+            if not verdict_path.exists():
+                _capture_partial(node, execution_id, cwd)
+            raise StationError(node, agent_md, f"agent run failed (verdict re-drive): {type(e).__name__}: {e}") from e
+        except BaseException:   # noqa: BLE001 — KILL / cancel during the re-drive: fast breadcrumb, then propagate
+            if not verdict_path.exists():
+                _capture_partial(node, execution_id, cwd, fast=True)
+            raise
+        if not verdict_path.exists():
+            _capture_partial(node, execution_id, cwd)   # breadcrumb the pushed git state for the resume-hint
+            raise StationError(node, agent_md, f"no verdict written to {verdict_path} (after re-drive)")
     try:
         return verdict_model.model_validate_json(_read(verdict_path))
     except Exception as e:  # noqa: BLE001 — malformed / schema-violating verdict
