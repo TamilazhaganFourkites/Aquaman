@@ -1239,7 +1239,7 @@ function colorizeLogLine(line) {
 const TICKER_NOISE_RE = /^(\s*$|\s*▶|\s*[✓✗]|\[(DONE|FAILED|PAUSED)\]|\s*RESULT:)/;
 function activityTicker(rawTail) {
   if (!rawTail || !rawTail.length) return [];
-  return rawTail.filter(l => l.trim() && !TICKER_NOISE_RE.test(l)).slice(-2);
+  return rawTail.filter(l => l.trim() && !TICKER_NOISE_RE.test(l)).slice(-1);
 }
 
 // ── Live view: unified master list + detail pane ─────────────────────────
@@ -1342,7 +1342,14 @@ function renderLive() {
     listHtml += `<div class="list-section-label">Auto-queue</div>` +
       autoOnly.map(t => rowHtml(t, true)).join("");
   }
-  document.getElementById("ticketList").innerHTML = listHtml;
+  // Same cause as the stepper's scroll-reset (see renderDetail): this rebuilds every ~2s poll
+  // regardless of whether anything in the list actually changed, and a plain innerHTML replace
+  // resets the container's own scrollTop to 0 — save/restore across it so scrolling the ticket
+  // list (many tickets in a batch, or a long auto-queue) doesn't keep snapping back to the top.
+  const ticketListEl = document.getElementById("ticketList");
+  const ticketListScrollTop = ticketListEl.scrollTop;
+  ticketListEl.innerHTML = listHtml;
+  ticketListEl.scrollTop = ticketListScrollTop;
   document.querySelectorAll("[data-select]").forEach(row => row.addEventListener("click", () => {
     selectedTicket = row.dataset.select;
     renderLive();
@@ -1362,14 +1369,114 @@ function renderLive() {
 
 const openLogs = new Set(); // tickets whose log panel is currently expanded
 
+// Every poll (2s) used to replace the WHOLE detail panel unconditionally — even when nothing but
+// a running step's elapsed/ticker ticked forward, which tore down and rebuilt every DOM node: CSS
+// animations (the marker ping, the flowing connector line) all restarted from frame 0, reading as a
+// constant "blink", and it's what stomped the stepper's scroll position (see the save/restore
+// below). _detailStructKey fingerprints everything that actually needs a real rebuild (step
+// count/labels/states/highlights, gate, ticket identity) but deliberately EXCLUDES elapsed/ticker
+// text, which change almost every poll for a running step — those are patched in place instead.
+let _detailStructKey = null;
+
+function detailStructureKey(t) {
+  const events = t.events || [];
+  const lastState = events.length ? events[events.length - 1].state : null;
+  return JSON.stringify({
+    ticket: t.ticket,
+    status: t.status,
+    gate: t.status === "paused" ? `${t.paused_gate || ""}|${t.paused_message || ""}` : "",
+    steps: events.map(e => [e.node, e.state, e.label, e.highlight || ""]),
+    placeholder: t.status === "running" && lastState !== "running",   // the synthetic "Working…" step
+    // detailHtml's Dismiss button also shows for a "queued" ticket once its batch is stopped
+    // (app.py's dismiss_ticket allows this) — that's a real markup change this key must catch,
+    // even though nothing about the TICKET's own status/steps changed when Stop was clicked.
+    batchCancelled,
+  });
+}
+
+// Steady-state update: only the bits that change almost every poll (elapsed timers, the last
+// step's activity ticker) — everything else keeps its existing DOM node, so no animation restart,
+// no scroll reset, no flicker. Falls back to a full rebuild (returns false) if a step doesn't
+// exist where expected — belt-and-suspenders in case the structure key ever misses something.
+function patchDetailInPlace(panel, t) {
+  const badge = panel.querySelector(".card-head .duration-badge");
+  if (badge && t.started_at) badge.textContent = formatElapsed(t.started_at, t.finished_at);
+  const stepEls = panel.querySelectorAll(".stepper > .step");
+  const events = t.events || [];
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    if (e.state !== "running") continue;
+    const stepEl = stepEls[i];
+    if (!stepEl) return false;
+    const metaSpan = stepEl.querySelector(".step-meta span");
+    if (metaSpan && e.elapsed) metaSpan.textContent = e.elapsed;
+  }
+  // PARALLEL_ANALYSIS (default on) can have SEVERAL steps "running" at once (sme_consult ∥
+  // dep_resolver ∥ prep_image), each getting its own .step-ticker div in detailHtml — all of them
+  // show the SAME activityTicker(t.raw_tail) text (there's no per-node ticker, just one shared
+  // tail of the process's own stdout), so every one of them needs the update, not just the first.
+  const ticker = activityTicker(t.raw_tail);
+  const tickerEls = panel.querySelectorAll(".step-ticker");
+  if (ticker.length && !tickerEls.length) return false;   // ticker just appeared -> needs the full markup
+  if (tickerEls.length) {
+    const html = ticker.map(esc).join("<br>");
+    const title = ticker.join("\n");
+    tickerEls.forEach(el => {
+      if (el.innerHTML !== html) el.innerHTML = html;
+      el.title = title;
+    });
+  }
+  // Raw log, when open: update its content WITHOUT recreating the <pre> — recreating it (the old
+  // full-rebuild path) is what forced it to snap to the bottom on every poll, fighting anyone
+  // actually scrolled up reading it. Only auto-follow to the bottom if they were already there
+  // (or within ~40px of it), same as a normal `tail -f` would — otherwise leave their scroll alone.
+  const rawlog = panel.querySelector(".rawlog");
+  if (rawlog && rawlog.open) {
+    const pre = rawlog.querySelector("pre");
+    const summary = rawlog.querySelector("summary");
+    const lines = t.raw_tail || [];
+    if (summary) summary.textContent = `Log (${lines.length} lines)`;
+    if (pre) {
+      const html = lines.map(colorizeLogLine).join("\n");
+      if (pre.innerHTML !== html) {
+        const nearBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+        pre.innerHTML = html;
+        if (nearBottom) pre.scrollTop = pre.scrollHeight;
+      }
+    }
+  }
+  return true;
+}
+
 function renderDetail(t, isAuto) {
   const panel = document.getElementById("detailPanel");
   if (!t) {
     panel.innerHTML = `<div class="detail-empty"><div class="glyph">◌</div>Select a ticket to see its live progress.</div>`;
+    _detailStructKey = null;
     return;
   }
   const wasOpen = openLogs.has(t.ticket);
+  const key = detailStructureKey(t);
+  if (key === _detailStructKey && panel.querySelector(".stepper")) {
+    if (patchDetailInPlace(panel, t)) return;
+  }
+  _detailStructKey = key;
+  // Rebuilding replaces every child, which resets any scrolled element's scrollTop to 0 — the
+  // .stepper (internally scrollable) would otherwise visibly snap back to the top on every rebuild.
+  // Save/restore across it. Same for the raw log's <pre>, read BEFORE it's destroyed: a real
+  // structural rebuild (a step completing, a new one starting) can still happen while the user has
+  // the log open and scrolled up reading it — it must not force them to the bottom same as the
+  // patch path no longer does (only auto-follow if they were already near the bottom).
+  const prevStepper = panel.querySelector(".stepper");
+  const stepperScrollTop = prevStepper ? prevStepper.scrollTop : 0;
+  const prevPre = wasOpen ? panel.querySelector(".rawlog pre") : null;
+  const preScrollTop = prevPre ? prevPre.scrollTop : 0;
+  const preNearBottom = prevPre
+    ? (prevPre.scrollHeight - prevPre.scrollTop - prevPre.clientHeight < 40)
+    : true;   // no prior <pre> -> first time this log is opened -> default to showing the tail
   panel.innerHTML = detailHtml(t, isAuto);
+  const newStepper = panel.querySelector(".stepper");
+  if (newStepper) newStepper.scrollTop = stepperScrollTop;
 
   if (t.status === "paused") {
     const approveBtn = document.getElementById(`gate-approve-${t.ticket}`);
@@ -1387,7 +1494,10 @@ function renderDetail(t, isAuto) {
     if (wasOpen) {
       rawlog.open = true;
       const pre = rawlog.querySelector("pre");
-      if (pre) pre.scrollTop = pre.scrollHeight;
+      // The freshly-rebuilt <pre> is a brand-new DOM node (scrollTop 0 by default) — restore
+      // exactly where they were reading, UNLESS they were already following near the bottom, in
+      // which case keep following the new tail.
+      if (pre) pre.scrollTop = preNearBottom ? pre.scrollHeight : preScrollTop;
     }
   }
   const dismissBtn = panel.querySelector("[data-dismiss]");
