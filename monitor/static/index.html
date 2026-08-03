@@ -36,7 +36,7 @@
     --header-shadow:0 4px 18px -6px rgba(0,0,0,.45);
     --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;
-    --fs-micro:11px; --fs-caption:12px; --fs-body:14px; --fs-md:15px; --fs-lg:17px; --fs-xl:21px;
+    --fs-micro:12px; --fs-caption:13px; --fs-body:15px; --fs-md:16px; --fs-lg:18px; --fs-xl:22px;
     --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:24px; --sp-6:32px; --sp-7:48px;
     --rail:1280px;
     --radius:14px; --radius-sm:9px;
@@ -139,11 +139,13 @@
   .brand { display:flex; align-items:center; gap:11px; }
   .trident { flex:none; filter:drop-shadow(0 0 6px color-mix(in srgb, var(--glow) 65%, transparent)); }
   .trident path, .trident line { stroke:var(--glow); }
+  .kai-brand { flex:none; filter:drop-shadow(0 2px 5px rgba(0,0,0,.3)); }
+  .guardian-brand { flex:none; object-fit:contain; filter:drop-shadow(0 2px 5px rgba(0,0,0,.3)); }
   header h1 {
-    margin:0; font-family:var(--mono); font-size:16px; font-weight:700; letter-spacing:.01em;
+    margin:0; font-family:var(--mono); font-size:17px; font-weight:700; letter-spacing:.01em;
     color:var(--header-ink); white-space:nowrap;
   }
-  header .sub { font-size:11px; color:var(--header-sub); letter-spacing:.01em; white-space:nowrap; }
+  header .sub { font-size:12px; color:var(--header-sub); letter-spacing:.01em; white-space:nowrap; }
   .pulse {
     display:inline-flex; align-items:center; gap:7px; padding:6px 12px; border-radius:100px; flex:none;
     font-family:var(--mono); font-size:var(--fs-micro); font-weight:700; letter-spacing:.06em; text-transform:uppercase;
@@ -153,6 +155,45 @@
   .pulse .dot { width:7px; height:7px; border-radius:50%; background:var(--pending); }
   .pulse.live .dot { background:var(--glow); box-shadow:0 0 0 3px color-mix(in srgb, var(--glow) 30%, transparent); }
   .pulse.live { color:var(--glow); border-color:color-mix(in srgb, var(--glow) 30%, transparent); }
+  /* ambient "breathing" glow while auto-pickup is live — slow and gentle, deliberately distinct
+     from the sharper, faster sonar-ping used for an actively-running station below, so the two
+     read as different things: this is "on and watching", that is "working right now". */
+  @media (prefers-reduced-motion: no-preference) {
+    .pulse.live .dot { animation:breathe 2.6s ease-in-out infinite; }
+    @keyframes breathe {
+      0%,100% { box-shadow:0 0 0 3px color-mix(in srgb, var(--glow) 30%, transparent); }
+      50%     { box-shadow:0 0 0 6px color-mix(in srgb, var(--glow) 14%, transparent); }
+    }
+  }
+  .theme-toggle {
+    display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px; padding:0;
+    flex:none; border-radius:100px; font-size:16px; line-height:1;
+    background:color-mix(in srgb, var(--ink) 8%, transparent); color:var(--header-sub);
+    border:1px solid color-mix(in srgb, var(--header-ink) 14%, transparent);
+  }
+  .theme-toggle:hover { color:var(--header-ink); border-color:color-mix(in srgb, var(--header-ink) 30%, transparent); }
+
+  /* ── environment health strip: disk/Docker/network reachability at a glance, so a stall like
+     "fk-code-graph unreachable" or "disk full" shows red BEFORE a ticket wastes time hitting it. */
+  .health-strip { display:flex; align-items:center; gap:12px; font-family:var(--mono); font-size:13px;
+    color:var(--header-sub); letter-spacing:.02em; }
+  .health-strip span { display:inline-flex; align-items:center; }
+  .health-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; flex:none;
+    background:var(--pending); }
+
+  /* ── toasts: closes the loop on an action (kill/retry/dismiss/...) actually completing — those
+     previously just silently refreshed state with no confirmation beyond the pill eventually
+     changing. Stack bottom-right, auto-dismiss, don't block interaction with anything underneath. */
+  .toast-stack { position:fixed; bottom:22px; right:22px; z-index:70; display:flex;
+    flex-direction:column-reverse; gap:8px; pointer-events:none; max-width:340px; }
+  .toast { pointer-events:auto; padding:11px 16px; border-radius:10px; background:var(--surface);
+    border:1px solid var(--line); box-shadow:var(--shadow-lg); font-size:var(--fs-caption); color:var(--ink); }
+  .toast.success { border-color:color-mix(in srgb, var(--ok) 50%, transparent); }
+  .toast.error { border-color:color-mix(in srgb, var(--crit) 50%, transparent); }
+  @media (prefers-reduced-motion: no-preference) {
+    .toast { animation:toast-in .25s cubic-bezier(.2,.8,.2,1) both; }
+    @keyframes toast-in { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
+  }
 
   /* ── toolbar: tabs + primary actions, sticky right under the header ── */
   .toolbar { position:sticky; top:var(--header-h); z-index:25; height:var(--toolbar-h);
@@ -219,6 +260,10 @@
   button:active { transform:translateY(1px); }
   button.ghost { background:transparent; }
   button.ghost:hover { background:var(--surface-2); }
+  button.danger {
+    background:var(--crit-bg); border-color:color-mix(in srgb, var(--crit) 50%, transparent); color:var(--crit);
+  }
+  button.danger:hover { background:color-mix(in srgb, var(--crit) 22%, transparent); border-color:var(--crit); }
 
   /* ── Start batch — the one CTA worth giving real Aquaman presence ──── */
   button.primary {
@@ -258,6 +303,20 @@
   button.primary:disabled { opacity:.5; cursor:default; box-shadow:none; transform:none; }
   button.primary:disabled::before { animation:none; }
 
+  /* ── trident loader: a planted staff swaying, not a spinning wheel — a trident isn't
+     rotationally symmetric, so a full 360° spin reads as broken (upside-down half the time);
+     a gentle tilt keeps it upright and legible while still clearly signaling motion. Reused
+     wherever the app shows a "working on it" state (Start-batch button, Discovered refresh). ── */
+  .trident-loader { display:inline-flex; flex:none; }
+  .trident-loader svg, button.primary:disabled .trident-mini { transform-origin:50% 88%; }
+  @media (prefers-reduced-motion: no-preference) {
+    .trident-loader svg, button.primary:disabled .trident-mini { animation:trident-sway 1.1s ease-in-out infinite; }
+    @keyframes trident-sway { 0%,100% { transform:rotate(-14deg); } 50% { transform:rotate(14deg); } }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .trident-loader svg { opacity:.6; }
+  }
+
   /* ── Live: master-detail layout ──────────────────────────────────── */
   .live-layout { display:grid; grid-template-columns:360px 1fr; gap:var(--sp-4); align-items:start; }
   .list-panel { border:1px solid var(--line); border-radius:var(--radius); background:var(--surface);
@@ -281,7 +340,7 @@
   .ticket-row .row-id .ticket { font-family:var(--mono); font-size:var(--fs-md); font-weight:700; }
   .ticket-row .row-step { font-size:var(--fs-caption); color:var(--muted); margin-top:2px;
     overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .auto-tag { font-family:var(--mono); font-size:9px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+  .auto-tag { font-family:var(--mono); font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
     color:var(--muted); border:1px solid var(--line-strong); border-radius:5px; padding:1px 5px; flex:none; }
   .needs-input { display:inline-flex; width:7px; height:7px; border-radius:50%; background:var(--warn); flex:none; }
   @media (prefers-reduced-motion: no-preference) {
@@ -298,6 +357,18 @@
   .detail-card.st-failed::before, .detail-card.st-interrupted::before { background:var(--warn); }
   .detail-card.st-running::before, .detail-card.st-paused::before { background:var(--glow);
     box-shadow:0 0 12px 1px color-mix(in srgb, var(--glow) 70%, transparent); }
+  /* A shipped-PR moment — deliberately no reduced-motion static fallback (unlike trident-sway/
+     ping): those substitute a static equivalent because they carry load-bearing state; this is
+     pure decoration on top of state (the pill, the toast) that's already fully conveyed without
+     it, so "skip the animation, the toast still fires" is the correct call, not an omission. */
+  @media (prefers-reduced-motion: no-preference) {
+    .detail-card.celebrating::before { animation:celebrate-pop .8s ease-out; }
+    @keyframes celebrate-pop {
+      0%   { background:var(--ok); box-shadow:0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent); }
+      40%  { box-shadow:0 0 24px 4px color-mix(in srgb, var(--ok) 55%, transparent); }
+      100% { background:var(--ok); box-shadow:none; }
+    }
+  }
 
   .card-head { padding:var(--sp-4) var(--sp-5) 14px; border-bottom:1px solid var(--line);
     display:flex; align-items:flex-start; justify-content:space-between; gap:var(--sp-3); }
@@ -316,6 +387,16 @@
   .pill.interrupted { background:var(--warn-bg); color:var(--warn); }
   .badge-warn { color:var(--warn); font-size:var(--fs-micro); margin-left:8px; }
 
+  /* Total ticket duration — distinct from a station's own per-step elapsed (shown in the stepper).
+     Sits right beside the ticket number, both in the detail header and the master-list row. */
+  .duration-badge {
+    font-family:var(--mono); font-size:var(--fs-caption); font-weight:650; color:var(--ink-dim);
+    background:var(--surface-2); border:1px solid var(--line); border-radius:100px; padding:3px 10px;
+    font-variant-numeric:tabular-nums; letter-spacing:.02em;
+  }
+  .row-duration { font-family:var(--mono); font-size:var(--fs-micro); color:var(--muted);
+    font-variant-numeric:tabular-nums; }
+
   .meta-line { font-family:var(--mono); font-size:var(--fs-micro); color:var(--muted); margin-top:5px;
     font-variant-numeric:tabular-nums; }
   .meta-line.path { max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; }
@@ -326,9 +407,30 @@
     content:""; position:absolute; left:9px; top:23px; bottom:-8px; width:1.5px; background:var(--line-strong);
   }
   .step.ok:not(:last-child)::after { background:color-mix(in srgb, var(--ok) 45%, var(--line-strong)); }
+  /* bioluminescent current: ONLY the segment leading into the currently active station flows —
+     it marks where the real frontier of progress is, not the whole history. Every OTHER completed
+     segment (between two already-finished steps) stays the plain static line above — a step that
+     finished 10 minutes ago shouldn't still look like it's "working". :has(+ .step.running) matches
+     at most one line: the one immediately above whichever step is presently running (this also
+     naturally covers a PAUSED ticket for free — its last-known step stays marked "running" in the
+     event list while paused, since the pipeline process itself exited rather than the step
+     resolving, so the frontier correctly keeps flowing while waiting on a human decision). A
+     finished/failed ticket has no running step in its events at all, so this rule simply never
+     matches — no card-level state check needed. */
+  @media (prefers-reduced-motion: no-preference) {
+    .step.ok:has(+ .step.running)::after {
+      background-color:transparent;
+      background-image:repeating-linear-gradient(to bottom,
+        color-mix(in srgb, var(--glow) 85%, transparent) 0, color-mix(in srgb, var(--glow) 85%, transparent) 3px,
+        transparent 3px, transparent 9px);
+      background-size:100% 24px;
+      animation:current-flow 1.1s linear infinite;
+    }
+    @keyframes current-flow { from { background-position:0 0; } to { background-position:0 24px; } }
+  }
   .marker {
     position:relative; z-index:1; width:19px; height:19px; border-radius:50%; display:flex; align-items:center;
-    justify-content:center; font-size:11px; font-weight:800; background:var(--surface);
+    justify-content:center; font-size:12px; font-weight:800; background:var(--surface);
   }
   .step.ok .marker { background:var(--ok); color:var(--surface); }
   .step.crit .marker { background:var(--crit); color:var(--surface); }
@@ -347,6 +449,8 @@
   .step-meta { display:flex; gap:8px; font-family:var(--mono); font-size:var(--fs-micro); color:var(--muted);
     margin-top:2px; font-variant-numeric:tabular-nums; }
   .step-hi { font-size:var(--fs-caption); color:var(--muted); margin-top:2px; }
+  .step-ticker { font-family:var(--mono); font-size:var(--fs-micro); color:var(--muted); margin-top:3px;
+    opacity:.85; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
 
   .gate { margin:var(--sp-3) var(--sp-5) var(--sp-4); padding:var(--sp-3) var(--sp-4); border-radius:var(--radius-sm);
     background:var(--warn-bg); border:1px solid color-mix(in srgb, var(--warn) 45%, transparent); }
@@ -367,7 +471,7 @@
     text-transform:uppercase; letter-spacing:.07em; color:var(--muted); user-select:none;
     display:flex; align-items:center; gap:6px;
   }
-  .rawlog summary::before { content:"▸"; font-size:9px; transition:transform .15s ease; }
+  .rawlog summary::before { content:"▸"; font-size:10px; transition:transform .15s ease; }
   .rawlog[open] summary::before { transform:rotate(90deg); }
   .rawlog summary:hover { color:var(--ink); }
   .rawlog[open] summary { border-bottom:1px solid var(--line); }
@@ -380,11 +484,13 @@
   .detail-empty { display:flex; flex-direction:column; align-items:center; justify-content:center;
     min-height:400px; border:1px dashed var(--line-strong); border-radius:var(--radius); color:var(--muted);
     font-size:var(--fs-caption); gap:var(--sp-2); text-align:center; padding:var(--sp-5); }
-  .detail-empty .glyph { font-size:26px; opacity:.5; }
+  .detail-empty .glyph { font-size:27px; opacity:.5; }
 
   /* ── live-empty state (nothing running or queued at all) ────────────── */
   .live-empty { padding:var(--sp-7) var(--sp-4); text-align:center; }
-  .live-empty .glyph { font-size:32px; opacity:.45; margin-bottom:var(--sp-3); }
+  .live-empty .glyph { font-size:33px; opacity:.45; margin-bottom:var(--sp-3); }
+  .live-empty .kai-mascot { margin-bottom:var(--sp-3); filter:drop-shadow(0 8px 16px rgba(0,0,0,.25)); }
+  .live-empty .guardian-mascot { margin-bottom:var(--sp-3); filter:drop-shadow(0 8px 16px rgba(0,0,0,.25)); }
   .live-empty h2 { font-size:var(--fs-lg); margin:0 0 6px; }
   .live-empty p { color:var(--muted); font-size:var(--fs-caption); max-width:44ch; margin:0 auto var(--sp-4); }
 
@@ -409,6 +515,9 @@
   .history-row .outcome { font-size:var(--fs-caption); color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .history-row .when { font-family:var(--mono); font-size:var(--fs-micro); color:var(--muted); text-align:right;
     font-variant-numeric:tabular-nums; }
+  .history-duration-track { width:100%; height:3px; border-radius:2px; background:var(--line); margin-top:5px; overflow:hidden; }
+  .history-duration-fill { height:100%; background:var(--glow); }
+  .history-row.st-failed .history-duration-fill, .history-row.st-interrupted .history-duration-fill { background:var(--warn); }
   @media (max-width:760px) {
     .history-row { grid-template-columns:1fr auto; row-gap:6px; }
     .history-row .outcome, .history-row .when { grid-column:1 / -1; text-align:left; }
@@ -417,6 +526,24 @@
   .empty-state { padding:var(--sp-6) var(--sp-4); text-align:center; color:var(--muted); font-size:var(--fs-caption); }
 
   /* ── slide-over: "New batch" ─────────────────────────────────────── */
+  /* ── Cmd+K command palette — a plain open/close transition, not ambient/looping motion, so
+     (like .slideover's own transform transition just below) it doesn't need the reduced-motion
+     guard the file's @keyframes use. */
+  .palette-backdrop { position:fixed; inset:0; background:rgba(2,8,14,.55); backdrop-filter:blur(2px);
+    opacity:0; pointer-events:none; transition:opacity .18s ease; z-index:60; }
+  .palette-backdrop.open { opacity:1; pointer-events:auto; }
+  .palette { position:fixed; top:14vh; left:50%; width:min(560px,92vw); background:var(--surface);
+    border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow-lg);
+    z-index:61; opacity:0; pointer-events:none; transform:translate(-50%,-6px);
+    transition:opacity .18s ease, transform .18s ease; }
+  .palette.open { opacity:1; pointer-events:auto; transform:translate(-50%,0); }
+  .palette input { width:100%; border:none; border-bottom:1px solid var(--line); padding:14px var(--sp-4);
+    font-size:var(--fs-md); background:transparent; color:var(--ink); border-radius:var(--radius) var(--radius) 0 0;
+    box-sizing:border-box; }
+  .palette input:focus-visible { outline:none; }
+  .palette-row { padding:9px 14px; font-size:var(--fs-body); cursor:pointer; display:flex; justify-content:space-between; }
+  .palette-row.active, .palette-row:hover { background:var(--surface-2); }
+
   .slideover-backdrop { position:fixed; inset:0; background:rgba(2,8,14,.55); backdrop-filter:blur(2px);
     opacity:0; pointer-events:none; transition:opacity .25s ease; z-index:40; }
   .slideover-backdrop.open { opacity:1; pointer-events:auto; }
@@ -451,22 +578,58 @@
   <header>
     <div class="header-row">
       <div class="brand">
-        <svg class="trident" width="26" height="26" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <line x1="15" y1="6" x2="15" y2="26" stroke-width="1.6" stroke-linecap="round"/>
-          <path d="M6 6 L6 11 Q6 15 15 15 Q24 15 24 11 L24 6" stroke-width="1.6" stroke-linecap="round" fill="none"/>
-          <line x1="6" y1="3" x2="6" y2="8" stroke-width="1.6" stroke-linecap="round"/>
-          <line x1="24" y1="3" x2="24" y2="8" stroke-width="1.6" stroke-linecap="round"/>
-          <line x1="15" y1="3" x2="15" y2="8" stroke-width="1.6" stroke-linecap="round"/>
-          <line x1="10" y1="26" x2="20" y2="26" stroke-width="1.6" stroke-linecap="round"/>
+        <!-- Kai (kept, not deleted — currently unused in favor of the guardian.svg mascot below;
+             a <template> never renders, so this markup stays inert but intact. -->
+        <template id="kai-brand-tpl">
+        <svg class="kai-brand" width="30" height="30" viewBox="40 0 240 240" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <defs>
+            <radialGradient id="brandCheek" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#ffb199" stop-opacity="0.55"/>
+              <stop offset="100%" stop-color="#ffb199" stop-opacity="0"/>
+            </radialGradient>
+          </defs>
+          <path d="M100 200 Q80 202 74 220 Q84 232 100 226 Q108 214 104 200 Z" fill="var(--gold)" stroke="#0b1520" stroke-width="4" stroke-linejoin="round"/>
+          <path d="M200 200 Q220 202 226 220 Q216 232 200 226 Q192 214 196 200 Z" fill="var(--gold)" stroke="#0b1520" stroke-width="4" stroke-linejoin="round"/>
+          <path d="M132 190 L150 208 L168 190" fill="none" stroke="var(--gold)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="136" y="176" width="28" height="20" rx="6" fill="#f3c6a1"/>
+          <circle cx="150" cy="130" r="82" fill="#f6d3ac" stroke="#0b1520" stroke-width="5"/>
+          <path d="M62 128 Q50 60 96 30 Q150 4 210 34 Q252 58 240 122 Q234 96 214 106 Q220 78 190 62
+                   Q198 92 176 78 Q178 50 148 44 Q156 74 128 66 Q124 42 100 52 Q112 78 88 82 Q94 104 74 110 Z"
+                fill="#0e8f82" stroke="#0b1520" stroke-width="5" stroke-linejoin="round"/>
+          <path d="M108 46 Q104 68 118 76" fill="none" stroke="#8ff2e6" stroke-width="3.5" stroke-linecap="round" opacity="0.8"/>
+          <path d="M160 40 Q158 60 172 70" fill="none" stroke="#8ff2e6" stroke-width="3.5" stroke-linecap="round" opacity="0.75"/>
+          <path d="M200 66 Q202 84 216 96" fill="none" stroke="#8ff2e6" stroke-width="3" stroke-linecap="round" opacity="0.7"/>
+          <ellipse cx="66" cy="140" rx="10" ry="14" fill="#f6d3ac" stroke="#0b1520" stroke-width="4"/>
+          <ellipse cx="234" cy="140" rx="10" ry="14" fill="#f6d3ac" stroke="#0b1520" stroke-width="4"/>
+          <ellipse cx="104" cy="168" rx="16" ry="10" fill="url(#brandCheek)"/>
+          <ellipse cx="196" cy="168" rx="16" ry="10" fill="url(#brandCheek)"/>
+          <path d="M100 116 Q116 106 132 114" fill="none" stroke="#0b1520" stroke-width="4" stroke-linecap="round"/>
+          <path d="M168 114 Q184 106 200 116" fill="none" stroke="#0b1520" stroke-width="4" stroke-linecap="round"/>
+          <ellipse cx="118" cy="140" rx="15" ry="19" fill="#0b1520"/>
+          <ellipse cx="182" cy="140" rx="15" ry="19" fill="#0b1520"/>
+          <circle cx="124" cy="130" r="5.5" fill="#fff"/>
+          <circle cx="188" cy="130" r="5.5" fill="#fff"/>
+          <circle cx="114" cy="148" r="3" fill="#fff" opacity="0.85"/>
+          <circle cx="178" cy="148" r="3" fill="#fff" opacity="0.85"/>
+          <path d="M130 176 Q150 190 170 176" fill="none" stroke="#0b1520" stroke-width="4" stroke-linecap="round"/>
         </svg>
+        </template>
+        <img class="guardian-brand" src="/mascot-guardian.png" width="30" height="36" alt="" aria-hidden="true">
         <div>
           <h1>Aquaman Batch Monitor</h1>
-          <div class="sub">Sequential ocean-pipeline runs, live station-by-station</div>
+          <div class="sub">Concurrent ocean-pipeline runs, live station-by-station</div>
         </div>
       </div>
-      <div class="pulse" id="headerPulse"><span class="dot"></span><span id="headerPulseText">auto-pickup paused</span></div>
+      <div style="display:flex;align-items:center;gap:14px">
+        <div class="health-strip" id="healthStrip"></div>
+        <div class="pulse" id="headerPulse"><span class="dot"></span><span id="headerPulseText">auto-pickup paused</span></div>
+        <button class="theme-toggle" id="notifyToggle" type="button"></button>
+        <button class="theme-toggle" id="themeToggle" type="button"></button>
+      </div>
     </div>
   </header>
+
+  <div class="toast-stack" id="toastStack"></div>
 
   <div class="toolbar">
     <div class="toolbar-row">
@@ -502,9 +665,74 @@
           <div class="detail-panel" id="detailPanel"></div>
         </div>
         <div class="live-empty" id="liveEmpty">
-          <div class="glyph">〜</div>
+          <!-- Kai (kept, not deleted — currently unused in favor of the guardian.svg mascot below;
+               a <template> never renders, so this markup stays inert but intact. -->
+          <template id="kai-mascot-tpl">
+          <svg class="kai-mascot" width="128" height="154" viewBox="0 0 300 360" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <defs>
+              <radialGradient id="kaiCheek" cx="50%" cy="50%" r="50%">
+                <stop offset="0%" stop-color="#ffb199" stop-opacity="0.55"/>
+                <stop offset="100%" stop-color="#ffb199" stop-opacity="0"/>
+              </radialGradient>
+            </defs>
+            <path d="M118 300 L112 344 Q112 352 122 352 L136 352 Q144 352 144 344 L146 300 Z" fill="#123b52" stroke="#0b1520" stroke-width="4"/>
+            <path d="M160 300 L162 344 Q162 352 170 352 L184 352 Q192 352 190 344 L182 300 Z" fill="#123b52" stroke="#0b1520" stroke-width="4"/>
+            <path d="M108 340 L146 340 L146 352 Q146 358 138 358 L118 358 Q106 358 106 350 Z" fill="var(--gold)" stroke="#0b1520" stroke-width="4"/>
+            <path d="M158 340 L196 340 L198 350 Q198 358 186 358 L166 358 Q158 358 158 352 Z" fill="var(--gold)" stroke="#0b1520" stroke-width="4"/>
+            <path d="M78 210 Q54 218 46 250 Q44 262 52 268 Q64 262 72 250 Q82 232 92 216 Z" fill="#0e5c56" stroke="#0b1520" stroke-width="4" stroke-linejoin="round"/>
+            <circle cx="46" cy="266" r="15" fill="#0a4a45" stroke="#0b1520" stroke-width="4"/>
+            <path d="M104 224 Q98 270 116 302 L184 302 Q202 270 196 224 Q194 192 150 186 Q106 192 104 224 Z" fill="#12a89c" stroke="#0b1520" stroke-width="4.5" stroke-linejoin="round"/>
+            <path d="M118 216 Q116 250 126 278 Q140 284 150 282 Q142 250 140 216 Z" fill="#ffffff" opacity="0.14"/>
+            <path d="M100 200 Q80 202 74 220 Q84 232 100 226 Q108 214 104 200 Z" fill="var(--gold)" stroke="#0b1520" stroke-width="4" stroke-linejoin="round"/>
+            <path d="M200 200 Q220 202 226 220 Q216 232 200 226 Q192 214 196 200 Z" fill="var(--gold)" stroke="#0b1520" stroke-width="4" stroke-linejoin="round"/>
+            <path d="M132 190 L150 208 L168 190" fill="none" stroke="var(--gold)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M100 274 Q150 292 200 274 L200 292 Q150 308 100 292 Z" fill="var(--gold)" stroke="#0b1520" stroke-width="4" stroke-linejoin="round"/>
+            <g transform="translate(150,283)">
+              <path d="M0 -13 L11.3 -6.5 L11.3 6.5 L0 13 L-11.3 6.5 L-11.3 -6.5 Z" fill="#0e5c56" stroke="#0b1520" stroke-width="2"/>
+              <line x1="0" y1="-2" x2="0" y2="7" stroke="var(--glow)" stroke-width="2" stroke-linecap="round"/>
+              <path d="M-4.5 -2 L-4.5 1 Q-4.5 4 0 4 Q4.5 4 4.5 1 L4.5 -2" fill="none" stroke="var(--glow)" stroke-width="2" stroke-linecap="round"/>
+            </g>
+            <path d="M122 208 Q150 224 124 250 Q150 268 132 288" fill="none" stroke="var(--glow)" stroke-width="2.5" opacity="0.85"/>
+            <path d="M178 208 Q150 224 176 250 Q150 268 168 288" fill="none" stroke="var(--glow)" stroke-width="2.5" opacity="0.85"/>
+            <path d="M198 208 Q222 214 228 236 Q230 252 220 260 Q206 254 200 238 Q196 222 194 208 Z" fill="#12a89c" stroke="#0b1520" stroke-width="4.5" stroke-linejoin="round"/>
+            <circle cx="222" cy="256" r="15" fill="#0e5c56" stroke="#0b1520" stroke-width="4"/>
+            <rect x="136" y="176" width="28" height="20" rx="6" fill="#f3c6a1"/>
+            <circle cx="150" cy="130" r="82" fill="#f6d3ac" stroke="#0b1520" stroke-width="5"/>
+            <path d="M62 128 Q50 60 96 30 Q150 4 210 34 Q252 58 240 122 Q234 96 214 106 Q220 78 190 62
+                     Q198 92 176 78 Q178 50 148 44 Q156 74 128 66 Q124 42 100 52 Q112 78 88 82 Q94 104 74 110 Z"
+                  fill="#0e8f82" stroke="#0b1520" stroke-width="5" stroke-linejoin="round"/>
+            <path d="M108 46 Q104 68 118 76" fill="none" stroke="#8ff2e6" stroke-width="3.5" stroke-linecap="round" opacity="0.8"/>
+            <path d="M160 40 Q158 60 172 70" fill="none" stroke="#8ff2e6" stroke-width="3.5" stroke-linecap="round" opacity="0.75"/>
+            <path d="M200 66 Q202 84 216 96" fill="none" stroke="#8ff2e6" stroke-width="3" stroke-linecap="round" opacity="0.7"/>
+            <ellipse cx="66" cy="140" rx="10" ry="14" fill="#f6d3ac" stroke="#0b1520" stroke-width="4"/>
+            <ellipse cx="234" cy="140" rx="10" ry="14" fill="#f6d3ac" stroke="#0b1520" stroke-width="4"/>
+            <ellipse cx="104" cy="168" rx="16" ry="10" fill="url(#kaiCheek)"/>
+            <ellipse cx="196" cy="168" rx="16" ry="10" fill="url(#kaiCheek)"/>
+            <path d="M100 116 Q116 106 132 114" fill="none" stroke="#0b1520" stroke-width="4" stroke-linecap="round"/>
+            <path d="M168 114 Q184 106 200 116" fill="none" stroke="#0b1520" stroke-width="4" stroke-linecap="round"/>
+            <ellipse cx="118" cy="140" rx="15" ry="19" fill="#0b1520"/>
+            <ellipse cx="182" cy="140" rx="15" ry="19" fill="#0b1520"/>
+            <circle cx="124" cy="130" r="5.5" fill="#fff"/>
+            <circle cx="188" cy="130" r="5.5" fill="#fff"/>
+            <circle cx="114" cy="148" r="3" fill="#fff" opacity="0.85"/>
+            <circle cx="178" cy="148" r="3" fill="#fff" opacity="0.85"/>
+            <path d="M130 176 Q150 190 170 176" fill="none" stroke="#0b1520" stroke-width="4" stroke-linecap="round"/>
+            <g stroke="var(--gold)" stroke-width="4.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="38" y1="85" x2="38" y2="335"/>
+              <path d="M18 85 L18 101 Q18 116 38 116 Q58 116 58 101 L58 85" fill="var(--gold)"/>
+              <line x1="18" y1="72" x2="18" y2="89"/>
+              <line x1="58" y1="72" x2="58" y2="89"/>
+              <line x1="38" y1="72" x2="38" y2="89"/>
+            </g>
+            <circle cx="18" cy="68" r="4.5" fill="var(--gold)" stroke="#0b1520" stroke-width="1.5"/>
+            <circle cx="58" cy="68" r="4.5" fill="var(--gold)" stroke="#0b1520" stroke-width="1.5"/>
+            <circle cx="38" cy="68" r="4.5" fill="var(--gold)" stroke="#0b1520" stroke-width="1.5"/>
+            <path d="M18 101 Q18 116 38 116 Q58 116 58 101" fill="none" stroke="#fff" stroke-width="1.5" opacity="0.5"/>
+          </svg>
+          </template>
+          <img class="guardian-mascot" src="/mascot-guardian.png" width="150" height="179" alt="">
           <h2>Nothing in flight</h2>
-          <p>Start a batch, or resume auto-pickup to let discovered tickets run themselves — one at a time, never in parallel.</p>
+          <p>Start a batch — tickets run concurrently — or resume auto-pickup to let discovered tickets run themselves, one at a time from its own queue.</p>
           <button class="ghost" id="liveEmptyStart" type="button" style="margin:0 auto">+ New batch</button>
         </div>
       </section>
@@ -522,6 +750,12 @@
     </div>
   </main>
 
+  <div class="palette-backdrop" id="paletteBackdrop"></div>
+  <div class="palette" id="palette" role="dialog" aria-label="Command palette">
+    <input id="paletteInput" placeholder="Jump to a ticket, or run a command…" autocomplete="off">
+    <div id="paletteResults"></div>
+  </div>
+
   <div class="slideover-backdrop" id="soBackdrop"></div>
   <aside class="slideover" id="slideover" aria-label="Start a new batch">
     <div class="slideover-head">
@@ -532,7 +766,7 @@
       <div class="panel">
         <label class="field-label" for="tickets">Ticket IDs (one per line, or comma-separated)</label>
         <textarea id="tickets" placeholder="MM-14601&#10;MM-14602&#10;MM-14603"></textarea>
-        <div class="hint">Runs strictly one at a time — never in parallel.</div>
+        <div class="hint">Runs concurrently, up to the configured limit at once.</div>
       </div>
 
       <div class="panel" id="discovered">
@@ -591,15 +825,191 @@
 // ── Global state ──────────────────────────────────────────────────────────
 let batchId = null;
 let batchTickets = [];
+let batchCancelled = false;
 let autoTickets = [];
 let selectedTicket = null;
 let batchPoller = null;
 const BATCH_KEY = "aquaman-batch-id";   // survives a page reload; server state is the real source of truth
 const TERMINAL = new Set(["done", "failed", "interrupted"]);
 
+// Notify/celebrate must not fire for anything that was already true before this page loaded —
+// but "the first renderLive() call" is NOT a reliable signal of "we've seen the real state":
+// reconnectOnLoad's batch fetch and refreshAutoStatus's auto-queue fetch are two independent,
+// uncoordinated async chains that both call renderLive() as soon as THEY resolve, in whichever
+// order wins the race. Rather than trying to coordinate exactly when both have settled, give
+// both a fixed grace window after load — comfortably longer than either fetch normally takes —
+// during which every renderLive() call only records state (baseline-building), never diffs.
+const PAGE_LOAD_AT = Date.now();
+const BASELINE_GRACE_MS = 3000;
+
 function esc(s) {
   return (s || "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 }
+
+// Total ticket duration — distinct from each station's own per-step elapsed time (already shown
+// in the stepper). started_at is set the moment a ticket's status first becomes "running";
+// finished_at is set once it settles (done/failed/interrupted) — for a still-running/paused ticket
+// this ticks forward on every poll (2-4s cadence) since `end` falls back to right now. Same
+// `<m>m<s>s` / `<s>s` format the backend's own ui._fmt_elapsed already uses, so it reads as one
+// consistent time convention across the whole app.
+function formatElapsed(startedAt, finishedAt) {
+  if (!startedAt) return null;
+  const total = Math.max(0, Math.round((finishedAt || (Date.now() / 1000)) - startedAt));
+  const m = Math.floor(total / 60), s = total % 60;
+  return m > 0 ? `${m}m${s}s` : `${s}s`;
+}
+
+// A markdown recap of a ticket's whole run — station list, outcome, PR, log path — ready to
+// paste straight into a Jira comment or Slack thread. pr_number is rendered as plain "#123"
+// text, not a link: neither TicketRun nor a history row carries a repo base URL, only the
+// bare PR number, so a clickable link isn't honestly constructible without inventing config.
+function buildRunSummary(t) {
+  const lines = [`### ${t.ticket}`,
+    `- **Status:** ${t.final_status || t.status}${t.final_outcome ? ` — ${t.final_outcome}` : ""}`];
+  if (t.pr_number) lines.push(`- **PR:** #${t.pr_number}`);
+  if (t.started_at) lines.push(`- **Duration:** ${formatElapsed(t.started_at, t.finished_at)}`);
+  if (t.log_path) lines.push(`- **Log:** \`${t.log_path}\``);
+  lines.push("", "**Stations:**");
+  (t.events || []).forEach(e => {
+    const icon = e.state === "ok" ? "✓" : e.state === "crit" ? "✗" : "…";
+    lines.push(`- ${icon} ${e.label}${e.elapsed ? ` (${e.elapsed})` : ""}${e.highlight ? ` — ${e.highlight}` : ""}`);
+  });
+  return lines.join("\n");
+}
+
+// ── Toasts — closes the loop on an action actually completing ────────────
+function showToast(message, kind = "info") {
+  const stack = document.getElementById("toastStack");
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = message;
+  stack.appendChild(el);
+  setTimeout(() => {
+    el.style.transition = "opacity .25s ease, transform .25s ease";
+    el.style.opacity = "0";
+    el.style.transform = "translateY(6px)";
+    setTimeout(() => el.remove(), 260);
+  }, 3200);
+}
+
+// ── Theme toggle — cycles system -> light -> dark -> system, persisted. The CSS already fully
+// supports :root[data-theme="light"|"dark"]; this is the control that was never wired to it. ──
+const THEME_KEY = "aquaman-theme";
+function applyTheme(theme) {
+  if (theme) document.documentElement.dataset.theme = theme;
+  else delete document.documentElement.dataset.theme;
+  const btn = document.getElementById("themeToggle");
+  if (theme === "light") { btn.textContent = "☀"; btn.title = "Light theme — click for Dark"; }
+  else if (theme === "dark") { btn.textContent = "☾"; btn.title = "Dark theme — click for System default"; }
+  else { btn.textContent = "◐"; btn.title = "Following system theme — click for Light"; }
+}
+document.getElementById("themeToggle").addEventListener("click", () => {
+  const cur = localStorage.getItem(THEME_KEY);
+  const next = cur === null ? "light" : cur === "light" ? "dark" : null;
+  if (next === null) localStorage.removeItem(THEME_KEY); else localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+});
+applyTheme(localStorage.getItem(THEME_KEY));
+
+// ── Desktop notifications — closes the loop when a ticket needs YOU (a gate paused, or it
+// finished) and you're not watching the tab. Off by default (opt-in, matches how intrusive a
+// desktop notification is); persisted like the theme toggle. ──
+const NOTIFY_KEY = "aquaman-notify";
+function applyNotifyToggle() {
+  const btn = document.getElementById("notifyToggle");
+  if (!("Notification" in window)) { btn.style.display = "none"; return; }
+  const on = localStorage.getItem(NOTIFY_KEY) === "1" && Notification.permission === "granted";
+  btn.textContent = on ? "🔔" : "🔕";
+  btn.title = on ? "Desktop notifications on — click to turn off"
+                 : "Desktop notifications off — click to turn on";
+}
+if ("Notification" in window) {
+  document.getElementById("notifyToggle").addEventListener("click", async () => {
+    const on = localStorage.getItem(NOTIFY_KEY) === "1" && Notification.permission === "granted";
+    if (on) {
+      localStorage.setItem(NOTIFY_KEY, "0");
+      applyNotifyToggle();
+      return;
+    }
+    let perm = Notification.permission;
+    if (perm === "default") perm = await Notification.requestPermission();
+    if (perm === "granted") {
+      localStorage.setItem(NOTIFY_KEY, "1");
+      showToast("Desktop notifications on", "success");
+    } else {
+      localStorage.setItem(NOTIFY_KEY, "0");
+      showToast("Notifications blocked — enable in browser settings", "error");
+    }
+    applyNotifyToggle();
+  });
+  applyNotifyToggle();
+}
+
+// notifiedStates: last-seen status per ticket, so a transition (not just "is paused/terminal")
+// fires exactly once. Every call within BASELINE_GRACE_MS of page load only RECORDS current
+// state — a fresh tab must not notify for things that already happened before it started
+// watching, and (see PAGE_LOAD_AT's own comment) a fixed grace window is what actually makes
+// that reliable given two independent, uncoordinated fetches both feed this.
+const notifiedStates = new Map();
+function checkNotify(all) {
+  if (Date.now() - PAGE_LOAD_AT < BASELINE_GRACE_MS) {
+    all.forEach(t => notifiedStates.set(t.ticket, t.status));
+    return;
+  }
+  if (!("Notification" in window) || localStorage.getItem(NOTIFY_KEY) !== "1" || Notification.permission !== "granted") {
+    all.forEach(t => notifiedStates.set(t.ticket, t.status));
+    return;
+  }
+  const notifyWorthy = new Set(["paused", "done", "failed", "interrupted"]);
+  all.forEach(t => {
+    if (notifyWorthy.has(t.status) && notifiedStates.get(t.ticket) !== t.status) {
+      // tag = "<ticket>:<status>" — lets the OS/browser notification center COALESCE duplicate
+      // notifications from multiple open tabs watching the same batch into one visible entry
+      // (replacing, not stacking), rather than needing real cross-tab coordination for a
+      // single-engineer local tool.
+      const tag = `${t.ticket}:${t.status}`;
+      const body = t.status === "paused" ? (t.paused_message || "waiting on you")
+                                          : (t.final_outcome || t.status);
+      const n = new Notification(`${t.ticket} — ${t.status}`, {body, tag});
+      n.onclick = () => { window.focus(); selectedTicket = t.ticket; setTab("live"); renderLive(); n.close(); };
+    }
+    notifiedStates.set(t.ticket, t.status);
+  });
+}
+
+// ── Persist New-batch settings across reload (log level + the 3 gate checkboxes) ──
+const SETTINGS_KEY = "aquaman-settings";
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    if (s.logLevel) document.getElementById("loglevel").value = s.logLevel;
+    document.getElementById("qaAutoapprove").checked = !!s.qaAutoapprove;
+    document.getElementById("rcaReviewAuto").checked = !!s.rcaReviewAuto;
+    document.getElementById("qaTestrail").checked = !!s.qaTestrail;
+  } catch { /* malformed/missing settings -> just keep the form's defaults */ }
+}
+function saveSettings() {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+    logLevel: document.getElementById("loglevel").value,
+    qaAutoapprove: document.getElementById("qaAutoapprove").checked,
+    rcaReviewAuto: document.getElementById("rcaReviewAuto").checked,
+    qaTestrail: document.getElementById("qaTestrail").checked,
+  }));
+}
+["loglevel", "qaAutoapprove", "rcaReviewAuto", "qaTestrail"].forEach(id =>
+  document.getElementById(id).addEventListener("change", saveSettings));
+loadSettings();
+
+// A small planted-trident loader — swaying, not spinning (see .trident-loader's CSS comment for
+// why a full rotation doesn't work for a shape this asymmetric). Reused wherever the app shows a
+// "working on it" state.
+const TRIDENT_LOADER_SVG = `<span class="trident-loader"><svg width="13" height="13" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <line x1="15" y1="6" x2="15" y2="26" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M6 6 L6 11 Q6 15 15 15 Q24 15 24 11 L24 6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" fill="none"/>
+  <line x1="6" y1="3" x2="6" y2="8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+  <line x1="24" y1="3" x2="24" y2="8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+  <line x1="15" y1="3" x2="15" y2="8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+</svg></span>`;
 
 // ── Tabs ─────────────────────────────────────────────────────────────────
 document.querySelectorAll(".tab-btn").forEach(btn => btn.addEventListener("click", () => setTab(btn.dataset.tab)));
@@ -623,7 +1033,83 @@ document.getElementById("openNewBatch").addEventListener("click", openSlideover)
 document.getElementById("liveEmptyStart").addEventListener("click", openSlideover);
 document.getElementById("closeSlideover").addEventListener("click", closeSlideover);
 document.getElementById("soBackdrop").addEventListener("click", closeSlideover);
-document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSlideover(); });
+
+// ── Cmd+K command palette: jump to a ticket or run a command fast, without hunting through
+// buttons. No fuzzy-matching library — this app has zero build step and zero JS dependencies
+// beyond FastAPI on the backend, and a plain substring filter is enough at this scale. ──
+function paletteTargets() {
+  const knownBatchIds = new Set(batchTickets.map(t => t.ticket));
+  const all = [...batchTickets, ...autoTickets.filter(t => !knownBatchIds.has(t.ticket))];
+  const targets = all.map(t => ({
+    label: `${t.ticket} — ${t.status}`, kind: "ticket",
+    // setTab() alone only toggles section display, it doesn't re-render the master-detail
+    // pane — selecting from the palette must set selectedTicket AND call renderLive() itself,
+    // not rely on the next ~2s poll tick to pick it up.
+    run: () => {
+      selectedTicket = t.ticket;
+      setTab("live");
+      renderLive();
+      document.querySelector(`[data-select="${CSS.escape(t.ticket)}"]`)?.scrollIntoView({block: "nearest"});
+    },
+  }));
+  targets.push(
+    {label: "New batch…", kind: "command", run: openSlideover},
+    {label: "Toggle theme", kind: "command", run: () => document.getElementById("themeToggle").click()},
+    // Routes through the real button's click() (not a re-implemented fetch) specifically so a
+    // Cmd+K + Enter combo still hits the existing confirm() guard warning about real git/PR/Jira
+    // side effects before resuming auto-pickup — the palette must never let that be bypassed.
+    {label: document.getElementById("autoToggle").textContent, kind: "command",
+     run: () => document.getElementById("autoToggle").click()},
+    {label: "Go to History", kind: "command", run: () => setTab("history")},
+    {label: "Go to Live", kind: "command", run: () => setTab("live")},
+  );
+  return targets;
+}
+let paletteActiveIdx = 0, paletteMatches = [];
+function renderPaletteResults(query) {
+  const q = query.trim().toLowerCase();
+  paletteMatches = paletteTargets()
+    .filter(t => !q || t.label.toLowerCase().includes(q))
+    .sort((a, b) => a.label.toLowerCase().indexOf(q) - b.label.toLowerCase().indexOf(q))
+    .slice(0, 8);
+  paletteActiveIdx = 0;
+  document.getElementById("paletteResults").innerHTML = paletteMatches.map((t, i) =>
+    `<div class="palette-row${i === 0 ? " active" : ""}" data-idx="${i}"><span>${esc(t.label)}</span><span class="step-hi">${t.kind}</span></div>`
+  ).join("") || `<div class="palette-row" style="opacity:.6">No matches</div>`;
+  document.querySelectorAll(".palette-row[data-idx]").forEach(row =>
+    row.addEventListener("click", () => runPaletteMatch(+row.dataset.idx)));
+}
+function runPaletteMatch(i) { const m = paletteMatches[i]; if (m) { m.run(); closePalette(); } }
+function openPalette() {
+  document.getElementById("palette").classList.add("open");
+  document.getElementById("paletteBackdrop").classList.add("open");
+  const input = document.getElementById("paletteInput");
+  input.value = "";
+  renderPaletteResults("");
+  input.focus();
+}
+function closePalette() {
+  document.getElementById("palette").classList.remove("open");
+  document.getElementById("paletteBackdrop").classList.remove("open");
+}
+function updatePaletteActive() {
+  document.querySelectorAll(".palette-row[data-idx]").forEach((row, i) => row.classList.toggle("active", i === paletteActiveIdx));
+}
+document.getElementById("paletteBackdrop").addEventListener("click", closePalette);
+document.getElementById("paletteInput").addEventListener("input", e => renderPaletteResults(e.target.value));
+document.getElementById("paletteInput").addEventListener("keydown", e => {
+  if (e.key === "ArrowDown") { e.preventDefault(); paletteActiveIdx = Math.min(paletteActiveIdx + 1, paletteMatches.length - 1); updatePaletteActive(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); paletteActiveIdx = Math.max(paletteActiveIdx - 1, 0); updatePaletteActive(); }
+  else if (e.key === "Enter") { e.preventDefault(); runPaletteMatch(paletteActiveIdx); }
+});
+
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); return; }
+  if (e.key === "Escape") {
+    if (document.getElementById("palette").classList.contains("open")) closePalette();
+    else closeSlideover();
+  }
+});
 
 // A stone dropped in water — a ripple from the exact click point, not a generic effect.
 document.getElementById("start").addEventListener("click", (e) => {
@@ -683,6 +1169,7 @@ async function pollBatch() {
   if (!res.ok) return;
   const data = await res.json();
   batchTickets = data.tickets || [];
+  batchCancelled = !!data.cancelled;
   renderLive();
 }
 
@@ -715,6 +1202,32 @@ async function pollBatch() {
     btn.addEventListener("click", () => { watchBatch(btn.dataset.reconnect); box.remove(); }));
 })();
 
+// Colorize the raw log the same way the stepper already does (✓ green, ✗ red, station headers
+// teal, [PAUSED]/[FAILED]/[DONE] banners in their matching color) — scanning a long developer-level
+// log for the one line that matters was harder than it needed to be as flat monochrome text.
+function colorizeLogLine(line) {
+  const escaped = esc(line);
+  if (line.includes("✓")) return `<span style="color:var(--ok)">${escaped}</span>`;
+  if (line.includes("✗")) return `<span style="color:var(--crit)">${escaped}</span>`;
+  if (/^\s*▶/.test(line)) return `<span style="color:var(--glow)">${escaped}</span>`;
+  if (line.includes("[PAUSED]")) return `<span style="color:var(--warn)">${escaped}</span>`;
+  if (line.includes("[FAILED]")) return `<span style="color:var(--crit)">${escaped}</span>`;
+  if (line.includes("[DONE]")) return `<span style="color:var(--ok)">${escaped}</span>`;
+  return escaped;
+}
+
+// Last substantive raw-log line(s) for a running station — turns a bare "Working…" into a
+// live glimpse of what's actually happening. Reads straight from t.raw_tail (no backend
+// change needed); noise lines (headers/outcome markers/blank) are filtered out since those
+// are already represented elsewhere in the stepper. At management/team log level the
+// pipeline prints little beyond those markers, so this often comes back empty there — that's
+// expected, not broken; it's populated mainly at developer log level.
+const TICKER_NOISE_RE = /^(\s*$|\s*▶|\s*[✓✗]|\[(DONE|FAILED|PAUSED)\]|\s*RESULT:)/;
+function activityTicker(rawTail) {
+  if (!rawTail || !rawTail.length) return [];
+  return rawTail.filter(l => l.trim() && !TICKER_NOISE_RE.test(l)).slice(-2);
+}
+
 // ── Live view: unified master list + detail pane ─────────────────────────
 function currentStepCaption(t) {
   if (t.status === "paused") return `waiting on you — ${t.paused_gate || "gate"}`;
@@ -740,6 +1253,7 @@ function rowHtml(t, isAuto) {
       </div>
     </div>
     <div class="row-right">
+      ${t.started_at ? `<span class="row-duration">${esc(formatElapsed(t.started_at, t.finished_at))}</span>` : ""}
       <span class="pill ${t.status}"><span class="d"></span>${esc(t.status)}</span>
     </div>
   </div>`;
@@ -752,10 +1266,36 @@ function pickDefaultSelection(all) {
        || all[0] || null);
 }
 
+// A tasteful moment for a real shipped success — "done" alone isn't enough (an RCA-routed or
+// unsupported ticket can end at "done" with no code ever landing); a pr_number is what proves
+// a coded change actually shipped. Session-only (no localStorage) — fires at most once per
+// ticket per browser session, and a fresh tab shouldn't re-celebrate tickets that were already
+// done+PR'd before it started watching — same PAGE_LOAD_AT/BASELINE_GRACE_MS grace window as
+// checkNotify, for the same reason (two independent, uncoordinated fetches both feed this).
+const celebratedTickets = new Set();
+function checkCelebrate(all) {
+  if (Date.now() - PAGE_LOAD_AT < BASELINE_GRACE_MS) {
+    all.forEach(t => { if (t.status === "done" && t.pr_number) celebratedTickets.add(t.ticket); });
+    return;
+  }
+  all.forEach(t => {
+    if (t.status === "done" && t.pr_number && !celebratedTickets.has(t.ticket)) {
+      celebratedTickets.add(t.ticket);
+      showToast(`🎉 ${t.ticket} shipped — PR #${t.pr_number}`, "success");
+      if (t.ticket === selectedTicket) {
+        const card = document.querySelector(".detail-card");
+        if (card) { card.classList.add("celebrating"); setTimeout(() => card.classList.remove("celebrating"), 900); }
+      }
+    }
+  });
+}
+
 function renderLive() {
   const knownBatchIds = new Set(batchTickets.map(t => t.ticket));
   const autoOnly = autoTickets.filter(t => !knownBatchIds.has(t.ticket));
   const all = [...batchTickets, ...autoOnly];
+  checkCelebrate(all);
+  checkNotify(all);
 
   document.getElementById("liveCount").textContent = all.length ? ` · ${all.length}` : "";
 
@@ -776,8 +1316,13 @@ function renderLive() {
 
   let listHtml = "";
   if (batchTickets.length) {
-    listHtml += `<div class="list-section-label">This batch</div>` +
-      batchTickets.map(t => rowHtml(t, false)).join("");
+    // Stop only shows while something in this batch is still ahead of it — no point offering to
+    // stop a batch that's already fully settled (every ticket done/failed/interrupted).
+    const hasActive = batchTickets.some(t => !TERMINAL.has(t.status));
+    listHtml += `<div class="list-section-label" style="display:flex;align-items:center;justify-content:space-between">
+      <span>This batch</span>
+      ${hasActive ? `<button class="ghost" id="stopBatchBtn" type="button" style="padding:2px 10px;font-size:11px;text-transform:none;letter-spacing:0">Stop</button>` : ""}
+    </div>` + batchTickets.map(t => rowHtml(t, false)).join("");
   }
   if (autoOnly.length) {
     listHtml += `<div class="list-section-label">Auto-queue</div>` +
@@ -788,6 +1333,14 @@ function renderLive() {
     selectedTicket = row.dataset.select;
     renderLive();
   }));
+  const stopBatchBtn = document.getElementById("stopBatchBtn");
+  if (stopBatchBtn) stopBatchBtn.addEventListener("click", async () => {
+    if (!confirm("Stop this batch? Every currently-running ticket in it is force-killed; any tickets still queued are abandoned, not started.")) return;
+    stopBatchBtn.disabled = true;
+    const res = await fetch(`/batches/${batchId}/stop`, {method: "POST"});
+    showToast(res.ok ? "Batch stopped" : "Couldn't stop the batch", res.ok ? "success" : "error");
+    await pollBatch();
+  });
 
   const selected = all.find(t => t.ticket === selectedTicket);
   renderDetail(selected, all.find(t => t.ticket === selectedTicket && autoOnly.includes(t)) !== undefined);
@@ -825,11 +1378,48 @@ function renderDetail(t, isAuto) {
   }
   const dismissBtn = panel.querySelector("[data-dismiss]");
   if (dismissBtn) dismissBtn.addEventListener("click", async () => {
-    if (!confirm(`Remove ${t.ticket} from the auto-queue? This only clears it from view — it won't be re-added unless discovery finds it again.`)) return;
+    const where = isAuto ? "the auto-queue (it won't be re-added unless discovery finds it again)" : "this batch";
+    if (!confirm(`Remove ${t.ticket} from ${where}? This only clears it from view.`)) return;
     dismissBtn.disabled = true;
-    await fetch(`/auto/${encodeURIComponent(t.ticket)}/dismiss`, {method: "POST"});
+    const targetBatchId = isAuto ? "auto" : batchId;
+    const res = await fetch(`/batches/${targetBatchId}/tickets/${encodeURIComponent(t.ticket)}/dismiss`, {method: "POST"});
+    showToast(res.ok ? `Removed ${t.ticket}` : `Couldn't remove ${t.ticket}`, res.ok ? "success" : "error");
     if (selectedTicket === t.ticket) selectedTicket = null;
-    await refreshAutoStatus();
+    if (isAuto) { await refreshAutoStatus(); } else { await pollBatch(); }
+  });
+  const killBtn = panel.querySelector("[data-kill]");
+  if (killBtn) killBtn.addEventListener("click", async () => {
+    if (!confirm(`Force-kill the running process for ${t.ticket}? This is a hard SIGKILL — any in-flight work (a Docker build, an SDK call) stops immediately, not gracefully.`)) return;
+    killBtn.disabled = true;
+    const res = await fetch(`/tickets/${encodeURIComponent(t.ticket)}/kill`, {method: "POST"});
+    showToast(res.ok ? `Killed ${t.ticket}` : `Couldn't kill ${t.ticket} — no running process found`, res.ok ? "success" : "error");
+    if (isAuto) { await refreshAutoStatus(); } else { await pollBatch(); }
+  });
+  const retryBtn = panel.querySelector("[data-retry]");
+  if (retryBtn) retryBtn.addEventListener("click", async () => {
+    retryBtn.disabled = true;
+    const targetBatchId = isAuto ? "auto" : batchId;
+    const res = await fetch(`/batches/${targetBatchId}/tickets/${encodeURIComponent(t.ticket)}/retry`, {method: "POST"});
+    showToast(res.ok ? `Retrying ${t.ticket}…` : `Couldn't retry ${t.ticket}`, res.ok ? "success" : "error");
+    if (isAuto) { await refreshAutoStatus(); } else { await pollBatch(); }
+  });
+  const copyBtn = panel.querySelector("[data-copy-path]");
+  if (copyBtn) copyBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(copyBtn.dataset.copyPath);
+      showToast("Copied log path to clipboard", "success");
+    } catch {
+      showToast("Couldn't copy — clipboard access blocked", "error");
+    }
+  });
+  const copySummaryBtn = panel.querySelector("[data-copy-summary]");
+  if (copySummaryBtn) copySummaryBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(buildRunSummary(t));
+      showToast("Copied run summary to clipboard", "success");
+    } catch {
+      showToast("Couldn't copy — clipboard access blocked", "error");
+    }
   });
 }
 
@@ -841,23 +1431,127 @@ async function resume(ticket, decision, isAuto) {
   // resume_batch). Using the manual batchId here for an auto ticket would 404, or
   // worse, silently act on whatever unrelated manual batch happens to be active.
   const targetBatchId = isAuto ? "auto" : batchId;
-  await fetch(`/batches/${targetBatchId}/resume`, {
+  const res = await fetch(`/batches/${targetBatchId}/resume`, {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({decision, note}),
+    // ticket is required now that a batch can run several tickets concurrently — more than
+    // one can be paused at a gate in the same batch at once, so the backend can no longer
+    // assume "the" paused ticket is unambiguous.
+    body: JSON.stringify({decision, note, ticket}),
   });
+  showToast(res.ok ? `Submitted "${decision}" for ${ticket}` : `Couldn't submit decision for ${ticket}`,
+             res.ok ? "success" : "error");
   if (isAuto) { await refreshAutoStatus(); } else { await pollBatch(); }
 }
 
+// Mirrors ocean_pipeline's own station graph (and app.py's LABEL_TO_NODE, the labels'
+// single source of truth) just enough to GUESS what's most likely next — used only to
+// fill the gap between one station finishing and the next one's own "▶ ..." header
+// actually arriving, so that gap doesn't read as a bare, uninformative "Working…". This
+// is never authoritative: the instant a real header streams in, it replaces the guess
+// exactly like any other event. Branchy stations (a review that can loop back, a gate
+// that can request changes) predict their most common outcome, not a guarantee.
+// Exact inverse of app.py's LABEL_TO_NODE (itself mirroring ocean_pipeline/ui.py's own
+// _LABELS) — every node graph.py wires in, except rca_report: a plain-code node with no
+// ui.station_start header at all (it only posts one Jira comment), so it never appears
+// as a real event and predicting it would show a label nothing will ever replace.
+const NODE_LABEL = {
+  researcher: "Research & routing", sme_consult: "Ocean SME consult",
+  rca_agent: "Root-cause analysis (RCA)", rca_review_gate: "RCA review — awaiting approval",
+  rca_done: "RCA report delivered", unsupported_route: "Unsupported ticket — stopped",
+  dep_resolver: "Dependency resolution", reachability_gate: "Reachability verification",
+  coder: "Coding", harsh_reviewer: "Adversarial code review", open_pr: "Open draft PR",
+  sit_resolve: "Local SIT — resolve & gate", sit_author: "Local SIT — draft test",
+  qa_review_gate: "QA review — awaiting approval", sit_run: "Local SIT — run",
+  sit_testrail: "TestRail — writing cases", sit_triage: "Local SIT — triage & verdict",
+  human_gate: "Awaiting human approval", flip_ready: "Flip PR to ready-for-review",
+  prep_rework: "Rework — SIT found a defect", prep_env_retry: "Retry — SIT hit an environment issue",
+  learn_repo: "Onboarding an unsupported repo", prep_image: "Pre-warming the Ruby image",
+  prep_container: "Starting the shared test container",
+  teardown_container: "Removing the shared test container", stop_run: "Stopped — needs an engineer",
+};
+// The graph's most-common ("happy path") outgoing edge per node — graph.py is the source
+// of truth this mirrors. Terminal nodes (unsupported_route, rca_done, and flip_ready /
+// stop_run / teardown_container when neither PERSISTENT_CONTAINER nor WARM_SIT_INFRA is
+// on) are omitted on purpose: no entry means predictNextLabel returns null there and the
+// UI falls back to plain "Working…", which is correct right before the process actually exits.
+const HAPPY_NEXT = {
+  researcher: "sme_consult",
+  // sme_consult / dep_resolver / prep_image all feed the SAME fan-in join
+  // (reachability_gate) — whichever finishes LAST must point there, not at an
+  // already-done sibling. PARALLEL_GROUPS below covers the "still waiting on a
+  // sibling" case; this is only the fallback once every sibling is done.
+  sme_consult: "reachability_gate", dep_resolver: "reachability_gate", prep_image: "reachability_gate",
+  prep_container: "reachability_gate", reachability_gate: "coder", coder: "harsh_reviewer",
+  harsh_reviewer: "open_pr",   // most runs approve on the first pass, not "rework"
+  open_pr: "sit_resolve", sit_resolve: "sit_author", sit_author: "qa_review_gate",
+  qa_review_gate: "sit_run",   // most common decision (with or without TestRail) runs SIT next
+  sit_run: "sit_triage", sit_testrail: "sit_triage",
+  sit_triage: "human_gate",    // most common outcome is PASS
+  human_gate: "flip_ready",    // most common decision is approve
+  learn_repo: "sit_resolve", prep_rework: "coder", prep_env_retry: "sit_run",
+  rca_agent: "rca_review_gate",   // skips the header-less rca_report hop — it never prints, so
+                                   // predicting it would leave a guess nothing ever replaces
+  rca_review_gate: "rca_done",    // most common: no further fix needed
+  flip_ready: "teardown_container", stop_run: "teardown_container",
+};
+// Nodes that fan out in the SAME superstep (LangGraph runs them concurrently; completion
+// order isn't fixed) and all join back at one shared node. If ANY sibling is still
+// pending, guessing that sibling beats the happy-path default; only once every sibling
+// is done does the join itself become the right guess (handled by falling through to
+// HAPPY_NEXT above, which is set to the join for every member of the group).
+const PARALLEL_GROUPS = [
+  { members: ["sme_consult", "dep_resolver", "prep_image"], join: "reachability_gate" },
+  { members: ["sit_run", "sit_testrail"], join: "sit_triage" },
+];
+
+function predictNextLabel(events) {
+  const last = events.length ? events[events.length - 1] : null;
+  if (!last || last.state === "running") return null;
+  const doneNodes = new Set(events.filter(e => e.state !== "running").map(e => e.node));
+  const group = PARALLEL_GROUPS.find(g => g.members.includes(last.node));
+  if (group) {
+    const pending = group.members.find(m => m !== last.node && !doneNodes.has(m));
+    return NODE_LABEL[pending || group.join] || null;
+  }
+  const nextNode = HAPPY_NEXT[last.node];
+  return nextNode ? (NODE_LABEL[nextNode] || null) : null;
+}
+
 function detailHtml(t, isAuto) {
-  const steps = (t.events || []).map(e => `
+  const events = t.events || [];
+  const ticker = activityTicker(t.raw_tail);
+  const tickerHtml = ticker.length
+    ? `<div class="step-ticker" title="${esc(ticker.join("\n"))}">${ticker.map(esc).join("<br>")}</div>` : "";
+  let steps = events.map(e => `
     <div class="step ${e.state}">
       <div class="marker">${e.state === "ok" ? "✓" : e.state === "crit" ? "✕" : "…"}</div>
       <div>
         <div class="step-name">${esc(e.label)}</div>
         ${e.elapsed ? `<div class="step-meta"><span>${esc(e.elapsed)}</span></div>` : ""}
         ${e.highlight ? `<div class="step-hi">${esc(e.highlight)}</div>` : ""}
+        ${e.state === "running" ? tickerHtml : ""}
       </div>
     </div>`).join("");
+  // Plain-code stations (prep_container, teardown_container, open_pr, ...) never print the
+  // "▶ <station>" header — only AGENT-delegated stations do (ui.station_start, called only from
+  // agents.run_agent). So a plain-code stage in flight is otherwise invisible here: the last known
+  // event is already "ok"/"crit" even though real work is still happening behind it. Show a
+  // placeholder while that's true, so the stepper doesn't look stalled during the gap — and it
+  // naturally gets the same flowing-current connector line above it (:has(+ .step.running)) plus
+  // the sonar-ping marker, since it IS a real .step.running element, just an unnamed one.
+  const lastState = events.length ? events[events.length - 1].state : null;
+  if (t.status === "running" && lastState !== "running") {
+    const guess = predictNextLabel(events);
+    steps += `
+    <div class="step running">
+      <div class="marker">…</div>
+      <div>
+        <div class="step-name">${esc(guess || "Working…")}</div>
+        <div class="step-hi">${guess ? "predicted — hasn't reported in yet" : "the next station hasn't reported in yet"}</div>
+        ${tickerHtml}
+      </div>
+    </div>`;
+  }
 
   let gate = "";
   if (t.status === "paused") {
@@ -882,18 +1576,32 @@ function detailHtml(t, isAuto) {
     }
   }
 
-  const foot = (t.status === "done" || t.status === "failed") ? `
+  const foot = TERMINAL.has(t.status) ? `
     <div class="foot">
-      <b>${esc(t.final_status || t.status)}</b> — ${esc(t.final_outcome || "")}
+      <b>${esc(t.final_status || t.status)}</b>${t.final_outcome ? ` — ${esc(t.final_outcome)}` : ""}
       ${t.pr_number ? ` — PR #${t.pr_number}` : ""}
     </div>` : "";
 
-  const dismissRow = (isAuto && TERMINAL.has(t.status)) ? `
-    <div class="foot" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
-      <span>Finished in the auto-queue.</span>
-      <button class="ghost" data-dismiss="${esc(t.ticket)}" type="button">Dismiss</button>
-    </div>` : "";
-
+  // Ticket-level actions, available regardless of whether this is a manual-batch or auto-queue
+  // ticket: Kill (a genuinely stuck "running" process — the only way to stop one short of killing
+  // the whole monitor), Retry (a checkpoint resume for failed/interrupted — the pipeline's own
+  // --resume replays from the last LangGraph checkpoint, so this is not a from-scratch restart),
+  // Dismiss (clear a terminal entry from view).
+  // Kill stays full-size and danger-colored — it's a destructive, high-stakes action and should
+  // read as one at a glance, unlike Retry/Dismiss which live as small chips next to Copy path.
+  const killButton = t.status === "running"
+    ? `<button class="danger" data-kill="${esc(t.ticket)}" type="button">Kill</button>` : "";
+  const actionButtons = [];
+  if (t.status === "failed" || t.status === "interrupted") {
+    actionButtons.push(`<button data-retry="${esc(t.ticket)}" type="button">Retry</button>`);
+  }
+  // A "queued" ticket in a STOPPED manual batch is permanently abandoned (the backend
+  // guarantees it will never actually dispatch — see stop_batch/dismiss_ticket's own
+  // comments), so it's inert exactly like a terminal ticket and just as safe to dismiss —
+  // without this it would sit stuck in the Live list until the whole monitor restarts.
+  if (TERMINAL.has(t.status) || (!isAuto && t.status === "queued" && batchCancelled)) {
+    actionButtons.push(`<button class="ghost" data-dismiss="${esc(t.ticket)}" type="button">Dismiss</button>`);
+  }
   return `
     <div class="detail-card st-${t.status}">
       <div class="card-head">
@@ -901,21 +1609,27 @@ function detailHtml(t, isAuto) {
           <div style="display:flex;align-items:center;gap:9px">
             <div class="ticket">${esc(t.ticket)}</div>
             ${isAuto ? `<span class="auto-tag">auto</span>` : ""}
+            ${t.started_at ? `<span class="duration-badge">${esc(formatElapsed(t.started_at, t.finished_at))}</span>` : ""}
           </div>
           <div class="pill ${t.status}"><span class="d"></span>${esc(t.status)}</div>
         </div>
         <div class="meta-block">
           ${t.execution_id ? `<div class="meta-line">${esc(t.execution_id)}</div>` : ""}
           ${t.log_path ? `<div class="meta-line path" title="${esc(t.log_path)} — tail -f this file for this ticket's full log">${esc(t.log_path)}</div>` : ""}
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin-top:4px">
+            ${(events.length || t.log_path) ? `<button class="ghost" data-copy-summary="${esc(t.ticket)}" type="button" style="padding:2px 8px;font-size:11px">Copy summary</button>` : ""}
+            ${t.log_path ? `<button class="ghost" data-copy-path="${esc(t.log_path)}" type="button" style="padding:2px 8px;font-size:11px">Copy path</button>` : ""}
+            ${actionButtons.map(b => b.replace('type="button"', 'type="button" style="padding:2px 8px;font-size:11px"')).join("")}
+            ${killButton.replace('type="button"', 'type="button" style="padding:4px 12px;font-size:12px"')}
+          </div>
         </div>
       </div>
       <div class="stepper">${steps}</div>
       ${gate}
       ${foot}
-      ${dismissRow}
       <details class="rawlog" data-ticket="${esc(t.ticket)}">
         <summary>Log (${(t.raw_tail || []).length} lines)</summary>
-        <pre>${esc((t.raw_tail || []).join("\n"))}</pre>
+        <pre>${(t.raw_tail || []).map(colorizeLogLine).join("\n")}</pre>
       </details>
     </div>`;
 }
@@ -941,13 +1655,43 @@ document.getElementById("autoToggle").addEventListener("click", async () => {
   if (cur.paused) {
     if (!confirm("Resume auto-pickup? Real git/PR/Jira actions will start firing unattended on discovered tickets.")) return;
     await fetch("/control/resume", {method: "POST"});
+    showToast("Auto-pickup resumed", "success");
   } else {
     await fetch("/control/pause", {method: "POST"});
+    showToast("Auto-pickup paused", "success");
   }
   await refreshAutoStatus();
 });
 refreshAutoStatus();
 setInterval(refreshAutoStatus, 4000);
+
+// ── Environment health strip: disk/Docker/network, on its own slow interval —
+// decoupled from the 2s batch poll so a slow/hung check here can never stall it.
+async function pollHealth() {
+  try {
+    const res = await fetch("/health/env");
+    if (!res.ok) return;
+    renderHealthStrip(await res.json());
+  } catch { /* transient fetch failure — strip just keeps showing its last-known state */ }
+}
+function renderHealthStrip(h) {
+  const dot = (ok) => ok === true ? "var(--ok)" : ok === false ? "var(--crit)" : "var(--pending)";
+  // Docker's dot reflects the daemon's own ok/false/unknown same as the others, but when the
+  // daemon IS up, a large reclaimable-space total (space_warn) downgrades green -> amber —
+  // "running fine, but you should probably `docker system prune`" reads differently from
+  // "running fine, nothing to do", and differently again from "not running at all".
+  const dockerColor = h.docker.ok === true && h.docker.space_warn ? "var(--warn)" : dot(h.docker.ok);
+  const dockerLabel = h.docker.ok === true ? (h.docker.backend || "Docker") : "Docker daemon";
+  const dockerTitle = h.docker.ok === true && h.docker.total_gb != null
+    ? `${dockerLabel} ${h.docker.version || ""} — using ${h.docker.total_gb}GB (${h.docker.reclaimable_gb}GB reclaimable)`
+    : dockerLabel;
+  document.getElementById("healthStrip").innerHTML = `
+    <span title="Disk${h.disk.free_gb != null ? `: ${h.disk.free_gb}GB free` : ""}"><span class="health-dot" style="background:${dot(h.disk.ok)}"></span>Disk</span>
+    <span title="${esc(dockerTitle)}"><span class="health-dot" style="background:${dockerColor}"></span>Docker</span>
+    <span title="${esc(h.reachability.host || "network")}"><span class="health-dot" style="background:${dot(h.reachability.ok)}"></span>Net</span>`;
+}
+pollHealth();
+setInterval(pollHealth, 20000);
 
 // ── Discovered panel (inside the New-batch slide-over) ───────────────────
 document.getElementById("refreshDiscovered").addEventListener("click", async () => {
@@ -956,7 +1700,7 @@ document.getElementById("refreshDiscovered").addEventListener("click", async () 
   const listEl = document.getElementById("discoveredList");
   listEl.className = "empty-state";
   listEl.style.cssText = "padding:var(--sp-3) 0;text-align:left";
-  listEl.textContent = "Loading…";
+  listEl.innerHTML = `<span style="display:inline-flex;align-items:center;gap:8px">${TRIDENT_LOADER_SVG}Loading…</span>`;
   try {
     const res = await fetch("/discovered");
     const data = await res.json();
@@ -988,15 +1732,41 @@ function addTicket(key) {
 }
 
 // ── History tab ───────────────────────────────────────────────────────────
-function historyRowHtml(t) {
+function historyRowHtml(t, maxDuration) {
   const when = t.finished_at ? new Date(t.finished_at * 1000).toLocaleString() : "—";
   const outcome = t.final_outcome || t.paused_message || "";
-  return `<div class="history-row">
+  // Retry-from-History: the ONLY way to retry a failed/interrupted run once the monitor has
+  // restarted — BATCHES/`_auto_batch` are in-memory only, this table is what survives.
+  const canRetry = t.status === "failed" || t.status === "interrupted";
+  // Duration badge + a relative-width bar (one bar, one value) so multiple rows are scannable
+  // at a glance — not a per-station sparkline, since station-level durations aren't persisted
+  // anywhere (only in-memory while a ticket is live), just the ticket-level started_at/finished_at
+  // this row already carries.
+  //
+  // Only fall back to "still ticking against now" for a status that's genuinely still in
+  // flight (running/paused) — reconcile_stale always stamps finished_at when it flips a row to
+  // "interrupted" now, but this guards older rows written before that fix too: without it, any
+  // status lacking finished_at would recompute against Date.now() on every render, growing
+  // forever for a process that's actually long dead, and (since one maxDuration scales every
+  // row on the page) flattening every other row's bar to near-invisible width.
+  const stillTicking = t.status === "running" || t.status === "paused";
+  const duration = t.started_at && (t.finished_at || stillTicking)
+    ? (t.finished_at || Date.now() / 1000) - t.started_at : null;
+  const durationText = duration !== null ? formatElapsed(t.started_at, t.finished_at) : "—";
+  const pct = duration !== null ? Math.min(100, Math.round((duration / maxDuration) * 100)) : 0;
+  return `<div class="history-row st-${t.status}">
     <div class="ticket">${esc(t.ticket)}</div>
     <div class="pill ${t.status}"><span class="d"></span>${esc(t.status)}</div>
     <div class="outcome">${esc(outcome)}${t.pr_number ? ` <span class="meta-line" style="display:inline">· PR #${t.pr_number}</span>` : ""}</div>
-    <div class="when">${esc(when)}</div>
-    <button class="ghost" data-delete-row="${t.id}" type="button">Delete</button>
+    <div class="when">
+      ${esc(when)}
+      <div class="duration-badge" style="margin-top:4px">${esc(durationText)}</div>
+      ${duration !== null ? `<div class="history-duration-track"><div class="history-duration-fill" style="width:${pct}%"></div></div>` : ""}
+    </div>
+    <div style="display:flex;gap:6px">
+      ${canRetry ? `<button data-history-retry="${t.id}" type="button">Retry</button>` : ""}
+      <button class="ghost" data-delete-row="${t.id}" type="button">Delete</button>
+    </div>
   </div>`;
 }
 async function loadHistory() {
@@ -1009,13 +1779,29 @@ async function loadHistory() {
   if (!data.tickets.length) {
     listEl.innerHTML = `<div class="empty-state">No history yet — completed and failed runs will show up here.</div>`;
   } else {
-    listEl.innerHTML = `<div class="history-list">${data.tickets.map(historyRowHtml).join("")}</div>`;
+    const durations = data.tickets.map(t => t.started_at ? (t.finished_at || Date.now() / 1000) - t.started_at : 0);
+    const maxDuration = Math.max(1, ...durations);
+    listEl.innerHTML = `<div class="history-list">${data.tickets.map(t => historyRowHtml(t, maxDuration)).join("")}</div>`;
   }
   document.querySelectorAll("[data-delete-row]").forEach(b => b.addEventListener("click", async () => {
     if (!confirm("Delete this history entry? This can't be undone.")) return;
     b.disabled = true;
-    await fetch(`/history/${b.dataset.deleteRow}`, {method: "DELETE"});
+    const res = await fetch(`/history/${b.dataset.deleteRow}`, {method: "DELETE"});
+    showToast(res.ok ? "Deleted history entry" : "Couldn't delete that entry", res.ok ? "success" : "error");
     await loadHistory();
+  }));
+  document.querySelectorAll("[data-history-retry]").forEach(b => b.addEventListener("click", async () => {
+    b.disabled = true;
+    const res = await fetch(`/history/${b.dataset.historyRetry}/retry`, {method: "POST"});
+    if (res.ok) {
+      const data = await res.json();
+      showToast(`Retrying ${data.retried}…`, "success");
+      watchBatch(data.batch_id);
+      setTab("live");
+    } else {
+      showToast("Couldn't retry — it may no longer be failed/interrupted, or has no recorded execution id", "error");
+      b.disabled = false;
+    }
   }));
 }
 document.getElementById("refreshHistory").addEventListener("click", loadHistory);

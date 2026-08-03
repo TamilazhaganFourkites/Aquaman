@@ -121,6 +121,23 @@ def recent_tickets(limit: int = 200) -> list[dict]:
         return []
 
 
+def get_ticket(row_id: int) -> dict | None:
+    """One persisted ticket row by its sqlite id — used by /history/{row_id}/retry, the only way
+    to retry a failed/interrupted run once the monitor has restarted (BATCHES/`_auto_batch` are
+    in-memory only; this table is what survives)."""
+    try:
+        with _conn() as con:
+            row = con.execute(
+                "SELECT id, batch_id, idx, ticket, status, execution_id, paused_gate, "
+                "paused_message, final_status, final_outcome, pr_number, started_at, "
+                "finished_at, log_path FROM tickets WHERE id = ?",
+                (row_id,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def counts() -> dict:
     try:
         with _conn() as con:
@@ -159,10 +176,20 @@ def reconcile_stale() -> int:
     start means the OS subprocess that was driving it is definitely gone (killed along
     with the prior monitor process, or the machine restarted) — it did not error, so
     it must not be mislabeled 'failed'; it also must not be left looking like it's
-    still in flight forever. Returns the number of rows flipped, for a startup log line."""
+    still in flight forever. Returns the number of rows flipped, for a startup log line.
+
+    Also stamps finished_at (to right now, the best available approximation of when the
+    prior process actually died) — leaving it null would make the History tab's duration
+    display treat this row as still ticking forever (it falls back to the current time
+    whenever finished_at is absent for a still-in-flight-looking status), permanently
+    skewing that row's own duration and, since durations share one page-wide scale,
+    flattening every other row's duration bar too."""
     try:
         with _conn() as con:
-            cur = con.execute("UPDATE tickets SET status = 'interrupted' WHERE status = 'running'")
+            cur = con.execute(
+                "UPDATE tickets SET status = 'interrupted', finished_at = ? WHERE status = 'running'",
+                (time.time(),),
+            )
             return cur.rowcount
     except Exception:  # noqa: BLE001
         return 0

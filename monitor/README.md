@@ -1,14 +1,21 @@
 # Aquaman Batch Monitor
 
-A small local web app that runs a **sequential** batch of `ocean-pipeline` tickets and
-shows real, live station-by-station progress in a browser.
+A small local web app that runs a batch of `ocean-pipeline` tickets **concurrently** (up
+to `AQUAMAN_MAX_CONCURRENT` at once, default 3) and shows real, live station-by-station
+progress for each in a browser.
 
 This is not a second control plane. It does exactly two things:
 
-1. Spawns `ocean-pipeline <ticket>` as a subprocess, **one ticket at a time** — never
-   concurrently. Station 6 (local SIT) needs exclusive Docker/port/repo-checkout access,
-   the same reason Aquaman's own `run-batch.sh` is sequential. This app never introduces
-   a `max_concurrent`-style setting.
+1. Spawns `ocean-pipeline <ticket>` as a subprocess — up to `AQUAMAN_MAX_CONCURRENT` at
+   once, shared across manual batches and the auto-queue. This used to be strictly one
+   ticket at a time: Station 6 (local SIT) binds fixed ports and a shared local repo
+   checkout, a genuine collision risk with no protection outside this app. It no longer
+   needs to be — `ocean_pipeline` itself now carries machine-wide protection for exactly
+   that (a flock-based SIT-stage slot, `MAX_CONCURRENT_SIT`, default 1, plus a build-slot
+   for the Docker-heavy stages, `MAX_CONCURRENT_BUILDS`, default 2), so multiple tickets'
+   earlier stages run genuinely concurrently while their Docker-heavy moments queue
+   safely behind each other instead of colliding. Aquaman's own `run-batch.sh` CLI script
+   is still deliberately sequential — a design choice there, not a limitation here.
 2. Parses that subprocess's own stdout, using the exact contract already printed by
    `ocean_pipeline/ui.py` (`banner` / `station_start` / `step` / `summary`) — no separate
    source of truth, no re-implementation of any graph/node logic.
@@ -26,6 +33,7 @@ source ../.venv/bin/activate
 ```bash
 export AQUAMAN_BIN=$(pwd)/../.venv/bin/ocean-pipeline   # absolute path to the console script
 export AQUAMAN_DIR=$(pwd)/..                             # Aquaman repo root (subprocess cwd)
+export AQUAMAN_MAX_CONCURRENT=3                          # optional, defaults to 3
 uvicorn app:app --port 8799
 ```
 
@@ -46,8 +54,9 @@ and click **Start batch**.
   keep waiting), so this app surfaces a decision panel and, on your click, spawns a fresh
   `ocean-pipeline --resume <EXE-id> --qa ...` (or `--approve`/`--reject`) — exactly the
   commands you'd type by hand, just triggered from the UI.
-- A ticket only starts once the previous one has fully finished or is sitting at a gate
-  waiting on you — the batch will not silently skip ahead.
+- Up to `AQUAMAN_MAX_CONCURRENT` tickets run at once (across manual batches and the
+  auto-queue combined) — the rest queue and start the moment a slot frees, not once
+  every earlier ticket has fully finished.
 
 ## Known limits (read before demoing)
 
