@@ -117,6 +117,19 @@ async def run_one(ticket_id: str) -> dict:
     except Exception as e:  # noqa: BLE001 — one ticket's crash must not abort the batch
         final = {"final_status": "failed", "final_outcome": f"{type(e).__name__}: {e}"}
     finally:
+        # This subgraph never goes through cli.py::_execute, so its own SIT/build slot release
+        # backstop never runs here — without this, run_batch's sequential loop (MAX_CONCURRENT_SIT
+        # defaults to 1) would have every ticket AFTER the first wait up to SIT_SLOT_WAIT_SECONDS
+        # (2h default) for a slot the prior ticket is still silently holding, since sit_run acquires
+        # it but nothing in this module ever releases it. No pause/resume concept exists here
+        # (QA_REVIEW_AUTO=True forces qa_review_gate to auto-approve, per this function's own
+        # docstring) — every call reaches a genuine terminal state, so this is always safe to run,
+        # unlike cli.py's version which skips it on a real pause.
+        try:
+            nodes._release_sit_slot(execution_id)
+            nodes._release_build_slot(execution_id)
+        except Exception:  # noqa: BLE001 — never let cleanup fail the ticket
+            pass
         if handler is not None:
             tracing.flush()
     telemetry.station_event(execution_id, 6, "qa_batch_end",

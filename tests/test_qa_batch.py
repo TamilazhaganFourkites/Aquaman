@@ -64,11 +64,20 @@ def test_batch_is_sequential_and_never_flips_a_pr(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")
 
     import json as _json
+    import re as _re
+    from pathlib import Path as _Path
 
     async def fake_run_skill(**kw):
         node, tid = kw["node"], kw["ticket_id"]
         path = config.automation_verdict_path(tid)
-        if node in ("sit_run", "learn_repo"):
+        if node == "sit_run":
+            # sit_triage refuses to triage without THIS run's own junit (EXE-f749212a evidence
+            # guard) — see test_graph.py's _install for why the path has to come out of the
+            # prompt text (run_skill has no execution_id kwarg to derive it from directly).
+            m = _re.search(r"--junitxml=(\S+)`", kw["task_prompt"])
+            _Path(m.group(1)).write_text("<testsuite/>")
+            return
+        if node == "learn_repo":
             return
         if node == "sit_author":
             path.write_text(_json.dumps({"ticket_id": tid, "test_path": "test_x.py"}))

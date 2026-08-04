@@ -87,6 +87,7 @@ LABEL_TO_NODE = {
     "Unsupported ticket — stopped": "unsupported_route",
     "Dependency resolution": "dep_resolver",
     "Reachability verification": "reachability_gate",
+    "GAN-hardened test scenarios": "qa_scenarios",
     "Coding": "coder",
     "Adversarial code review": "harsh_reviewer",
     "Open draft PR": "open_pr",

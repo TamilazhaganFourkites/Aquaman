@@ -1381,13 +1381,13 @@ let _detailStructKey = null;
 
 function detailStructureKey(t) {
   const events = t.events || [];
-  const lastState = events.length ? events[events.length - 1].state : null;
+  const anyRunning = events.some(e => e.state === "running");
   return JSON.stringify({
     ticket: t.ticket,
     status: t.status,
     gate: t.status === "paused" ? `${t.paused_gate || ""}|${t.paused_message || ""}` : "",
     steps: events.map(e => [e.node, e.state, e.label, e.highlight || ""]),
-    placeholder: t.status === "running" && lastState !== "running",   // the synthetic "Working…" step
+    placeholder: t.status === "running" && !anyRunning,   // the synthetic "Working…" step
     // detailHtml's Dismiss button also shows for a "queued" ticket once its batch is stopped
     // (app.py's dismiss_ticket allows this) — that's a real markup change this key must catch,
     // even though nothing about the TICKET's own status/steps changed when Stop was clicked.
@@ -1584,6 +1584,7 @@ const NODE_LABEL = {
   rca_agent: "Root-cause analysis (RCA)", rca_review_gate: "RCA review — awaiting approval",
   rca_done: "RCA report delivered", unsupported_route: "Unsupported ticket — stopped",
   dep_resolver: "Dependency resolution", reachability_gate: "Reachability verification",
+  qa_scenarios: "GAN-hardened test scenarios",
   coder: "Coding", harsh_reviewer: "Adversarial code review", open_pr: "Open draft PR",
   sit_resolve: "Local SIT — resolve & gate", sit_author: "Local SIT — draft test",
   qa_review_gate: "QA review — awaiting approval", sit_run: "Local SIT — run",
@@ -1606,7 +1607,8 @@ const HAPPY_NEXT = {
   // already-done sibling. PARALLEL_GROUPS below covers the "still waiting on a
   // sibling" case; this is only the fallback once every sibling is done.
   sme_consult: "reachability_gate", dep_resolver: "reachability_gate", prep_image: "reachability_gate",
-  prep_container: "reachability_gate", reachability_gate: "coder", coder: "harsh_reviewer",
+  prep_container: "reachability_gate", reachability_gate: "qa_scenarios", qa_scenarios: "coder",
+  coder: "harsh_reviewer",
   harsh_reviewer: "open_pr",   // most runs approve on the first pass, not "rework"
   open_pr: "sit_resolve", sit_resolve: "sit_author", sit_author: "qa_review_gate",
   qa_review_gate: "sit_run",   // most common decision (with or without TestRail) runs SIT next
@@ -1668,8 +1670,14 @@ function detailHtml(t, isAuto) {
   // placeholder while that's true, so the stepper doesn't look stalled during the gap — and it
   // naturally gets the same flowing-current connector line above it (:has(+ .step.running)) plus
   // the sonar-ping marker, since it IS a real .step.running element, just an unnamed one.
-  const lastState = events.length ? events[events.length - 1].state : null;
-  if (t.status === "running" && lastState !== "running") {
+  // Checks whether ANYTHING in events is still running, not just the last-ARRIVED one: with
+  // PARALLEL_ANALYSIS, sme_consult/dep_resolver/prep_image interleave, so the most recent event
+  // to arrive can be a already-finished sibling (e.g. prep_image) while an EARLIER sibling
+  // (dep_resolver) is still genuinely running — checking only the last element wrongly treated
+  // that as "nothing running" and guessed the fan-in join (Reachability verification) as if it
+  // were already starting, while two of its own inputs hadn't finished yet.
+  const anyRunning = events.some(e => e.state === "running");
+  if (t.status === "running" && !anyRunning) {
     const guess = predictNextLabel(events);
     steps += `
     <div class="step running">
