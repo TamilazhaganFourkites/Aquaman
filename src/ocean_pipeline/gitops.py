@@ -13,7 +13,9 @@ path. They shell out to `gh`; the caller is responsible for `gh auth` (preflight
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 
 from . import config
 
@@ -123,10 +125,28 @@ def open_draft_pr(slug: str, branch: str, title: str, body: str) -> int:
 
 def cross_link_and_ready(slug: str, pr_number: int, test_pr_url: str = "") -> None:
     """Cross-link the test-automation PR into the service PR body (idempotent), then flip the
-    service PR to ready-for-review. Never merges and never deploys — that is the human boundary."""
+    service PR to ready-for-review. Never merges and never deploys — that is the human boundary.
+
+    Reads/writes the body via `gh api` (plain REST) rather than `gh pr view`/`gh pr edit`: those
+    subcommands request the deprecated `projectCards` field as part of their default GraphQL
+    query, which GitHub now rejects outright on repos where "Projects (classic)" has been sunset
+    (`GraphQL: Projects (classic) is being deprecated ... (repository.pullRequest.projectCards)`).
+    The REST endpoint has no such field and isn't affected.
+    """
     if test_pr_url:
-        body = _gh(["pr", "view", str(pr_number), "--repo", slug, "--json", "body", "-q", ".body"])
+        body = _gh(["api", f"repos/{slug}/pulls/{pr_number}", "--jq", ".body"])
         if test_pr_url not in body:
-            link = f"\n\n---\nTest-automation PR: {test_pr_url}\n"
-            _gh(["pr", "edit", str(pr_number), "--repo", slug, "--body", body + link])
+            new_body = body + f"\n\n---\nTest-automation PR: {test_pr_url}\n"
+            # Written via a temp file + `@path`, not inline `-f body=<text>`: gh's field values
+            # treat a leading `@` as "read from this file", so passing arbitrary PR-body text
+            # inline would misfire if the body ever happened to start with `@`. A file also
+            # sidesteps any command-line length limit for an unusually long body.
+            with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+                f.write(new_body)
+                body_path = f.name
+            try:
+                _gh(["api", f"repos/{slug}/pulls/{pr_number}", "-X", "PATCH",
+                     "-f", f"body=@{body_path}"])
+            finally:
+                os.unlink(body_path)
     _gh(["pr", "ready", str(pr_number), "--repo", slug])  # safe no-op if already ready

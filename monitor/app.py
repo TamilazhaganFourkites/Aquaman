@@ -807,14 +807,13 @@ async def retry_ticket(batch_id: str, ticket: str) -> dict:
     run.status = "queued"
     run.final_status = None
     run.final_outcome = None   # clear the stale failure message — a fresh one lands if this fails too
-    # Reset so the duration badge/summary reflect THIS retry attempt, not the original failed
-    # one: leaving the old finished_at set would freeze the displayed duration at the original
-    # run's length forever (since _drive_process's started_at guard only stamps a fresh value
-    # when it's None — it would stay None-guarded-away by the stale timestamp otherwise), and
-    # could even go negative once a new started_at lands after the old finished_at. log_path is
-    # deliberately left alone — the retry's output appends to the same file, preserving the full
-    # history of both attempts in one place, same convention as a station's own re-run logging.
-    run.started_at = None
+    # Only finished_at is reset (so the UI shows this as in-progress rather than frozen at the
+    # old finish time) — started_at is deliberately left as-is (the original run's real start
+    # time) so once this retry completes, the duration badge reflects the full original-to-
+    # completion span rather than just this resume step's own few seconds. _drive_process's
+    # `if started_at is None` guard leaves the preserved value alone. log_path is deliberately
+    # left alone too — the retry's output appends to the same file, preserving the full history
+    # of both attempts in one place, same convention as a station's own re-run logging.
     run.finished_at = None
     idx_now = _resolve_idx(batch, run)
     if idx_now is not None:
@@ -932,11 +931,13 @@ async def retry_history_ticket(row_id: int) -> dict:
     if not row["execution_id"]:
         raise HTTPException(409, "no execution id recorded for this ticket — nothing to resume from")
 
-    # status="queued", started_at left at its None default: _drive_process itself stamps both
-    # the moment it actually acquires a semaphore slot. Stamping started_at here instead would
-    # inflate this ticket's later duration badge/summary by however long it sits queued behind
-    # a full semaphore, not just its real run time.
-    run = TicketRun(ticket=row["ticket"], execution_id=row["execution_id"], status="queued")
+    # status="queued". started_at is inherited from the original row (a real past timestamp, not
+    # "now") so the retried run's duration badge reflects the full original-to-completion span
+    # instead of just this resume step's own few seconds — _drive_process's `if started_at is
+    # None` guard leaves an already-set value alone, so this doesn't reintroduce the "queued time
+    # inflates duration" problem a fresh `time.time()` stamp here would.
+    run = TicketRun(ticket=row["ticket"], execution_id=row["execution_id"], status="queued",
+                     started_at=row["started_at"])
     batch = Batch(id=str(uuid.uuid4())[:8], tickets=[run], log_level="team", created_at=time.time())
     BATCHES[batch.id] = batch
     store.save_batch(batch)
