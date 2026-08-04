@@ -384,14 +384,23 @@ def _container_directive(state: OceanState, repo_dir: str) -> str:
     return (
         f"\n\nPERSISTENT CONTAINER: the orchestrator has already started ONE booted container "
         f"`{name}` from the pre-warmed image (gems installed). For ALL builds/tests do NOT `docker "
-        f"run`, `docker build`, or start your own container — copy the CURRENT code in and exec:\n"
-        f"    docker cp {rd}/. {name}:/app/fourkites/test/\n"
-        f"    docker exec <required -e env for YOUR station: RAILS_ENV/FK_ENVIRONMENT/AWS_*/BUNDLE_GEMFILE "
-        f"per local-docker-run.md §3 — unit specs use FK_ENVIRONMENT=test, SIT uses qat> {name} bash -lc "
-        f"'cd /app/fourkites/test && bundle exec rspec <changed_spec_files>'\n"
-        f"Re-`docker cp` after each edit (the container persists across your RED→GREEN cycles AND the "
-        f"reviewer/SIT stations); batch specs into ONE `rspec` call. Only fall back to your own "
-        f"`docker run` recipe if a `docker exec {name}` probe fails.\n"
+        f"run`, `docker build`, or start your own container — reuse `{name}`.\n"
+        f"KNOWN-GOOD DOCKER RECIPE — use it as-is; do NOT rediscover the app dir or env by trial or a "
+        f"whole-disk search (MM-14132/EXE-aea95d39 issue #3: reachability, coder, AND reviewer each "
+        f"independently re-derived the SAME path + env this run, minutes wasted per station). Run the "
+        f"app-dir resolve + `docker cp` + `docker exec` as ONE chained shell command — `$APP` does NOT "
+        f"survive across separate Bash tool calls, and an empty `$APP` would `docker cp` into the "
+        f"container ROOT, so the `[ -n \"$APP\" ]` guard is required:\n"
+        f"    APP=$(docker exec {name} sh -lc 'if [ -f Gemfile ]; then pwd; else for d in /usr/src/app /app/fourkites/test /app; do [ -f \"$d/Gemfile\" ] && echo \"$d\" && break; done; fi'); \\\n"
+        f"    [ -n \"$APP\" ] && docker cp {rd}/. {name}:\"$APP\"/ \\\n"
+        f"      && docker exec -e RAILS_ENV=test -e FK_ENVIRONMENT=test -e AWS_REGION=us-east-1 "
+        f"-e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test {name} bash -lc \"cd \\\"$APP\\\" && bundle exec rspec <changed_spec_files>\"\n"
+        f"(the resolve prefers the container's WORKDIR when it holds the Gemfile — correct per-image: "
+        f"tracking-service=/usr/src/app, MMCUW=/app/fourkites/test; a missing AWS_REGION is the recurring "
+        f"`Aws::Errors::MissingRegionError`; unit specs use FK_ENVIRONMENT=test, the SIT uses --env qat.)\n"
+        f"Re-run the cp+exec (same `$APP`, same shell) after each edit — the container persists across "
+        f"your RED→GREEN cycles AND the reviewer/SIT stations; batch specs into ONE `rspec` call. Full env "
+        f"in `local-docker-run.md` §3; fall back to your own `docker run` recipe only if a `docker exec {name}` probe fails.\n"
     )
 
 
@@ -1200,7 +1209,16 @@ async def sit_run(state: OceanState) -> dict:
             f"Capture per-test pass/fail by passing pytest `--junitxml={junit_path}` — this ABSOLUTE path "
             f"is THIS run's authoritative junit that Station 3 (sit_triage) reads back. Write it there "
             f"(an extra copy under the checkout's reports/ is fine, but {junit_path} is the one that "
-            f"matters — it must exist and be non-empty when this step ends). Do NOT "
+            f"matters — it must exist and be non-empty when this step ends). "
+            f"ALWAYS pass a PER-TEST timeout — `--timeout=300` via the pre-installed `pytest-timeout` plugin "
+            f"(MM-14132/EXE-aea95d39 issue #6b): a single full-chain test can sit in a `poller.poll(10,...)` "
+            f"for up to 10 min, and without a per-test cap the OUTER Bash/tool timeout kills the WHOLE pytest "
+            f"process (exit 143) and loses EVERY collected item's result, forcing a blind re-run. The per-test "
+            f"cap must fire BEFORE the Bash timeout, so run this pytest command in a SINGLE foreground Bash "
+            f"call with an explicit GENEROUS Bash timeout (e.g. the 20-min max) — then `--timeout=300` fails "
+            f"just the hung item and still writes junit for the rest. Note `pytest-timeout` counts fixture/"
+            f"setup time too, so if a setup-heavy FIRST item (Rails boot + seed + a legit `poll(5,...)`) trips "
+            f"300s, raise it to ~480s — never remove it. Do NOT "
             f"run Station 3 (report/verdict) — the graph's sit_triage node does that next."
             f"{retry_note}"
             f"\n\n{_summary(state)}"
@@ -1232,12 +1250,14 @@ async def sit_testrail(state: OceanState) -> dict:
     tr_path = tr_dir / f"{tid}_testrail_result.json"
     if tr_path.exists():
         tr_path.unlink()
-    scenario_source = state.get("qa_scenarios_path") or (
-        "none passed -- there is no persisted SCENARIO PLAN block on disk, that only exists in the "
-        "interactive terminal review and is never written to the file. Reconstruct rows.json instead "
-        "from the AC MAP comment block right after the module docstring, plus each test methods own "
-        "one-line AC-citing docstring and its TCNOTADDED{N} parametrize marker"
-    )
+    # rows.json (and thus the case_map keys sit_triage substitutes) MUST be sourced from the COMMITTED
+    # TEST FILE's own TCNOTADDED{N} markers, NOT the persisted qa_scenarios list: a qa_review_gate
+    # "changes" loop can REDESIGN the scenarios after qa_scenarios ran (sit_author rewrites them into the
+    # file, never back to qa_scenarios_path), so that list goes STALE — a row set built from it would
+    # misalign with the file's placeholders and tag test methods with the WRONG case ids at substitution.
+    # The file is always 1:1 with itself; the scenarios list is at best supplementary wording.
+    test_path = state.get("qa_test_path") or "(the committed ticket SIT file)"
+    scenarios_hint = state.get("qa_scenarios_path") or ""
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_testrail",
@@ -1246,13 +1266,20 @@ async def sit_testrail(state: OceanState) -> dict:
             f"Run ocean-automation-testing Station 1b (testrail) ONLY for {tid} (`--only testrail`): "
             f"create the TestRail cases for the SIT already authored + approved via ocean-qa-agent "
             f"(Project 22 / Suite 197 — its Step 6, tools/create_testrail_cases.py). Do ONLY TestRail "
-            f"case creation for the EXISTING authored test at "
-            f"{state.get('qa_test_path') or '(the ticket SIT)'} — do "
+            f"case creation for the EXISTING authored test at {test_path} — do "
             f"NOT re-author, execute, or open any PR. rows.json does NOT already exist -- sit_author "
             f"always authors with --skip-testrail (this TestRail decision is made later, at the review "
             f"gate), so ocean-qa-agent's Step 6a never ran. Build it yourself first, per Station 1b's "
-            f"own instructions, from the SAME GAN-hardened scenario list at "
-            f"{scenario_source}. "
+            f"own instructions, sourcing the case set (ONE row per TCNOTADDED{{N}}) AUTHORITATIVELY from "
+            f"the COMMITTED TEST FILE at {test_path} — its TCNOTADDED{{N}} parametrize markers, AC MAP "
+            f"comment block, and per-method AC-citing docstrings — so every row maps 1:1 to a real "
+            f"placeholder in the file. Do NOT drive the placeholder set from the persisted qa_scenarios "
+            f"list: a qa_review_gate 'changes' loop may have REDESIGNED the scenarios after qa_scenarios "
+            f"ran, leaving it STALE — a mismatched row set tags methods with the WRONG case ids when "
+            f"sit_triage substitutes."
+            + (f" Use the GAN-hardened scenarios at {scenarios_hint} ONLY as supplementary detail for "
+               f"richer GIVEN/WHEN/THEN wording, never as the placeholder source." if scenarios_hint else "")
+            + " "
             f"DECOUPLING (FIX A2-1): the LOCAL seq payload templates "
             f"/ test-data are materialized by sit_run (Station 2), NOT here — this node touches ONLY the "
             f"TestRail API, so the local SIT never depends on TestRail case creation to resolve its payloads. "
