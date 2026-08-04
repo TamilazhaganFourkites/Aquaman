@@ -6,9 +6,11 @@ Aquaman is the deterministic, code-driven replacement for the `fk-execute` prose
 "floor captain" checklist, for the Ocean/MM (`isbu`) boards only. The pipeline
 control flow — station sequence, the RCA router, the review loop, the ready-flip
 gate — is a LangGraph state machine. The *work inside each node* is still done by
-the existing station agents in `fk-aideveloper/agents/pipeline/fk-*.md`, invoked
-as Claude Agent SDK subprocesses. This repo owns orchestration; it does not
-re-express any station logic.
+narrow worker prompts that live in fk-aideveloper's `skills/ocean-coding-agent/workers/`
+(the ocean domain SMEs live alongside them in `skills/ocean-coding-agent/agents/`),
+invoked as Claude Agent SDK subprocesses. This repo owns orchestration; it holds no
+worker/domain content itself (`config.OCEAN_WORKERS_DIR` / `OCEAN_AGENTS_DIR`) and
+does not re-express any station logic.
 
 ## Why LangGraph
 
@@ -90,7 +92,7 @@ src/ocean_pipeline/
 ├── state.py       OceanState TypedDict threaded through every node
 ├── schemas.py     per-station verdict models (agents write <station>.verdict.json)
 ├── config.py      paths, model, MAX_REVIEW_ITERATIONS, isbu project set
-├── agents.py      run_station(): drives an fk-*.md agent via Claude Agent SDK
+├── agents.py      run_agent()/run_skill(): drives an ocean-coding-agent worker via Claude Agent SDK
 ├── telemetry.py   aidev_db START/END + station-event hooks
 ├── nodes.py       one node per station (thin wrappers)
 ├── graph.py       StateGraph wiring: router, review loop, ready-flip
@@ -98,6 +100,22 @@ src/ocean_pipeline/
 ```
 
 ## Setup
+
+**Quick checklist (0 → running a real ticket).** Each step links to the detailed subsection
+below if something doesn't match your machine — this is just the linear path with nothing skipped:
+
+1. Complete fk-aideveloper's own onboarding (GitHub org access, `gh auth login`,
+   `./scripts/dev-setup.sh --preflight`, `claude-setup.sh`) — **§0** below.
+2. Clone Aquaman, create a **Python ≥ 3.11** venv, `pip install -e .`, export
+   `FK_AIDEVELOPER_DIR` if it isn't at the default path, make sure `claude` is authenticated
+   (`ANTHROPIC_API_KEY` or an interactive login) — **§1** below.
+3. If the ticket will reach Station 6 (almost every coding ticket will): a Docker backend
+   (Docker Desktop or Rancher Desktop) running + sized, Rosetta on if you're on Apple
+   Silicon, `pipenv` on PATH, `cloudqwest/test-automation` and `environment-configuration`
+   cloned locally — **§2** below.
+4. Run `ocean-pipeline --print-graph` to confirm the install and the graph compile with zero
+   external calls — **Verify your setup**, at the end of this section.
+5. Run a real ticket: `ocean-pipeline <TICKET-ID>` — see **Run** below.
 
 ### 0. Do this first: fk-aideveloper
 
@@ -163,13 +181,21 @@ running a coding ticket, not just when a run fails partway through:
 
 | Requirement | Notes | How to get it |
 |---|---|---|
-| Docker Desktop installed and running, sized `>= OCEAN_PIPELINE_MIN_DOCKER_MEMORY_GB` (default `4`) GB / `>= OCEAN_PIPELINE_MIN_DOCKER_CPUS` (default `2`) CPUs | checked at the top of `sit_run` (`nodes.py::_docker_preflight_reason`), but only once the run gets that far | [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) |
+| A Docker backend installed and running (Docker Desktop **or** Rancher Desktop — either is fine), sized `>= OCEAN_PIPELINE_MIN_DOCKER_MEMORY_GB` (default `4`) GB / `>= OCEAN_PIPELINE_MIN_DOCKER_CPUS` (default `2`) CPUs at minimum, but budget **8–12 GB / ≥4 CPU** if the ticket needs a full multi-service E2E, not just a single mocked repo (`local_service_execution.md` "Docker memory ceiling") | checked at the top of `sit_run` (`nodes.py::_docker_preflight_reason`); a backend that doesn't expose `MemTotal`/`NCPU` via `docker info` (Rancher Desktop/colima/Podman sometimes don't) is treated as unmeasurable-but-running, not down | [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) or [rancherdesktop.io](https://rancherdesktop.io/) |
+| **On Apple Silicon, enable Rosetta** in whichever backend's VM settings | the Ruby-worker repos (`ocean-worker`, `multimodal-worker`, `MMCUW`, `tracking-service`, `global_worker`) build from a private **amd64-only** azurecr base image — without Rosetta, QEMU emulation segfaults on native-gem builds. Only turn it off once you've confirmed an arm64 base variant exists for the repo you're building | Docker Desktop/Rancher Desktop → Settings → General/Virtual Machine |
 | `pipenv` on PATH | the SIT skill runs pytest through it | `brew install pipenv` or `pip install pipenv` |
 | LocalStack reachable at `OCEAN_PIPELINE_SQS_ENDPOINT_URL` (default `http://localhost:4566`) | needed for the SQS-driven leg of a multi-repo callback E2E; not checked anywhere today | see fk-aideveloper's `skills/local-infra-setup` |
-| `cloudqwest/test-automation` cloned locally | the SIT skill `cd`s into it to run pytest | `gh repo clone cloudqwest/test-automation` — see fk-aideveloper's README for the expected path |
-| `environment-configuration` cloned locally | Ruby worker Docker builds copy settings out of it | `gh repo clone cloudqwest/environment-configuration` |
-| `test_rail_email` / `test_rail_password` env vars | only if the QA review gate is answered `--qa approve-testrail` | ask in `#fk-aideveloper` Slack |
+| `cloudqwest/test-automation` cloned locally | the SIT skill `cd`s into it to run pytest | `gh repo clone cloudqwest/test-automation ~/Documents/projects/test-automation` — fk-aideveloper's own README flags this path as inconsistently documented (`~/Documents/projects/test-automation` vs `~/Documents/workspace/test-automation`); use the `~/Documents/projects/` path to match `FK_AIDEVELOPER_DIR`'s own default location |
+| `environment-configuration` cloned locally | Ruby worker Docker builds copy settings out of it | `gh repo clone cloudqwest/environment-configuration ~/Documents/projects/environment-configuration` — same `~/Documents/projects/` convention; fk-aideveloper's README notes no canonical location is documented yet |
+| TestRail creds — `TESTRAIL_EMAIL` / `TESTRAIL_API_KEY` exported in your `~/.zshrc` (a developer's local pair; CI instead injects `test_rail_email`/`test_rail_password`, both names accepted) | only if the QA review gate is answered `--qa approve-testrail` — `sit_testrail`'s `create_testrail_cases.py` aborts pre-flight and creates zero cases if absent | usually already set from a prior TestRail setup — verify with `printenv TESTRAIL_EMAIL` (name only, never echo the value); if genuinely unset, ask in `#fk-aideveloper` Slack |
 | `~/.aws/credentials` `[qat]` profile | only for chains that push SQS test messages | ask in `#fk-aideveloper` Slack (see fk-aideveloper's `references/sqs_local_testing.md` for the verification snippet once you have it) |
+
+**Set TestRail creds in `~/.zshrc`, not a one-off `export` in your terminal.** `sit_testrail`
+shells out to `create_testrail_cases.py` via `zsh -ic '<full command>'` specifically so
+`~/.zshrc`'s exports load in their native shell and reach the child process — a plain bash
+`source ~/.zshrc` beforehand is unreliable (wrong interpreter, interactive guards, and the env
+doesn't survive across separate tool calls). An `export` typed directly into an already-running
+shell works for that shell, but won't be there the next time the pipeline spawns a fresh one.
 
 **Optional, all fail open (absence = silent no-op, never blocks a run):**
 
@@ -178,7 +204,24 @@ running a coding ticket, not just when a run fails partway through:
 | `JIRA_API_TOKEN` | `""` | `jira.py` | ticket never transitions to In Review, no PR-link comment |
 | `JIRA_BASE_URL` | `https://fourkites.atlassian.net` | `jira.py` | n/a |
 | `RCA_TOKEN` | `""` | `telemetry.py` | no rows land in the team's aidev-db dashboards |
+| `GH_TOKEN` / `GITHUB_TOKEN` | — | `nodes.py::_gh_token` | rarely needed — `gh auth token` (from `gh auth login`, §0) is tried first and covers most setups; this is only a fallback for cold Ruby-image builds if that fails |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | — | `tracing.py` | no Langfuse trace (see Observability below) |
+
+**Where these actually need to live.** `tracing.py::_load_fk_secrets` reads `~/.fourkites-secrets.env`
+and `setdefault`s *every* `key=value` line in it into `os.environ` (never overriding anything
+already exported) — it isn't filtered to `LANGFUSE_*`. But it only runs once, at the top of
+`_execute()`, well **after** Python has already imported `jira.py`/`telemetry.py`/`config.py` and
+frozen `JIRA_API_TOKEN`/`JIRA_BASE_URL`/`RCA_TOKEN`/`FK_AIDEVELOPER_DIR` into module-level constants
+at import time — so putting those specific vars in the secrets file is too late to help, even
+though the loader itself doesn't reject them. `~/.zshrc` (or your shell's equivalent profile) has
+no such timing gap, since it's sourced before the Python process even starts — that's why it's the
+reliable place for `FK_AIDEVELOPER_DIR`, `JIRA_API_TOKEN`, `JIRA_BASE_URL`, `RCA_TOKEN`,
+`GH_TOKEN`/`GITHUB_TOKEN`, and TestRail's `TESTRAIL_*` pair above, and why `~/.fourkites-secrets.env`
+is documented as a Langfuse-only convention rather than a general one. A one-off `export` typed
+into an already-running terminal works only for that terminal — it won't be there the next
+terminal, IDE-integrated shell, or subprocess the pipeline spawns. `ANTHROPIC_API_KEY` and `gh auth`
+are the two that usually need neither: an interactive `claude` login and `gh auth login` (§0) each
+persist their own credential outside the shell environment, so most users never export either one.
 
 **Tuning knobs (safe defaults, override only if you know why):** `OCEAN_PIPELINE_ARTIFACTS`,
 `OCEAN_PIPELINE_CHECKPOINT_DB`, `OCEAN_PIPELINE_MODEL`, `OCEAN_PIPELINE_LOG_LEVEL` (see
@@ -190,18 +233,61 @@ running a coding ticket, not just when a run fails partway through:
 `OCEAN_PIPELINE_SESSION_ENV`. Every one of these has a hardcoded default in `config.py` —
 that file is the source of truth if this list ever drifts.
 
+### Verify your setup
+
+Before pointing the pipeline at a real ticket, confirm each piece independently — cheaper
+than debugging a mid-run failure at Station 4 or 6:
+
+```bash
+ocean-pipeline --print-graph      # compiles the graph, prints the mermaid diagram — zero
+                                   # external calls (no Claude, no GitHub, no Docker); if this
+                                   # fails, it's an install/import problem, not a runtime one
+gh auth status                    # required for open_pr/flip_ready — see §0 above
+claude --version                  # confirms the CLI is installed; run `claude` once
+                                   # interactively if it isn't already logged in
+docker info                       # only if the ticket will reach Station 6 — confirms your
+                                   # backend (Docker Desktop or Rancher Desktop) is actually
+                                   # running (not just installed)
+pipenv --version                  # only if the ticket will reach Station 6 — the SIT skill
+                                   # shells out to this
+```
+
+All five green is a good sign, but the only one enforced at run time is `cli.py::_preflight()`
+(dirs exist, `claude`/`gh` on PATH, `gh auth status`) — the rest fail later, at whichever
+station first needs them (Docker/`pipenv` at Station 6, `gh auth` at `open_pr`).
+
 ## Run
 
 ```bash
 ocean-pipeline MM-14615
 ocean-pipeline MM-14615 --context "Bug only affects SCAC=ABCD loads"
-ocean-pipeline --resume EXE-1a2b3c4d      # continue a crashed run from its last checkpoint
+ocean-pipeline MM-14615 --rca-only        # research + RCA report only — never auto-codes a fix
 ocean-pipeline --print-graph              # mermaid diagram straight from the compiled graph
 ```
 
 Node completions stream to the console as the run proceeds. The pipeline **never
 auto-merges or auto-deploys**; on SIT PASS it flips the service PR to ready-for-review
 automatically. The engineer still owns final merge, sign-off, and deploy.
+
+### Resuming a paused or crashed run
+
+A run pauses at one of three `interrupt()` gates — `rca_review_gate`, `qa_review_gate`,
+`human_gate` — or stops on a crash. Either way, `--resume <EXE-id>` continues it from its last
+checkpoint; which flag it needs depends on which gate it's actually paused at:
+
+```bash
+ocean-pipeline --resume EXE-1a2b3c4d                                # crash resume — no flag needed
+ocean-pipeline --resume EXE-1a2b3c4d --approve                      # rca_review_gate / human_gate: proceed
+ocean-pipeline --resume EXE-1a2b3c4d --reject                       # rca_review_gate / human_gate: stop here
+ocean-pipeline --resume EXE-1a2b3c4d --qa approve-testrail           # qa_review_gate: run SIT + write TestRail cases
+ocean-pipeline --resume EXE-1a2b3c4d --qa approve-no-testrail        # qa_review_gate: run SIT, skip TestRail
+ocean-pipeline --resume EXE-1a2b3c4d --qa changes --note "add a case for X"   # qa_review_gate: redraft
+```
+
+Don't guess which pair applies — the console tells you. A paused run prints
+`[PAUSED] <gate-specific message with the exact flags it expects>`
+(`cli.py::_pause_message`); e.g. `--approve` on a paused `qa_review_gate` silently falls through
+to the wrong branch instead of erroring, so the printed hint is the source of truth, not this table.
 
 ## Observability
 
@@ -222,51 +308,67 @@ superset of the one before it.**
 ```
 ════════════════════════════════════════════════════════════════
   FK Ocean Pipeline   ·   MM-14609
-  run EXE-1a2b3c4d
+  run EXE-1a2b3c4d   ·   started 22:53:42
 ════════════════════════════════════════════════════════════════
 
-▶  Research & routing
+▶  22:53:43  Research & routing
 
-▶  Coding
+▶  22:54:17  Coding
 
-▶  Adversarial code review
+▶  22:57:47  Adversarial code review
 
-▶  Local SIT (automation testing)
+▶  22:58:29  Local SIT (automation testing)
 ```
+
+The one exception to "nothing else" at `management`: the closing `RESULT:`/`[DONE]`/`Full
+report:` block below always prints, at every `--log-level` (`ui.summary`, and the two lines
+`cli.py` prints after it, have no level gate — only the per-station `✓`/`✗` line and its
+milestones/details do). `management` genuinely suppresses everything *during* the run, not
+the final result.
 
 `team` (default) — same banner, but each `▶` header is followed by its one outcome line:
 ```
-▶  Research & routing
-  ✓  Research & routing                        34s   → routed to coding
+▶  22:53:43  Research & routing
+  ✓  Research & routing                       34s   → routed to coding
 
-▶  Coding
-  ✓  Coding                                  3m30s   branch pushed
+▶  22:54:17  Coding
+  ✓  Coding                                 3m 30s   branch pushed
 
-▶  Adversarial code review
-  ✓  Adversarial code review                   42s   APPROVE
+▶  22:57:47  Adversarial code review
+  ✓  Adversarial code review                  42s   APPROVE
 
-▶  Local SIT (automation testing)
-  ✓  Local SIT (automation testing)          6m20s   SIT passed
+▶  22:58:29  Local SIT (automation testing)
+  ✓  Local SIT (automation testing)         6m 20s   SIT passed
 ────────────────────────────────────────────────────────────────
-  RESULT: COMPLETED   ·   took 11m06s   ·   finished 23:04:48
+  RESULT: COMPLETED   ·   took 11m 06s   ·   finished 23:04:48
   sit_passed; service PR #123 ready-for-review
   usage: 330k tokens · 74 tool calls   across 5 station runs
 ════════════════════════════════════════════════════════════════
+
+[DONE] MM-14609 status=completed pr=#123
+  Full report: /tmp/ocean-pipeline/EXE-1a2b3c4d/run-report.md
+  Cleaned 3 run Docker resource(s): container:ocean-worker-EXE-1a2b3c4d, image:ocean-worker-mm14609-coder …
 ```
+
+`[DONE] <ticket> status=<...> pr=#<n>` is a deliberate machine-readable line, not log noise —
+headless runners (e.g. `oas-autodev`'s reconcile step) grep the tail of the process output for
+`pr=#<n>` to know a run finished green without re-parsing the whole transcript. The `Cleaned …`
+line only appears if this run actually created Docker resources (`cli.py::_cleanup_run_docker`)
+and is skipped entirely on a pause (the container stack stays up for the eventual resume).
 
 `developer` additionally streams milestones live and prints detail bullets after each outcome:
 ```
-▶  Research & routing
+▶  22:53:43  Research & routing
      · querying Atlassian
      · dispatching sub-agent: ocean SME
     [researcher] ⚡ sub-agent progress: ocean SME (last tool: mcp__fk-code-graph__execute_cypher_query)
-  ✓  Research & routing                        34s   → routed to coding
+  ✓  Research & routing                       34s   → routed to coding
         └ repo: ocean-worker (ruby, docker)
 
-▶  Local SIT (automation testing)
+▶  22:58:29  Local SIT (automation testing)
      · bringing up local Docker infra
      · running the SIT (pytest)
-  ✓  Local SIT (automation testing)          6m20s   SIT passed
+  ✓  Local SIT (automation testing)         6m 20s   SIT passed
         └ 2/2 tests passed
         └   passed: test_eta_exception_cleared_on_pod
         └ ran ocean-worker local · mocked: tracking-service
