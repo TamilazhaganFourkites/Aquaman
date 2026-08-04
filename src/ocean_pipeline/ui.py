@@ -36,6 +36,7 @@ _LABELS = {
     "unsupported_route":  "Unsupported ticket — stopped",
     "dep_resolver":       "Dependency resolution",
     "reachability_gate":  "Reachability verification",
+    "qa_scenarios":       "GAN-hardened test scenarios",
     "coder":              "Coding",
     "harsh_reviewer":     "Adversarial code review",
     "open_pr":            "Open draft PR",
@@ -187,8 +188,11 @@ def _highlight(node: str, upd: dict) -> str:
     if node == "qa_review_gate" and upd.get("qa_decision"):
         return upd["qa_decision"].replace("_", " ")
     if node == "sit_testrail":
-        n = len(upd.get("qa_testrail_case_map") or {})
-        return f"TestRail: {n} case(s) created" if n else "TestRail cases written"
+        cm = upd.get("qa_testrail_case_map")
+        if isinstance(cm, dict) and cm:
+            ids = ", ".join(f"TC-{v}" for v in cm.values())
+            return f"TestRail: {len(cm)} case(s) — {ids}"
+        return "TestRail cases written"
     if node == "sit_triage" and upd.get("automation_result"):
         fc = upd.get("failure_class")
         return f"SIT {upd['automation_result']}" + (f" ({fc})" if fc else "")
