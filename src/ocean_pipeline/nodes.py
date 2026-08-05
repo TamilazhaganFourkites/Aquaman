@@ -755,6 +755,13 @@ async def qa_scenarios(state: OceanState) -> dict:
         scenarios_path.unlink()  # fresh attempt -- don't let a stale prior-attempt file fool the
                                   # verdict_path retry-guard below into thinking THIS attempt already
                                   # succeeded (same pattern as sit_resolve's automation_verdict_path).
+    # MM-14793 (GAN A1): clear any stale per-round GAN progress sidecar left by a PRIOR run for this
+    # ticket, so Step 5d resumes only against THIS run's rounds. This entry unlink runs ONCE, before
+    # run_skill -- run_skill's internal drive-retries re-enter Step 5d and legitimately resume from the
+    # sidecar the aborted drive wrote during THIS node entry; only a cross-run leftover is cleared here.
+    gan_progress_path = scenarios_path.with_name(scenarios_path.stem + "-gan-progress.json")
+    if gan_progress_path.exists():
+        gan_progress_path.unlink()
     await agents.run_skill(
         skill_name="ocean-qa-agent",
         node="qa_scenarios",
