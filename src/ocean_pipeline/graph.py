@@ -59,9 +59,19 @@ def after_review(state: OceanState) -> str:
     if state.get("review_verdict") == "APPROVE":
         return "approve"
     if state.get("review_iteration", 0) >= config.MAX_REVIEW_ITERATIONS:
-        # Review budget spent with findings outstanding: stop looping and open the PR;
-        # Station 6 (SIT) is the next gate, and a code_fault there still triggers rework.
-        return "approve"
+        # Review budget spent. If the coder actually produced a diff, stop looping and open the
+        # PR anyway -- Station 6 (SIT) is the next gate, and a code_fault there still triggers
+        # rework. But if there's NO diff (coder refused/failed to write any code -- e.g. a
+        # genuinely blocked ticket, branch left blank), "approving" is nonsensical: it would route
+        # straight to open_pr, which has nothing to open a PR for and crashes with a GitOpError.
+        # Stop cleanly instead (EXE-342a6243/MM-14475: two blocked coder attempts, two explicit
+        # reviewer escalations to a human, but budget-exhaustion silently routed to open_pr anyway
+        # and crashed). Checking just `branch`, not `files_changed`, mirrors open_pr's own guard
+        # (`if not slugs or not branch: raise GitOpError`) -- the same signal the rest of the
+        # graph already treats as authoritative for "is there something to act on."
+        if state.get("branch"):
+            return "approve"
+        return "stop"
     return "rework"
 
 
@@ -202,7 +212,7 @@ def build_graph():
     g.add_edge("qa_scenarios", "coder")
     g.add_edge("coder", "harsh_reviewer")
     g.add_conditional_edges("harsh_reviewer", after_review,
-                            {"rework": "coder", "approve": "open_pr"})
+                            {"rework": "coder", "approve": "open_pr", "stop": "stop_run"})
 
     g.add_edge("open_pr", "sit_resolve")
 

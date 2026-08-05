@@ -35,12 +35,13 @@ class Script:
     """Per-test control over what the mocked agents return, plus call counts."""
 
     def __init__(self, *, route="coding", rca_fix=False, review_seq=("APPROVE",),
-                 sit_seq=("passed",), sme_bucket=""):
+                 sit_seq=("passed",), sme_bucket="", coder_blocked=False):
         self.route = route
         self.rca_fix = rca_fix
         self.sme_bucket = sme_bucket
         self.review_seq = list(review_seq)
         self.sit_seq = list(sit_seq)
+        self.coder_blocked = coder_blocked   # coder refuses to write code -- empty branch (EXE-342a6243)
         self._review_i = 0
         self._sit_i = 0
         self._cur = "passed"   # this attempt's SIT outcome, decided at sit_resolve, used at sit_triage
@@ -83,6 +84,8 @@ def _install(script: Script, tmp_path, monkeypatch):
         if node.startswith("reachability_gate"):
             return schemas.ReachabilityVerdict(report_path=nowhere)
         if node.startswith("coder"):
+            if script.coder_blocked:
+                return schemas.CoderVerdict(branch="", files_changed=0)
             return schemas.CoderVerdict(branch=f"{kw['ticket_id']}/b",
                                         repo="cloudqwest/ocean-worker", repo_dir="/tmp/ws/ocean-worker",
                                         pr_title="t", pr_body="b")
@@ -361,7 +364,16 @@ def test_graph_warm_sit_infra_wiring_without_container(monkeypatch):
 def test_after_review():
     assert graph.after_review({"review_verdict": "APPROVE", "review_iteration": 1}) == "approve"
     assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 1}) == "rework"
-    assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 2}) == "approve"
+    # Budget exhausted WITH a real diff to approve -> proceed to open_pr, SIT is the next gate.
+    # (Mirrors open_pr's own guard, which checks just `branch`, not `files_changed`.)
+    assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 2,
+                                "branch": "MM-1/fix"}) == "approve"
+    # Budget exhausted with NO diff (coder refused/failed to write code, branch left blank --
+    # EXE-342a6243/MM-14475) -> stop cleanly instead of routing to open_pr, which would crash
+    # with a GitOpError (open_pr raises on an empty branch).
+    assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 2,
+                                "branch": ""}) == "stop"
+    assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 2}) == "stop"
 
 
 def test_after_sit_resolve():
@@ -641,6 +653,23 @@ def test_review_iteration_cap(tmp_path, monkeypatch):
     # capped at MAX_REVIEW_ITERATIONS then proceeds to open_pr and on to SIT
     assert s.calls["harsh_reviewer"] == config.MAX_REVIEW_ITERATIONS
     assert final["final_status"] == "completed"
+
+
+def test_review_budget_exhausted_with_no_diff_stops_cleanly(tmp_path, monkeypatch):
+    """EXE-342a6243/MM-14475: coder refuses to write code every time (blocked ticket), reviewer
+    correctly escalates ("CHANGES_REQUIRED", nothing to approve) every time. Once the review
+    budget is exhausted, the graph must stop -- NOT route to open_pr, which would crash with a
+    GitOpError on the empty branch (the actual bug this test guards against)."""
+    s = Script(review_seq=["CHANGES_REQUIRED"], coder_blocked=True)  # never approves, never codes
+    _install(s, tmp_path, monkeypatch)
+    final = _run()
+    assert final["final_status"] == "failed"
+    assert s.calls["coder"] == config.MAX_REVIEW_ITERATIONS
+    assert s.calls["harsh_reviewer"] == config.MAX_REVIEW_ITERATIONS
+    assert s.calls["open_pr"] == 0          # never reached -- the actual bug would have called this
+    assert s.calls["sit_resolve"] == 0      # never reached either
+    assert "review_budget_exhausted_no_diff" in final["final_outcome"]
+    assert "no PR was opened" in final["final_outcome"]
 
 
 def test_code_fault_loop_then_pass(tmp_path, monkeypatch):
@@ -1644,34 +1673,50 @@ def test_open_draft_pr_raises_if_number_unreadable_after_create(monkeypatch):
 
 
 def test_cross_link_and_ready_adds_link_when_missing(monkeypatch):
+    """Body read/write goes through `gh api` (REST), not `gh pr view`/`gh pr edit` -- those
+    subcommands request the deprecated `projectCards` GraphQL field, which GitHub rejects outright
+    on repos where "Projects (classic)" has been sunset (the actual EXE-342a6243/MM-14060 bug).
+    The write is `-f body=@<tempfile>`, not inline text, so the link is verified by reading that
+    file's content INSIDE the fake, before cross_link_and_ready's own `finally` deletes it."""
     calls = []
+    written = {}
     link = "https://github.com/x/test-automation/pull/1"
 
     def fake_run(cmd, **kw):
         calls.append(cmd)
-        return _FakeGhProc(stdout="original body") if "view" in cmd else _FakeGhProc(stdout="")
+        if "PATCH" in cmd:
+            path = cmd[cmd.index("-f") + 1].split("=@", 1)[1]
+            written["body"] = Path(path).read_text()
+            return _FakeGhProc(stdout="")
+        if "api" in cmd:
+            return _FakeGhProc(stdout="original body")
+        return _FakeGhProc(stdout="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     gitops.cross_link_and_ready("org/repo", 5, link)
-    edit_calls = [c for c in calls if "edit" in c]
-    assert len(edit_calls) == 1
-    assert any(link in arg for arg in edit_calls[0])
+    patch_calls = [c for c in calls if "PATCH" in c]
+    assert len(patch_calls) == 1
+    assert link in written["body"]
     assert any("ready" in c for c in calls)
 
 
 def test_cross_link_and_ready_skips_edit_when_link_already_present(monkeypatch):
     """Idempotent: re-running against a service PR that already carries the link must not
-    append a duplicate."""
+    append a duplicate (no PATCH call)."""
     calls = []
     link = "https://github.com/x/test-automation/pull/1"
 
     def fake_run(cmd, **kw):
         calls.append(cmd)
-        return _FakeGhProc(stdout=f"original body\n{link}") if "view" in cmd else _FakeGhProc(stdout="")
+        if "PATCH" in cmd:
+            return _FakeGhProc(stdout="")
+        if "api" in cmd:
+            return _FakeGhProc(stdout=f"original body\n{link}")
+        return _FakeGhProc(stdout="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     gitops.cross_link_and_ready("org/repo", 5, link)
-    assert not any("edit" in c for c in calls)
+    assert not any("PATCH" in c for c in calls)
     assert any("ready" in c for c in calls)
 
 
@@ -1679,8 +1724,7 @@ def test_cross_link_and_ready_no_test_pr_url_just_flips_ready(monkeypatch):
     calls = []
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: (calls.append(cmd), _FakeGhProc(stdout=""))[1])
     gitops.cross_link_and_ready("org/repo", 5)
-    assert not any("view" in c for c in calls)
-    assert not any("edit" in c for c in calls)
+    assert not any("api" in c for c in calls)
     assert any("ready" in c for c in calls)
 
 

@@ -1595,8 +1595,17 @@ async def stop_run(state: OceanState) -> dict:
                 "final_outcome": f"human rejected the ready-flip; service PR "
                                  f"#{state.get('pr_number')} left draft"}
     fc = state.get("failure_class", "")
+    # after_review's own "stop" case (budget exhausted, no diff to approve -- see graph.py) lands
+    # here too, arriving BEFORE open_pr ever ran: no PR exists yet, so this must be distinguished
+    # from every other reason below, all of which happen after a PR was already opened.
+    no_diff_after_review = (
+        state.get("review_verdict") not in (None, "", "APPROVE")
+        and not state.get("branch")
+    )
     if state.get("needs_onboarding"):
         reason = "repo_onboarding_exhausted"   # still unsupported after MAX_ONBOARD_ATTEMPTS
+    elif no_diff_after_review:
+        reason = "review_budget_exhausted_no_diff"
     elif fc == "code_fault":
         reason = "coding_attempts_exhausted"
     elif fc == "environment_failure" and state.get("preflight_failed"):
@@ -1608,8 +1617,10 @@ async def stop_run(state: OceanState) -> dict:
     else:
         reason = "sit_failed"
     telemetry.station_event(state["execution_id"], 6, "stop", reason=reason)
+    pr_note = (f"service PR #{state['pr_number']} left draft" if state.get("pr_number")
+               else "no PR was opened -- no diff for the reviewer to approve")
     return {"final_status": "failed", "ready_flipped": False,
-            "final_outcome": f"sit_failed:{reason}; service PR left draft"}
+            "final_outcome": f"sit_failed:{reason}; {pr_note}"}
 
 
 # ------------------------------------------------------------------ RCA agent
