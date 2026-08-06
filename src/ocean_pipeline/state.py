@@ -2,8 +2,13 @@
 
 This replaces the ad-hoc context passing in fk-execute's prose checklist.
 Each station reads what it needs and returns a partial dict; LangGraph merges
-it (last-write-wins for scalars/lists — the pipeline is a single sequential
-path, so no reducers are needed).
+it (last-write-wins for scalars/lists). NOTE (F8, architecture review): the graph
+is NOT a single sequential path — it has parallel supersteps (the prep_image/
+analysis fan-out, and the `sit_run ∥ sit_testrail` fan-out). Last-write-wins is
+safe only because those concurrent branches write DISJOINT keys; if you add a
+branch where two concurrent nodes write the SAME key, you MUST give that key an
+explicit reducer (Annotated[..., reducer]) — otherwise LangGraph raises
+InvalidUpdateError on the concurrent write (it does not silently pick a winner).
 """
 from __future__ import annotations
 

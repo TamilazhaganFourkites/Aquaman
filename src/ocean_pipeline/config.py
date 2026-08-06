@@ -147,7 +147,7 @@ KEEP_CACHED_IMAGE = os.environ.get("OCEAN_PIPELINE_KEEP_CACHED_IMAGE", "0").lowe
 CHECKPOINT_DB = os.environ.get("OCEAN_PIPELINE_CHECKPOINT_DB", str(ARTIFACTS_ROOT / "checkpoints.sqlite"))
 
 # Default model for station agents. Always the latest capable Opus unless overridden.
-STATION_MODEL = os.environ.get("OCEAN_PIPELINE_MODEL", "claude-opus-4-8")
+STATION_MODEL = os.environ.get("OCEAN_PIPELINE_MODEL", "claude-opus-5")  # F6 (architecture review): was claude-opus-4-8 (one gen back); opus-5 is current — accuracy win across all stations, env-overridable
 
 # Console log detail. Three audiences, one run:
 #   management  — top station headers + one-line outcome per station only (no milestones,

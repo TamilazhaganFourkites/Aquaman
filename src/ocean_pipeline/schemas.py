@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 
 # ---- generic per-node verdicts (written via run_agent's contract) -------
@@ -112,6 +112,21 @@ class ReviewVerdict(BaseModel):
     @property
     def minor_count(self) -> int:
         return self._sev_count("MINOR")
+
+    @model_validator(mode="after")
+    def _gate_verdict_on_severity(self) -> "ReviewVerdict":
+        # F2 (Aquaman architecture review): the "severity gate computed then discarded" gap — the review
+        # worker can emit verdict=APPROVE while findings[] still holds CRITICAL/MAJOR items, and nothing
+        # cross-checks the two. critical_count/major_count are the single source of truth (derived from
+        # findings above), and the reviewer's own contract is "APPROVE only at zero CRITICAL and zero
+        # MAJOR" — so enforce that HERE in code instead of trusting the model: an APPROVE that disagrees
+        # with the counts is downgraded to CHANGES_REQUIRED. This makes "APPROVE with open CRITICAL/MAJOR"
+        # structurally impossible; every consumer (state review_verdict, telemetry, graph.after_review)
+        # then sees a verdict consistent with the findings, and after_review routes to rework/stop with no
+        # change of its own. (Fail-safe direction only — it can never UPgrade CHANGES_REQUIRED to APPROVE.)
+        if self.verdict == "APPROVE" and (self.critical_count > 0 or self.major_count > 0):
+            self.verdict = "CHANGES_REQUIRED"
+        return self
 
 
 # ---- Station 6: mirrors ocean-automation-testing SKILL.md Station 3 verdict --
