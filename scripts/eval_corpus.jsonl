@@ -1,0 +1,15 @@
+# F5 routing/domain-bucket eval corpus (SEED). Ground truth for `scripts/eval_routing.py`.
+# `route` is required + always scored. `domain_bucket` is scored ONLY for coding tickets with a
+# NON-EMPTY, VERIFIED bucket — leave it "" when unverified (route-only scoring) rather than guess:
+# a wrong ground-truth label poisons the eval worse than an unscored one.
+# EXPAND THIS to ~30 closed tickets with human-verified labels before trusting the accuracy number
+# (the architecture review's target sample). Each row = one closed MM ticket.
+{"ticket_id": "MM-14312", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
+{"ticket_id": "MM-14381", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
+{"ticket_id": "MM-14132", "route": "coding", "domain_bucket": "callback_notification"}
+{"ticket_id": "MM-13446", "route": "coding", "domain_bucket": "callback_notification"}
+{"ticket_id": "MM-14475", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14457", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14060", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14065", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-13527", "route": "rca", "domain_bucket": ""}
