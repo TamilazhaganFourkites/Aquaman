@@ -118,7 +118,9 @@ class ReviewVerdict(BaseModel):
 class AutomationTest(BaseModel):
     name: str = ""            # was required; defaulted so a test element missing `name` can't crash the run
     testrail_id: int = 0
-    result: str = ""
+    result: str = ""          # "passed" | "failed" | "needs_env" (S4/I12: a Step 9b CANNOT-VERIFY method,
+                               # never executed against the mock — not a pass, not a fail). Free str, not a
+                               # Literal, so one unexpected value can't fail-parse the whole verdict.
     detail: str = ""
 
 

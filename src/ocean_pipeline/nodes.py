@@ -1290,7 +1290,16 @@ def _recover_sit_junit(exec_id: str, junit_path) -> None:
     KNOWN exec-scoped copies the skill produces — its durable `memory/tickets` preserve and the SIT
     checkout's `reports/`. The filenames are EXEC-SCOPED, so this can NEVER pick up a prior run's junit
     (the whole point of the run-scoped name) — it only closes the "agent used the relative path" gap so a
-    genuinely-passing run isn't turned into a loud (but still wrong) could_not_verify (EXE-f749212a)."""
+    genuinely-passing run isn't turned into a loud (but still wrong) could_not_verify (EXE-f749212a).
+
+    EXCLUDES `*junit_batch_*` (S4/I12, run-monitoring-findings-06af6088.md): those are the PER-FILE
+    partial junits ocean-automation-testing's Step 6 batching recipe writes before merging them all
+    into the real run junit via `merge_junit.py`. Without this exclusion, this glob's `*{exec_id}*.xml`
+    pattern also matches a single batch file — if the agent's own merge step were ever skipped, this
+    recovery would silently copy in JUST ONE batch (sorted first, e.g. `junit_batch_1_...`) as if it
+    were the complete run, truncating evidence exactly the way the batching fix exists to prevent, via
+    a different code path. A batch file left behind with no merged output present is a real merge-step
+    failure -- surface that as missing evidence, don't paper over it with a partial substitute."""
     if junit_path.exists() and junit_path.stat().st_size > 0:
         return
     pat = f"*{exec_id}*.xml"
@@ -1308,6 +1317,8 @@ def _recover_sit_junit(exec_id: str, junit_path) -> None:
     except OSError:
         pass
     for c in candidates:
+        if "junit_batch_" in c.name:
+            continue
         try:
             if c.is_file() and c.stat().st_size > 0:
                 shutil.copyfile(str(c), str(junit_path))
@@ -1389,19 +1400,26 @@ async def sit_run(state: OceanState) -> dict:
             f"synthesized from the approved scenarios — do NOT depend on TestRail case creation (this headless "
             f"run may be approve-no-testrail, where no TestRail cases exist). The templates MUST exist before "
             f"collection/setup or every test errors at setup (could_not_run). "
-            f"Capture per-test pass/fail by passing pytest `--junitxml={junit_path}` — this ABSOLUTE path "
-            f"is THIS run's authoritative junit that Station 3 (sit_triage) reads back. Write it there "
-            f"(an extra copy under the checkout's reports/ is fine, but {junit_path} is the one that "
-            f"matters — it must exist and be non-empty when this step ends). "
-            f"ALWAYS pass a PER-TEST timeout — `--timeout=300` via the pre-installed `pytest-timeout` plugin "
-            f"(MM-14132/EXE-aea95d39 issue #6b): a single full-chain test can sit in a `poller.poll(10,...)` "
-            f"for up to 10 min, and without a per-test cap the OUTER Bash/tool timeout kills the WHOLE pytest "
-            f"process (exit 143) and loses EVERY collected item's result, forcing a blind re-run. The per-test "
-            f"cap must fire BEFORE the Bash timeout, so run this pytest command in a SINGLE foreground Bash "
-            f"call with an explicit GENEROUS Bash timeout (e.g. the 20-min max) — then `--timeout=300` fails "
-            f"just the hung item and still writes junit for the rest. Note `pytest-timeout` counts fixture/"
-            f"setup time too, so if a setup-heavy FIRST item (Rails boot + seed + a legit `poll(5,...)`) trips "
-            f"300s, raise it to ~480s — never remove it. Do NOT "
+            f"This run's authoritative junit is the ABSOLUTE path {junit_path} — Station 3 (sit_triage) "
+            f"reads back exactly THAT file; it must exist and be non-empty when this step ends. "
+            f"DO NOT run every changed test file in ONE pytest invocation inside this single turn "
+            f"(S4/I12, run-monitoring-findings-06af6088.md): a single full-chain test can sit in a "
+            f"`poller.poll(10,...)` for up to 10 min or a `custom_sleep_time(900)` wait, and chaining "
+            f"several files into one Bash call risks the OUTER turn/tool timeout killing the WHOLE "
+            f"pytest process (exit 143) BEFORE `--junitxml` is ever written (it's only written on a "
+            f"normal exit) — losing every file's results, including ones that already passed, and "
+            f"forcing a blind full re-run (confirmed live: MM-14381 lost its entire junit this way). "
+            f"Instead follow ocean-automation-testing/SKILL.md's Step 6 'suite-level time budget' "
+            f"recipe verbatim: loop ONE bounded `timeout 600 pytest --timeout=300 -m \"not needs_env\" "
+            f"<single file>` per changed test file, each into its OWN `reports/junit_batch_N_<exec_id>.xml` "
+            f"(never abort the loop on one batch's failure/timeout — every later file still deserves its "
+            f"turn), then merge all produced batch files into {junit_path} with "
+            f"`tools/merge_junit.py --out {junit_path} --glob 'reports/junit_batch_*_<exec_id>.xml'` as the "
+            f"LAST step. If this turn is killed mid-loop, whatever batch files already exist on disk are "
+            f"still there for a follow-up merge — do not discard them. `--timeout=300` per test still "
+            f"applies inside each batch (MM-14132/EXE-aea95d39 issue #6b); `pytest-timeout` counts fixture/"
+            f"setup time too, so if a setup-heavy FIRST item (Rails boot + seed + a legit `poll(5,...)`) "
+            f"trips 300s, raise it to ~480s — never remove it. Do NOT "
             f"run Station 3 (report/verdict) — the graph's sit_triage node does that next."
             f"{retry_note}"
             f"\n\n{_summary(state)}"
