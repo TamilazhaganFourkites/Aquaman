@@ -52,6 +52,22 @@ class OceanState(TypedDict, total=False):
     dependency_blocking: bool        # dep_resolver's own blocking claim; surfaced in the runner log
     reachability_report: dict        # binding artifact fk-coder must obey
     reachability_blocking: bool      # surfaced in the runner log
+    # MM-14816 (G20 placeholder resolution). Written by dep_resolver only. resolved_placeholders here is
+    # the resolver's RAW resolved set ([{placeholder,resolved_value,source,evidence}]); reachability_gate
+    # VERIFIES it and writes the verified set into reachability_report (NOT back into this state key —
+    # the coder reads the verified values from the report via _reachability_for_coder). unresolved:
+    # [{placeholder,sources_searched,why_unresolved,blocks_ac}]; blocking_open_questions: genuine
+    # product/UX decisions that stop the run BEFORE coding (graph → stop_run blocked branch).
+    resolved_placeholders: list
+    unresolved_placeholders: list
+    blocking_open_questions: list
+    # MM-14816 (G20): the human's Monitor-UI decision at blocked_review_gate on those open questions.
+    # blocked_decision: "answer" | "post" | "reject". blocked_answers: free-text answers the human gave
+    # (answer path) — authoritative context for the coder. open_question_caveats: the questions carried
+    # forward UNANSWERED (reject path) — the coder proceeds best-effort and flags them in the PR body.
+    blocked_decision: str
+    blocked_answers: str
+    open_question_caveats: list
 
     # --- Station 4: code ---
     branch: str

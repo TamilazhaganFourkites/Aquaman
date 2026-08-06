@@ -93,6 +93,25 @@ def after_review(state: OceanState) -> str:
     return "rework"
 
 
+def after_reachability(state: OceanState) -> str:
+    # MM-14816 (G20): if the resolver surfaced an AC-blocking product/UX open question, route (BEFORE the
+    # ~20-min GAN and the coder) to the blocked_review_gate — a HUMAN decides in the Monitor UI whether to
+    # answer/post-to-Jira/reject (the outward Jira post is never automatic). reachability short-circuited
+    # its own work at entry for this case. Match stop_run's stripped filter so an all-whitespace list
+    # can't route to the gate. Otherwise proceed to the GAN as today.
+    if any(str(q).strip() for q in (state.get("blocking_open_questions") or [])):
+        return "blocked"
+    return "proceed"
+
+
+def after_blocked_review(state: OceanState) -> str:
+    # MM-14816 (G20): the human's Monitor-UI decision on the open questions.
+    #   post   → stop_run (blocked branch posts to Jira + cli emits the oas-autodev marker → AWAITING_INPUT)
+    #   answer → loop back to reachability_gate (block cleared, answers carried) → runs fully → coding
+    #   reject → loop back to reachability_gate (block cleared, questions carried as caveats) → coding
+    return "post" if state.get("blocked_decision") == "post" else "continue"
+
+
 def after_sit_resolve(state: OceanState) -> str:
     # Onboarding is detected at resolve, before any authoring/execution: branch to learn_repo
     # (capped), stop cleanly if the budget is spent, else run the SIT.
@@ -161,6 +180,7 @@ def build_graph():
     g.add_node("unsupported_route", nodes.unsupported_route)
     g.add_node("dep_resolver", nodes.dep_resolver)
     g.add_node("reachability_gate", nodes.reachability_gate)
+    g.add_node("blocked_review_gate", nodes.blocked_review_gate)  # MM-14816 (G20): human Monitor-UI gate before any Jira post
     g.add_node("qa_scenarios", nodes.qa_scenarios)   # MM-14738: GAN-hardened test scenarios, pre-code
     if config.PERSISTENT_CONTAINER:
         g.add_node("prep_container", nodes.prep_container)        # #1: start ONE shared test container
@@ -223,7 +243,14 @@ def build_graph():
         g.add_edge("prep_container", "reachability_gate")   # prep_container (shared boot) -> reachability_gate
     # reachability_gate -> qa_scenarios -> coder, regardless of PERSISTENT_CONTAINER (the only thing
     # that toggle changes is whether prep_container sits in front of reachability_gate, above).
-    g.add_edge("reachability_gate", "qa_scenarios")
+    # MM-14816 (G20): conditional — a blocking product/UX open question routes to the blocked_review_gate
+    # (human decides in the Monitor UI, BEFORE the GAN/coder); otherwise proceed to qa_scenarios as today.
+    g.add_conditional_edges("reachability_gate", after_reachability,
+                            {"proceed": "qa_scenarios", "blocked": "blocked_review_gate"})
+    # The human's 3-way decision: post → stop_run (posts to Jira + teardown below, no leak); answer/reject
+    # → loop back to reachability_gate (block now cleared → runs fully → coding), answers/caveats carried.
+    g.add_conditional_edges("blocked_review_gate", after_blocked_review,
+                            {"post": "stop_run", "continue": "reachability_gate"})
     # MM-14738: GAN-hardened test scenarios are designed pre-code, right after reachability -- the
     # fixed target `coder` must satisfy. A code_fault rework re-enters at `coder` (below) and never
     # loops back through `qa_scenarios`, by construction (this is qa_scenarios' only outbound edge).

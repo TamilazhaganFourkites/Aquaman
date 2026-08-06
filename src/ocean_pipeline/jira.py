@@ -69,3 +69,26 @@ def comment(ticket_id: str, body: str) -> None:
     except Exception as e:  # noqa: BLE001
         if DEBUG:
             print(f"[jira] comment failed: {type(e).__name__}: {e}")
+
+
+def comment_once(ticket_id: str, body: str, marker: str) -> None:
+    """Idempotent comment (MM-14816 / G20 P3): post `body` only if no existing comment on the ticket
+    already contains `marker`. oas-autodev's resume_awaiting_input re-runs the pipeline on every new
+    Jira comment, so a re-blocked run must NOT re-post the same open questions each cycle. Best-effort:
+    if the existence check errors, fall back to posting (a duplicate comment is better than a silently
+    dropped escalation)."""
+    if not _enabled() or not ticket_id or not body:
+        return
+    try:
+        # orderBy=-created → NEWEST first, so our recent block comment is in the first page even on a
+        # long-lived ticket (Jira v2 defaults to oldest-first, which would push it past maxResults and
+        # silently re-post on every resume — the P3 no-respam guarantee).
+        existing = _req("GET", f"issue/{ticket_id}/comment?maxResults=100&orderBy=-created").get("comments", [])
+        if any(marker in (c.get("body") or "") for c in existing):
+            if DEBUG:
+                print(f"[jira] comment_once skipped for {ticket_id} — marker already present")
+            return
+    except Exception as e:  # noqa: BLE001 — can't check → fall through and post (don't drop the ask)
+        if DEBUG:
+            print(f"[jira] comment_once existence-check failed ({type(e).__name__}); posting anyway")
+    comment(ticket_id, body)

@@ -94,6 +94,7 @@ LABEL_TO_NODE = {
     "Unsupported ticket — stopped": "unsupported_route",
     "Dependency resolution": "dep_resolver",
     "Reachability verification": "reachability_gate",
+    "Open questions — awaiting approval": "blocked_review_gate",
     "GAN-hardened test scenarios": "qa_scenarios",
     "Coding": "coder",
     "Adversarial code review": "harsh_reviewer",
@@ -114,7 +115,7 @@ LABEL_TO_NODE = {
     "Flip PR to ready-for-review": "flip_ready",
     "Stopped — needs an engineer": "stop_run",
 }
-GATE_NODES = {"qa_review_gate", "rca_review_gate", "human_gate"}
+GATE_NODES = {"qa_review_gate", "rca_review_gate", "human_gate", "blocked_review_gate"}
 
 _HEADER_RE = re.compile(r"^▶\s+\d{2}:\d{2}:\d{2}\s+(.+)$")
 _BANNER_EXE_RE = re.compile(r"run (EXE-[0-9a-f]+)")
@@ -671,6 +672,7 @@ class CreateBatchBody(BaseModel):
 
 class ResumeBody(BaseModel):
     decision: str          # "approve" | "reject" | "approve_testrail" | "approve_no_testrail" | "changes"
+                           # | "answer" | "post" (blocked_review_gate: answer/post/reject)
     note: str = ""
     # Which paused ticket this decision is for. Now that a batch can run several tickets
     # concurrently, MORE THAN ONE can be paused at a gate in the same batch at once — "the"
@@ -795,6 +797,12 @@ async def resume_batch(batch_id: str, body: ResumeBody) -> dict:
         qa_map = {"approve_testrail": "approve-testrail",
                   "approve_no_testrail": "approve-no-testrail", "changes": "changes"}
         args += ["--qa", qa_map.get(body.decision, body.decision)]
+        if body.note:
+            args += ["--note", body.note]
+    elif run.paused_gate == "blocked_review_gate":
+        # MM-14816 (G20): 3-way blocked-open-questions gate. decision ∈ {answer, post, reject};
+        # `answer` carries the human's answers in note. (The outward Jira post happens only on `post`.)
+        args += ["--blocked", body.decision]
         if body.note:
             args += ["--note", body.note]
     else:

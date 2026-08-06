@@ -45,6 +45,18 @@ class DependencyVerdict(BaseModel):
     report_path: str
     blocking: bool = False
     notes: str = ""
+    # MM-14816 (G20 placeholder resolution): a `[ENGINEER TO FILL]` / fix-critical blank the resolver
+    # RESOLVED from code/logs/comments (each {placeholder, resolved_value, source, evidence}). Carried
+    # on the VERDICT (not just the report file) so the dep_resolver NODE can thread it into state →
+    # reachability worker (which verifies it) → coder. A report-file-only record reaches nobody (the
+    # reachability/coder workers are banned from cross-station file reads) — that was the MM-14457 miss.
+    resolved_placeholders: list = Field(default_factory=list)
+    # Blanks the resolver could NOT ground from any source (each {placeholder, sources_searched,
+    # why_unresolved, blocks_ac}). Non-blocking ones are surfaced; blocking ones go below.
+    unresolved_placeholders: list = Field(default_factory=list)
+    # Genuine product/UX/business decisions (not discoverable facts) that BLOCK an AC — the graph stops
+    # BEFORE coding and raises these on the Jira ticket (see nodes.stop_run blocked branch + cli marker).
+    blocking_open_questions: list[str] = Field(default_factory=list)
 
 
 class RcaVerdict(BaseModel):

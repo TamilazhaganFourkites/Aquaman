@@ -374,6 +374,11 @@ def _reachability_for_coder(report: dict) -> str:
         ],
         "overrides_for_coder": report.get("overrides_for_coder") or [],
         "advisory_findings": report.get("advisory_findings") or [],
+        # MM-14816 (G20): the reachability-VERIFIED [ENGINEER TO FILL]/blank values the coder must USE
+        # (each {placeholder, resolved_value, source, evidence}) — binding, so untruncated here. Unverified
+        # ones were downgraded by reachability and are NOT in this list (coder is C10/C11-bound not to
+        # invent a value that isn't here).
+        "resolved_placeholders": report.get("resolved_placeholders") or [],
     }
     return json.dumps(slim, indent=2, default=str)
 
@@ -821,14 +826,31 @@ async def dep_resolver(state: OceanState) -> dict:
         ),
         verdict_model=schemas.DependencyVerdict,
     )
-    telemetry.station_event(state["execution_id"], 1, "end", blocking=v.blocking)
+    telemetry.station_event(state["execution_id"], 1, "end", blocking=v.blocking,
+                            blocking_questions=len(v.blocking_open_questions))
+    # MM-14816 (G20): thread the resolver's placeholder work into STATE so it survives to the
+    # reachability worker (verifies it) and the coder — a report-file-only record reaches nobody
+    # (both downstream workers are banned from cross-station file reads). See schemas.DependencyVerdict.
     return {"dependency_report": {"report_path": v.report_path, "notes": v.notes},
-            "dependency_blocking": v.blocking}
+            "dependency_blocking": v.blocking,
+            "resolved_placeholders": v.resolved_placeholders,
+            "unresolved_placeholders": v.unresolved_placeholders,
+            "blocking_open_questions": v.blocking_open_questions}
 
 
 # ------------------------------------------------------------------ Station 1.5
 async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
+    # MM-14816 (G20): if dep_resolver surfaced a genuine product/UX decision that BLOCKS an AC, stop
+    # BEFORE any coding — short-circuit at ENTRY (skip this gate's own verification, the GAN, and the
+    # coder). The graph's after_reachability conditional routes to stop_run's blocked branch (which
+    # posts the questions to Jira + emits the oas-autodev block marker). Raising it here, not after a
+    # partial diff exists, is the whole point ("resolve/ask before coding").
+    _blocking_qs = [q for q in (state.get("blocking_open_questions") or []) if str(q).strip()]
+    if _blocking_qs:
+        telemetry.station_event(state["execution_id"], 1.5, "blocked_short_circuit",
+                                blocking_questions=len(_blocking_qs))
+        return {"reachability_report": {}, "reachability_blocking": True}
     # NOTE: an earlier "skip the gate when dep_resolver made zero reachability claims"
     # optimization (has_reachability_claims) was REMOVED (MM-14816) -- its skip signal covered only
     # 4 of the gate's 5 verification categories (it omitted "build-new-mechanism" self-solves and
@@ -852,6 +874,15 @@ async def reachability_gate(state: OceanState) -> dict:
             task_prompt=(
                 f"Execution-verify every ALREADY_MET / self-solve / blocked / cross-repo claim for "
                 f"{state['ticket_id']}. Emit the binding reachability-report.json.\n\n{_summary(state)}"
+                # MM-14816 (G20): the resolver filled these [ENGINEER TO FILL]/blank values from
+                # code/logs/comments. VERIFY each against its cited source (a resolved cross-repo/runtime
+                # value is a cross-repo claim — same job) and write the VERIFIED set into the report so the
+                # coder receives it; DOWNGRADE any that don't verify to unresolved_placeholders (never pass
+                # an unverified value as fact). See reachability.md's placeholder-verification section.
+                + (f"\n\nRESOLVED PLACEHOLDERS to verify against their cited source, then emit the verified "
+                   f"set into the report (downgrade unverifiable ones):\n"
+                   f"{_brief(state.get('resolved_placeholders'), limit=8000)}"
+                   if state.get("resolved_placeholders") else "")
             ),
             verdict_model=schemas.ReachabilityVerdict,
         )
@@ -860,6 +891,49 @@ async def reachability_gate(state: OceanState) -> dict:
             _release_build_slot(state["execution_id"])
     telemetry.station_event(state["execution_id"], 1.5, "end", blocking=v.blocking)
     return {"reachability_report": _load_json(v.report_path), "reachability_blocking": v.blocking}
+
+
+# ------------------------------------------------------------ 1.55 — blocked-open-questions human gate
+async def blocked_review_gate(state: OceanState) -> dict:
+    """MM-14816 (G20): the resolver surfaced AC-blocking product/UX open questions. Posting them to the
+    customer Jira ticket is an OUTWARD-FACING action, so it is gated behind a HUMAN decision in the
+    Monitor UI (always ask — no auto override), NOT fired automatically. 3-way, resumed via
+    `--blocked <answer|post|reject> [--note ...]`:
+      • answer → the human already knows the answers (in --note): fold them in, clear the block, and
+        CONTINUE (loop back to reachability, then coding). No Jira post.
+      • post   → the human doesn't know: approve posting the questions to Jira for product/UX (stop_run
+        posts + emits the oas-autodev marker → parks AWAITING_INPUT → resumes when answered).
+      • reject → skip posting but CONTINUE anyway (human-authorized proceed-despite): the questions ride
+        forward as caveats to the coder + PR body (coder stays C10/C11-bound; nothing invented silently).
+    Reached only when reachability short-circuited on a non-empty, stripped blocking set."""
+    exec_id = state["execution_id"]
+    questions = [q for q in (state.get("blocking_open_questions") or []) if str(q).strip()]
+    if not questions:                      # defensive — routed here only when non-empty
+        return {"blocked_decision": "reject"}
+    from langgraph.types import interrupt
+    raw = interrupt({
+        "action": "blocked_open_questions",
+        "ticket_id": state["ticket_id"],
+        "questions": questions,
+        "prompt": ("This ticket has open product/UX questions that block implementation. Review them, "
+                   "then resume with ONE of:\n"
+                   "  --blocked answer --note '<your answers>'   (you know them → pipeline continues)\n"
+                   "  --blocked post                             (post to Jira for product/UX)\n"
+                   "  --blocked reject                           (skip posting; continue, questions flagged)"),
+    })
+    decision = (raw.get("decision") if isinstance(raw, dict) else str(raw)) or "reject"
+    note = raw.get("note", "") if isinstance(raw, dict) else ""
+    telemetry.station_event(exec_id, 1.55, "decision", blocked_decision=decision)
+    if decision == "post":
+        # keep blocking_open_questions set → stop_run's blocked branch posts + returns final_status=blocked
+        return {"blocked_decision": "post"}
+    if decision == "answer":
+        # human supplied answers → clear the block, carry the answers to the coder, loop back to reachability
+        return {"blocked_decision": "answer", "blocked_answers": note,
+                "open_question_caveats": [], "blocking_open_questions": []}
+    # reject → continue with the questions as visible caveats (no post), clear the block so the graph proceeds
+    return {"blocked_decision": "reject", "blocked_answers": "",
+            "open_question_caveats": questions, "blocking_open_questions": []}
 
 
 # ------------------------------------------------------------------ 1.6 — GAN-hardened test scenarios (MM-14738)
@@ -1023,8 +1097,23 @@ async def coder(state: OceanState) -> dict:
                 f"already exists (a rework pass re-enters here), reuse it — `git fetch` + checkout the "
                 f"ticket branch — do NOT re-clone. Report its absolute path as repo_dir.\n\n"
                 f"Binding reachability report (build what it says is NOT_YET_BUILT; do not re-litigate "
-                f"its verdicts):\n{_brief(state.get('reachability_report'), limit=12000)}\n\n"
-                f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}\n\n"
+                # MM-14816 (G20): use the UNTRUNCATED binding slice (verdicts + overrides + advisories +
+                # the reachability-VERIFIED resolved_placeholders the coder must USE) — the old
+                # `_brief(..., 12000)` truncated binding content on a real run (R2), which would drop the
+                # resolved values. Full audit/provenance stays on disk if the coder wants more.
+                f"its verdicts; USE any resolved_placeholders values verbatim, do not re-invent them):\n"
+                f"{_reachability_for_coder(state.get('reachability_report') or {})}\n\n"
+                # MM-14816 (G20): a human answered the ticket's open questions at the Monitor-UI gate —
+                # authoritative, use them as given.
+                + (f"HUMAN-PROVIDED ANSWERS to the ticket's open questions (authoritative — build to "
+                   f"these):\n{state['blocked_answers']}\n\n" if state.get("blocked_answers") else "")
+                # reject path: proceed, but these are UNANSWERED — flag them, don't invent around them.
+                + (f"UNANSWERED OPEN QUESTIONS (a human chose to proceed without answers): implement "
+                   f"best-effort, do NOT invent a consumer-facing value to resolve one (C10/C11), and "
+                   f"CALL THESE OUT in the PR body so reviewers see the gaps:\n"
+                   f"{_brief(state.get('open_question_caveats'), limit=4000)}\n\n"
+                   if state.get("open_question_caveats") else "")
+                + f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}\n\n"
                 f"Research summary:\n{_brief(state.get('research_packet'))}\n\n"
                 f"{_summary(state)}"
                 f"{_container_directive(state, str(workspace))}"
@@ -1862,6 +1951,29 @@ async def flip_ready(state: OceanState) -> dict:
 
 # ------------------------------------------------------------------ stop (rejected / failed / could_not_verify / budget exhausted)
 async def stop_run(state: OceanState) -> dict:
+    # MM-14816 (G20): AC-blocking product/UX decision the resolver couldn't ground — raised BEFORE any
+    # coding (reachability short-circuits here). Post the questions to Jira ONCE (idempotent across
+    # oas-autodev resumes — P3) and return final_status="blocked" so cli emits the oas-autodev block
+    # marker (→ AWAITING_INPUT, surfaced for product/UX, auto-resumes when answered). This branch is
+    # first: it's a pre-coding stop, distinct from every review/SIT/approval reason below.
+    questions = [q for q in (state.get("blocking_open_questions") or []) if str(q).strip()]
+    # Only the blocked_review_gate POST decision reaches here with the block still set (answer/reject
+    # clear it + continue). The blocked_decision=="post" guard makes that explicit.
+    if questions and state.get("blocked_decision") == "post":
+        tid = state["ticket_id"]
+        qlist = "\n".join(f"  {i}. {q}" for i, q in enumerate(questions, 1))
+        jira.comment_once(
+            tid,
+            body=(f"🤖 Aquaman [BLOCKED — open questions]: this ticket has open questions that need a "
+                  f"product/UX decision before implementation can start. Please answer in a comment and "
+                  f"the pipeline will resume automatically:\n{qlist}"),
+            marker="Aquaman [BLOCKED — open questions]",   # stable per-ticket marker → no resume re-spam
+        )
+        telemetry.station_event(state["execution_id"], 1.5, "stop", reason="blocked_open_questions",
+                                blocking_questions=len(questions))
+        return {"final_status": "blocked", "ready_flipped": False,
+                "final_outcome": "blocked_open_questions: posted to Jira for product/UX; "
+                                 "awaiting answers before coding"}
     if str(state.get("rca_approval_decision", "")).lower().startswith("reject"):
         # Human rejected the RCA at its review gate — before any coding started.
         telemetry.station_event(state["execution_id"], 0.15, "stop", reason="rca_rejected_by_engineer")

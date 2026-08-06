@@ -36,6 +36,7 @@ _LABELS = {
     "unsupported_route":  "Unsupported ticket — stopped",
     "dep_resolver":       "Dependency resolution",
     "reachability_gate":  "Reachability verification",
+    "blocked_review_gate": "Open questions — awaiting approval",
     "qa_scenarios":       "GAN-hardened test scenarios",
     "coder":              "Coding",
     "harsh_reviewer":     "Adversarial code review",

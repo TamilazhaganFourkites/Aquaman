@@ -1550,6 +1550,8 @@ function renderDetail(t, isAuto) {
     if (approveBtn) approveBtn.onclick = () => resume(t.ticket, "approve", isAuto);
     if (rejectBtn) rejectBtn.onclick = () => resume(t.ticket, "reject", isAuto);
     qaBtns.forEach(b => b.onclick = () => resume(t.ticket, b.dataset.decision, isAuto));
+    const blockedBtns = document.querySelectorAll(`[data-blocked-for="${t.ticket}"]`);  // MM-14816 (G20) 3-way
+    blockedBtns.forEach(b => b.onclick = () => resume(t.ticket, b.dataset.decision, isAuto));
   }
   const rawlog = panel.querySelector(".rawlog");
   if (rawlog) {
@@ -1765,6 +1767,17 @@ function detailHtml(t, isAuto) {
           <button data-qa-for="${t.ticket}" data-decision="changes">Request changes</button>
         </div>
         <textarea id="note-${t.ticket}" placeholder="Feedback for a redraft (optional)"></textarea>
+      </div>`;
+    } else if (t.paused_gate === "blocked_review_gate") {
+      // MM-14816 (G20): 3-way — the outward Jira post is human-gated here, never automatic.
+      gate = `<div class="gate">
+        <div class="msg">${esc(t.paused_message)}</div>
+        <div class="actions">
+          <button data-blocked-for="${t.ticket}" data-decision="answer">Answer &amp; continue</button>
+          <button data-blocked-for="${t.ticket}" data-decision="post">Post to Jira</button>
+          <button data-blocked-for="${t.ticket}" data-decision="reject" class="ghost">Skip &amp; continue</button>
+        </div>
+        <textarea id="note-${t.ticket}" placeholder="Your answers to the open questions (used by &quot;Answer &amp; continue&quot;)"></textarea>
       </div>`;
     } else {
       gate = `<div class="gate">

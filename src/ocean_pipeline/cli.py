@@ -156,6 +156,12 @@ def _pause_message(execution_id: str, paused_on: tuple[str, ...]) -> str:
         return (f"awaiting human approval before flipping the service PR ready.\n"
                 f"  approve: ocean-pipeline --resume {execution_id} --approve\n"
                 f"  reject:  ocean-pipeline --resume {execution_id} --reject")
+    if "blocked_review_gate" in paused_on:   # MM-14816 (G20): 3-way, before any Jira post
+        return (f"awaiting a decision on the ticket's open product/UX questions (nothing posted to Jira "
+                f"yet).\n"
+                f"  you know the answers: ocean-pipeline --resume {execution_id} --blocked answer --note '<answers>'\n"
+                f"  post to Jira:         ocean-pipeline --resume {execution_id} --blocked post\n"
+                f"  skip + continue:      ocean-pipeline --resume {execution_id} --blocked reject")
     # Any future interrupt() gate that lands here without an entry above — surface the raw
     # node name rather than silently reusing the wrong gate's flags.
     return (f"paused at {', '.join(paused_on)!r} — no known resume flags for this gate yet; "
@@ -294,8 +300,20 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             # number on a clean finish means a green run is tracked as ready-for-merge
             # instead of being mis-classified as blocked (exit 0 + no PR string).
             pr = final.get("pr_number")
-            print(f"[DONE] {ticket_id} status={final.get('final_status') or 'completed'}"
-                  + (f" pr=#{pr}" if pr else ""))
+            # MM-14816 (G20): a `blocked` finish (AC-blocking product/UX open questions, raised before
+            # coding) is a CLEAN completion (stop_run -> teardown -> END), so it lands HERE, not the
+            # except handler. Emit a line oas-autodev already recognizes: `_is_blocked` matches
+            # "final_status: blocked" AND `_block_reason` classifies it via the LITERAL "open questions"
+            # / "answer in jira" vocab (NOT the underscore token) -> parks AWAITING_INPUT, surfaces the
+            # questions (already posted to Jira by stop_run), and auto-resumes when a human answers.
+            if (final.get("final_status") or "") == "blocked":
+                qs = final.get("blocking_open_questions") or []
+                qtail = ("; ".join(str(q) for q in qs))[:400] if qs else ""
+                print(f"[BLOCKED] {ticket_id} final_status: blocked — open questions unresolved, "
+                      f"answer in Jira{': ' + qtail if qtail else ''}")
+            else:
+                print(f"[DONE] {ticket_id} status={final.get('final_status') or 'completed'}"
+                      + (f" pr=#{pr}" if pr else ""))
     except Exception as e:  # noqa: BLE001 — never leave a `running` row orphaned (AP-223)
         telemetry.execution_end(execution_id, ticket_id, "failed", "unknown",
                                 final_outcome=f"{type(e).__name__}: {e}")
@@ -411,7 +429,13 @@ def main() -> None:
                         "or ready-flip human_gate (leave the PR draft)")
     p.add_argument("--qa", choices=["approve-testrail", "approve-no-testrail", "changes"],
                    help="with --resume: answer a paused QA review gate")
-    p.add_argument("--note", default="", help="with --resume --qa changes: feedback for the redraft")
+    p.add_argument("--blocked", choices=["answer", "post", "reject"],
+                   help="with --resume: answer a paused blocked-open-questions gate (MM-14816/G20) — "
+                        "`answer` (+ --note '<answers>') continues with your answers; `post` posts the "
+                        "questions to Jira for product/UX; `reject` continues with them flagged as caveats")
+    p.add_argument("--note", default="",
+                   help="with --resume --qa changes: feedback for the redraft; "
+                        "or with --resume --blocked answer: your answers to the open questions")
     p.add_argument("--print-graph", action="store_true", help="print the mermaid diagram and exit")
     p.add_argument("--rca-only", action="store_true",
                    help="run research + ocean-rca report and STOP (no auto-coding, even if a fix is needed)")
@@ -436,6 +460,8 @@ def main() -> None:
     elif args.resume:
         if args.qa:   # QA review gate: {decision, note}
             resume_value = {"decision": args.qa.replace("-", "_"), "note": args.note}
+        elif args.blocked:   # MM-14816 (G20) blocked-open-questions gate: {decision, note}
+            resume_value = {"decision": args.blocked, "note": args.note}
         elif args.approve:
             resume_value = "approve"
         elif args.reject:
