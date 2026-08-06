@@ -1081,6 +1081,7 @@ async def harsh_reviewer(state: OceanState) -> dict:
                 f"{_container_directive(state, wt)}"
             ),
             verdict_model=schemas.ReviewVerdict,
+            model=config.JUDGE_MODEL,   # F7: judge on a different model than the coder (self-preference bias)
         )
     finally:
         if own_build_slot:
@@ -1325,6 +1326,37 @@ def _recover_sit_junit(exec_id: str, junit_path) -> None:
                 return
         except OSError:
             continue
+
+
+def _junit_pass_fail(junit_path) -> tuple:
+    """F1 (Aquaman architecture review): the SIT pass/fail is MACHINE-READABLE (junit XML) — parse it
+    DETERMINISTICALLY here instead of trusting the LLM triage to read it as prose. Returns
+    (result, detail) where result is 'passed' | 'failed' | None. 'passed' iff at least one test
+    actually EXECUTED (tests minus skipped > 0) and there are zero failures and zero errors. None means
+    the file couldn't be parsed/aggregated — the caller then keeps the LLM verdict as a fallback (the
+    EVIDENCE GUARD upstream already proved a non-empty junit exists, so None here means malformed XML,
+    not a missing run). Aggregates across both the <testsuites> wrapper and bare <testsuite> shapes."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(str(junit_path)).getroot()
+    except Exception as e:  # noqa: BLE001 — malformed XML: fall back to the LLM verdict, never crash triage
+        return None, f"junit unparseable: {type(e).__name__}: {e}"[:160]
+    suites = [root] if root.tag == "testsuite" else root.findall(".//testsuite")
+    if not suites:
+        return None, "no <testsuite> element found"
+    tests = failures = errors = skipped = 0
+    for s in suites:
+        def _i(attr):
+            try:
+                return int(s.get(attr, 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        tests += _i("tests"); failures += _i("failures"); errors += _i("errors"); skipped += _i("skipped")
+    executed = tests - skipped
+    detail = f"tests={tests} failures={failures} errors={errors} skipped={skipped}"
+    if executed <= 0:
+        return "failed", f"nothing executed ({detail})"   # 0 tests, or all skipped, is never a PASS
+    return ("passed" if (failures == 0 and errors == 0) else "failed"), detail
 
 
 # ------------------------------------------------------------------ Station 6c — execute the approved SIT
@@ -1611,6 +1643,7 @@ async def sit_triage(state: OceanState) -> dict:
             f"service PR, merge, or deploy.\n\n{_summary(state)}"
         ),
         verdict_path=verdict_path,  # EXE-2755f777: unlinked fresh above
+        model=config.JUDGE_MODEL,   # F7: triage/classification on a different model than the coder
     )
     if not verdict_path.exists():
         telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
@@ -1632,12 +1665,42 @@ async def sit_triage(state: OceanState) -> dict:
         return {"automation_result": "failed", "failure_class": "could_not_verify",
                 "needs_onboarding": False, "sit_report": {}, "sit_findings": [],
                 "final_outcome": f"sit verdict failed schema validation: {type(e).__name__}: {e}"[:300]}
-    telemetry.station_event(exec_id, 6.4, "end", automation_result=v.automation_result,
-                            failure_class=v.failure_class, execution_mode=v.execution_mode,
-                            needs_onboarding=v.needs_onboarding)
+    # F1 (architecture review): DETERMINISTIC pass/fail from THIS run's junit is authoritative — the LLM
+    # verdict is kept only for the CLASSIFICATION (failure_class, findings). If the two disagree, the junit
+    # wins; that gap is exactly the verifier-self-report / reward-hacking risk F1 targets.
+    #   det=passed  -> passed, no failure_class (the tests objectively passed; any LLM "failure" is a false negative)
+    #   det=failed  -> failed, KEEP the LLM's failure_class (its job: code_fault vs test_fault vs env); if the
+    #                  LLM thought it PASSED and gave no class, we can't classify a failure it misread -> could_not_verify
+    #   det=None    -> junit malformed (not missing — evidence guard ran); fall back to the LLM verdict as before
+    # F4 (architecture review): sit_run executes under bypassPermissions in a writable worktree, so the
+    # grading junit is a reward-hacking surface. Deterministic grading (F1) already reads it from the
+    # run's artifacts dir (outside the worktree) AFTER sit_run's turn ends — but also FINGERPRINT the
+    # exact bytes we score into telemetry so the graded evidence is auditable / tamper-evident.
+    try:
+        import hashlib
+        _junit_sha = hashlib.sha256(junit_path.read_bytes()).hexdigest()[:16] if junit_path.exists() else ""
+    except OSError:
+        _junit_sha = ""
+    det_result, det_detail = _junit_pass_fail(junit_path)
+    automation_result = v.automation_result
+    failure_class = v.failure_class
+    if det_result is not None:
+        automation_result = det_result
+        if det_result == "passed":
+            failure_class = ""
+        else:  # det says failed
+            failure_class = v.failure_class or "could_not_verify"
+        if det_result != v.automation_result:
+            ui.milestone(f"F1: junit is authoritative -> {det_result} ({det_detail}); LLM triage said "
+                         f"'{v.automation_result}' -> trusting the deterministic junit parse")
+            telemetry.station_event(exec_id, 6.4, "det_override",
+                                    det_result=det_result, llm_result=v.automation_result, detail=det_detail)
+    telemetry.station_event(exec_id, 6.4, "end", automation_result=automation_result,
+                            failure_class=failure_class, execution_mode=v.execution_mode,
+                            needs_onboarding=v.needs_onboarding, graded_junit_sha=_junit_sha)  # F4: audit fingerprint
     return {
-        "automation_result": v.automation_result,
-        "failure_class": v.failure_class,
+        "automation_result": automation_result,
+        "failure_class": failure_class,
         "execution_mode": v.execution_mode,
         "test_automation_pr_url": v.test_automation_pr_url,
         "sit_findings": v.findings_for_coder,
@@ -1794,32 +1857,48 @@ async def stop_run(state: OceanState) -> dict:
                 "final_outcome": f"human rejected the ready-flip; service PR "
                                  f"#{state.get('pr_number')} left draft"}
     fc = state.get("failure_class", "")
-    # after_review's own "stop" case (budget exhausted, no diff to approve -- see graph.py) lands
-    # here too, arriving BEFORE open_pr ever ran: no PR exists yet, so this must be distinguished
-    # from every other reason below, all of which happen after a PR was already opened.
-    no_diff_after_review = (
-        state.get("review_verdict") not in (None, "", "APPROVE")
-        and not state.get("branch")
-    )
+    branch_set = bool(state.get("branch"))
+    pr_opened = bool(state.get("pr_number"))
+    # after_review's own "stop" cases land here too, BEFORE open_pr ever ran (no PR yet) -- two shapes,
+    # BOTH of which stopped at Station 5 (review), not Station 6 (SIT), which never ran:
+    #   - budget exhausted with NO diff (coder wrote nothing to approve), OR
+    #   - F3/C1: budget exhausted WITH a diff whose FINAL review still holds unresolved CRITICAL/MAJOR
+    #     -- a real branch the reviewer rejected. A `sit_failed` label (station 6) here would misdirect
+    #     the human triaging the run to a SIT stage that didn't run; record the review-stage truth.
+    review_rejected = state.get("review_verdict") not in (None, "", "APPROVE")
+    has_blocking = any(
+        isinstance(f, dict) and str(f.get("severity", "")).upper() in ("CRITICAL", "MAJOR")
+        for f in (state.get("review_findings") or []))
+    review_stop_no_diff = review_rejected and not branch_set
+    review_stop_blocking = review_rejected and branch_set and not pr_opened and has_blocking
     if state.get("needs_onboarding"):
-        reason = "repo_onboarding_exhausted"   # still unsupported after MAX_ONBOARD_ATTEMPTS
-    elif no_diff_after_review:
-        reason = "review_budget_exhausted_no_diff"
+        reason, station = "repo_onboarding_exhausted", 6   # still unsupported after MAX_ONBOARD_ATTEMPTS
+    elif review_stop_blocking:
+        reason, station = "review_budget_exhausted_blocking_findings", 5
+    elif review_stop_no_diff:
+        reason, station = "review_budget_exhausted_no_diff", 5
     elif fc == "code_fault":
-        reason = "coding_attempts_exhausted"
+        reason, station = "coding_attempts_exhausted", 6
     elif fc == "environment_failure" and state.get("preflight_failed"):
-        reason = "environment_failure_non_retriable"   # resource-insufficient; retrying can't help
+        reason, station = "environment_failure_non_retriable", 6   # resource-insufficient; retrying can't help
     elif fc == "environment_failure":
-        reason = "environment_failure_retries_exhausted"
+        reason, station = "environment_failure_retries_exhausted", 6
     elif fc == "could_not_verify":
-        reason = "could_not_verify"
+        reason, station = "could_not_verify", 6
     else:
-        reason = "sit_failed"
-    telemetry.station_event(state["execution_id"], 6, "stop", reason=reason)
-    pr_note = (f"service PR #{state['pr_number']} left draft" if state.get("pr_number")
-               else "no PR was opened -- no diff for the reviewer to approve")
+        reason, station = "sit_failed", 6
+    telemetry.station_event(state["execution_id"], station, "stop", reason=reason)
+    if state.get("pr_number"):
+        pr_note = f"service PR #{state['pr_number']} left draft"
+    elif review_stop_blocking:
+        pr_note = (f"a REJECTED diff exists on branch {state.get('branch')!r} -- unresolved "
+                   f"CRITICAL/MAJOR at review-budget exhaustion; no PR opened, needs a human")
+    else:
+        pr_note = "no PR was opened -- no diff for the reviewer to approve"
+    # Don't prefix review-stage stops with "sit_failed:" -- they never reached SIT.
+    outcome_prefix = "review_stopped" if (review_stop_blocking or review_stop_no_diff) else "sit_failed"
     return {"final_status": "failed", "ready_flipped": False,
-            "final_outcome": f"sit_failed:{reason}; {pr_note}"}
+            "final_outcome": f"{outcome_prefix}:{reason}; {pr_note}"}
 
 
 # ------------------------------------------------------------------ RCA agent

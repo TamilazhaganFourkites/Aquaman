@@ -55,6 +55,15 @@ def after_rca_review(state: OceanState) -> str:
     return "fix_needed" if state.get("rca_fix_needed") else "done"
 
 
+def _has_blocking_findings(state: OceanState) -> bool:
+    """F3 (architecture review): any UNRESOLVED CRITICAL/MAJOR in the last review. Severity is the
+    single source of truth (same convention ReviewVerdict's F2 gate uses)."""
+    for f in state.get("review_findings") or []:
+        if isinstance(f, dict) and str(f.get("severity", "")).upper() in ("CRITICAL", "MAJOR"):
+            return True
+    return False
+
+
 def after_review(state: OceanState) -> str:
     if state.get("review_verdict") == "APPROVE":
         return "approve"
@@ -70,6 +79,15 @@ def after_review(state: OceanState) -> str:
         # (`if not slugs or not branch: raise GitOpError`) -- the same signal the rest of the
         # graph already treats as authoritative for "is there something to act on."
         if state.get("branch"):
+            # F3 (architecture review): budget exhausted WITH a diff. This used to ALWAYS open the PR
+            # (Station 6 is the next gate). But if the FINAL review still holds UNRESOLVED CRITICAL/MAJOR
+            # findings, "approve" would ship a PR the reviewer explicitly rejected — the "review-budget
+            # exhaustion routes to approval" escape (the class that let MM-14457's issues through).
+            # Escalate to a human (stop_run records it, no PR) when blocking findings remain; only open
+            # the PR when the residual is at most MINOR. (Composes with F2: the last verdict is already
+            # CHANGES_REQUIRED whenever CRITICAL/MAJOR exist, so this never contradicts an honest APPROVE.)
+            if _has_blocking_findings(state):
+                return "stop"
             return "approve"
         return "stop"
     return "rework"

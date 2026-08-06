@@ -148,6 +148,11 @@ CHECKPOINT_DB = os.environ.get("OCEAN_PIPELINE_CHECKPOINT_DB", str(ARTIFACTS_ROO
 
 # Default model for station agents. Always the latest capable Opus unless overridden.
 STATION_MODEL = os.environ.get("OCEAN_PIPELINE_MODEL", "claude-opus-5")  # F6 (architecture review): was claude-opus-4-8 (one gen back); opus-5 is current — accuracy win across all stations, env-overridable
+# F7 (architecture review): the JUDGE nodes (harsh_reviewer, sit_triage) run on a DIFFERENT model than
+# the coder/generator (STATION_MODEL) to reduce self-preference bias — a generator that grades its own
+# family maximizes it (LLM-as-judge literature). Defaults to sonnet-5 (a distinct model from opus-5,
+# strong enough for adversarial review, cheaper/faster). Set == STATION_MODEL to disable cross-model judging.
+JUDGE_MODEL = os.environ.get("OCEAN_PIPELINE_JUDGE_MODEL", "claude-sonnet-5")
 
 # Console log detail. Three audiences, one run:
 #   management  — top station headers + one-line outcome per station only (no milestones,

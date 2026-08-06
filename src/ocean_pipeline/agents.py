@@ -683,7 +683,8 @@ def _station_mcp_config() -> dict | None:
 
 
 async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str,
-                 label: str = "station", allowed_tools: list[str] | None = None) -> None:
+                 label: str = "station", allowed_tools: list[str] | None = None,
+                 model: str | None = None) -> None:
     # Imported lazily so the graph/routing test suite runs without the SDK (or the
     # `claude` CLI it spawns) installed — the SDK is only needed at actual run time.
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
@@ -719,7 +720,10 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     os.environ.setdefault("BASH_MAX_TIMEOUT_MS", config.BASH_MAX_TIMEOUT_MS)
 
     options_kwargs = dict(
-        model=config.STATION_MODEL,
+        # F7 (architecture review): per-call model, defaulting to STATION_MODEL. The graph routes the
+        # JUDGE nodes (harsh_reviewer, sit_triage) to config.JUDGE_MODEL — a DIFFERENT model than the
+        # coder/generator — to reduce the self-preference bias a shared generator+judge model maximizes.
+        model=model or config.STATION_MODEL,
         system_prompt=system_prompt,
         cwd=str(cwd),
         permission_mode=permission_mode,
@@ -783,7 +787,8 @@ def _looks_like_complete_json(path: Path) -> bool:
 async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
                             permission_mode: str, label: str,
                             allowed_tools: list[str] | None = None,
-                            verdict_path: Path | None = None) -> None:
+                            verdict_path: Path | None = None,
+                            model: str | None = None) -> None:
     """Run the worker, retrying on any transient SDK/CLI failure with exponential backoff.
 
     A single claude-CLI ProcessError (e.g. the `Claude Code returned an error result: ...`
@@ -810,7 +815,7 @@ async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
     last: Exception | None = None
     for attempt in range(config.MAX_AGENT_RETRIES + 1):
         try:
-            await _drive(system_prompt, prompt, cwd, permission_mode, label, allowed_tools)
+            await _drive(system_prompt, prompt, cwd, permission_mode, label, allowed_tools, model)
             return
         except Exception as e:  # noqa: BLE001 — retry ANY transport/SDK failure
             if verdict_path is not None and _looks_like_complete_json(verdict_path):
@@ -898,6 +903,7 @@ async def run_agent(
     verdict_model: Type[T],
     cwd: Path | None = None,
     permission_mode: str | None = None,
+    model: str | None = None,   # F7: override the model for this node (e.g. JUDGE_MODEL for harsh_reviewer)
 ) -> T:
     """Run one agents/pipeline/fk-*.md worker for a single node and return its validated verdict."""
     verdict_path = config.artifacts_dir(execution_id) / f"{node}.verdict.json"
@@ -919,6 +925,7 @@ async def run_agent(
             label=node,
             allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
             verdict_path=verdict_path,
+            model=model,
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         if not verdict_path.exists():
@@ -953,6 +960,7 @@ async def run_agent(
                 label=f"{node}:verdict-redrive",
                 allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
                 verdict_path=verdict_path,
+                model=model,
             )
         except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
             if not verdict_path.exists():
@@ -982,6 +990,7 @@ async def run_skill(
     cwd: Path | None = None,
     permission_mode: str | None = None,
     verdict_path: Path | None = None,
+    model: str | None = None,   # F7: override the model for this skill call (e.g. JUDGE_MODEL for sit_triage)
 ) -> None:
     """Run a skills/<skill_name>/SKILL.md skill headless.
 
@@ -1006,6 +1015,7 @@ async def run_skill(
             label=node,
             allowed_tools=_frontmatter_tools(skill_md),
             verdict_path=verdict_path,
+            model=model,
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}",
