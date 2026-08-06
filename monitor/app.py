@@ -48,7 +48,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import jira_client
 import store
@@ -169,6 +169,12 @@ class TicketRun:
     finished_at: float | None = None
     log_path: str | None = None
     raw_lines: list[str] = field(default_factory=list)
+    # Free-form --context forwarded to ocean-pipeline on the initial fresh dispatch only (resolved
+    # per-ticket in create_batch: an explicit ticket_contexts[ticket] override wins over the batch's
+    # own default context). Deliberately NOT persisted to sqlite (store.py) -- it only matters at the
+    # moment _run_batch_from builds this ticket's CLI args, and a resumed/reconciled run always uses
+    # `--resume`, which cli.py never reads --context for anyway, so nothing is lost across a restart.
+    context: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -184,6 +190,7 @@ class TicketRun:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "log_path": self.log_path,
+            "context": self.context,
             # bounded tail, not the full history — this is exactly what the subprocess
             # printed at the batch's chosen --log-level (nothing filtered client-side);
             # the cap is defensive since a developer-level run can print thousands of
@@ -525,8 +532,10 @@ async def _run_batch_from(batch: Batch, start: int) -> None:
         if batch.cancelled:
             return
         run = batch.tickets[i]
-        asyncio.create_task(_drive_process(run, [run.ticket, "--log-level", batch.log_level],
-                                            batch.env_overrides, batch=batch))
+        args = [run.ticket, "--log-level", batch.log_level]
+        if run.context:
+            args += ["--context", run.context]
+        asyncio.create_task(_drive_process(run, args, batch.env_overrides, batch=batch))
     # Informational only now (no control-flow decision reads it) — "every ticket in this
     # batch has been dispatched," not "which one is currently active" (that concept no
     # longer applies once tickets run concurrently instead of one at a time).
@@ -654,6 +663,10 @@ class CreateBatchBody(BaseModel):
     qa_autoapprove: bool = False    # OCEAN_PIPELINE_QA_AUTOAPPROVE — skip qa_review_gate's pause
     rca_review_auto: bool = False   # OCEAN_PIPELINE_RCA_REVIEW_AUTO — skip rca_review_gate's pause
     qa_testrail: bool = False       # OCEAN_PIPELINE_TESTRAIL — real TestRail cases on auto-approve
+    context: str = ""               # batch-level default --context, applied to any ticket below
+                                     # with no entry in ticket_contexts
+    ticket_contexts: dict[str, str] = Field(default_factory=dict)  # per-ticket --context override,
+                                     # keyed by ticket id — wins over `context` for that one ticket
 
 
 class ResumeBody(BaseModel):
@@ -691,8 +704,14 @@ async def create_batch(body: CreateBatchBody) -> dict:
         "OCEAN_PIPELINE_TESTRAIL": _flag(body.qa_testrail),
     }
     level = body.log_level if body.log_level in ("management", "team", "developer") else "team"
-    batch = Batch(id=str(uuid.uuid4())[:8], tickets=[TicketRun(ticket=t) for t in tickets],
-                  log_level=level, env_overrides=env_overrides, created_at=time.time())
+    default_context = body.context.strip()
+    # Per-ticket override wins over the batch default; a ticket with no entry (or a
+    # whitespace-only override) falls back to default_context.
+    batch = Batch(
+        id=str(uuid.uuid4())[:8],
+        tickets=[TicketRun(ticket=t, context=body.ticket_contexts.get(t, "").strip() or default_context)
+                 for t in tickets],
+        log_level=level, env_overrides=env_overrides, created_at=time.time())
     BATCHES[batch.id] = batch
     store.save_batch(batch)
     for i, t in enumerate(batch.tickets):

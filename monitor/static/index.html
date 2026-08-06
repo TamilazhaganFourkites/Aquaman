@@ -243,6 +243,9 @@
     font-family:var(--sans); font-size:var(--fs-body); padding:9px 11px; border-radius:8px;
     border:1px solid var(--line); background:var(--surface-2); color:var(--ink); cursor:pointer;
   }
+  .per-ticket-context-row { display:flex; flex-direction:column; gap:2px; }
+  .per-ticket-context-row + .per-ticket-context-row { margin-top:var(--sp-4); }
+  .per-ticket-context-row textarea { min-height:56px; }
   .gate-list { display:flex; flex-direction:column; gap:var(--sp-3); }
   .gate-list .row { display:flex; align-items:flex-start; gap:10px; }
   .gate-list input[type="checkbox"] { margin-top:3px; accent-color:var(--glow); width:16px; height:16px; flex:none; }
@@ -783,6 +786,16 @@
         <div class="hint">Runs concurrently, up to the configured limit at once.</div>
       </div>
 
+      <div class="panel">
+        <label class="field-label" for="defaultContext">Default context (optional)</label>
+        <textarea id="defaultContext" placeholder="Applied to every ticket below that doesn't have its own override"></textarea>
+      </div>
+
+      <div class="panel" id="perTicketContextPanel" style="display:none">
+        <div class="panel-title">Per-ticket context override (optional)</div>
+        <div id="perTicketContextList"></div>
+      </div>
+
       <div class="panel" id="discovered">
         <div class="panel-title">
           <div class="eyebrow">Discovered — Refined &amp; assigned to you</div>
@@ -857,7 +870,11 @@ const PAGE_LOAD_AT = Date.now();
 const BASELINE_GRACE_MS = 3000;
 
 function esc(s) {
-  return (s || "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+  // Escapes quotes too (not just &<>) -- needed since free-form context text (this feature) can
+  // land inside an HTML attribute (rowHtml's title="Context: ..."), where an unescaped `"` breaks
+  // out of the attribute and corrupts the templated markup. Safe everywhere else esc() is already
+  // used (text nodes render &quot;/&#39; as plain quote characters).
+  return (s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
 
 // Total ticket duration — distinct from each station's own per-step elapsed time (already shown
@@ -1039,6 +1056,9 @@ function setTab(tab) {
 function openSlideover() {
   document.getElementById("slideover").classList.add("open");
   document.getElementById("soBackdrop").classList.add("open");
+  // #tickets can already hold persisted text from a previous session (it isn't cleared on close) --
+  // without this, the per-ticket panel would stay hidden/stale until the user's next keystroke.
+  renderPerTicketContext();
 }
 function closeSlideover() {
   document.getElementById("slideover").classList.remove("open");
@@ -1126,6 +1146,38 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// ── Per-ticket context override — one multi-line textarea per ticket, rendered live as the
+// Ticket IDs textarea changes. Keyed by ticket id (not DOM position/index) so editing the ticket
+// list — adding, removing, or reordering lines — never loses an already-typed override for a
+// ticket that's still present; only genuinely-new tickets get a fresh blank row.
+const perTicketContextValues = {};
+function renderPerTicketContext() {
+  const raw = document.getElementById("tickets").value;
+  const tickets = [...new Set(raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean))];
+  // Prune any id no longer in the current ticket list — otherwise an EDITED ticket id (e.g. a typo
+  // fix) leaves its typed context orphaned under the old key, invisible in the panel, only to
+  // silently reattach to a DIFFERENT later-typed ticket that happens to reuse that same old id.
+  const ticketSet = new Set(tickets);
+  Object.keys(perTicketContextValues).forEach(id => {
+    if (!ticketSet.has(id)) delete perTicketContextValues[id];
+  });
+  const panel = document.getElementById("perTicketContextPanel");
+  const list = document.getElementById("perTicketContextList");
+  if (!tickets.length) { panel.style.display = "none"; return; }
+  panel.style.display = "";
+  list.innerHTML = tickets.map(t => `
+    <div class="per-ticket-context-row">
+      <div class="field-label">${esc(t)}</div>
+      <textarea data-ticket-context="${esc(t)}" placeholder="Leave blank to use the default context above"></textarea>
+    </div>`).join("");
+  list.querySelectorAll("[data-ticket-context]").forEach(ta => {
+    const id = ta.dataset.ticketContext;
+    if (perTicketContextValues[id]) ta.value = perTicketContextValues[id];
+    ta.addEventListener("input", () => { perTicketContextValues[id] = ta.value; });
+  });
+}
+document.getElementById("tickets").addEventListener("input", renderPerTicketContext);
+
 // A stone dropped in water — a ripple from the exact click point, not a generic effect.
 document.getElementById("start").addEventListener("click", (e) => {
   const btn = e.currentTarget;
@@ -1152,14 +1204,25 @@ document.getElementById("start").addEventListener("click", async () => {
   const qa_autoapprove = document.getElementById("qaAutoapprove").checked;
   const rca_review_auto = document.getElementById("rcaReviewAuto").checked;
   const qa_testrail = document.getElementById("qaTestrail").checked;
+  const context = document.getElementById("defaultContext").value.trim();
+  const ticket_contexts = {};
+  tickets.forEach(t => {
+    const v = (perTicketContextValues[t] || "").trim();
+    if (v) ticket_contexts[t] = v;
+  });
   try {
     const res = await fetch("/batches", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({tickets, log_level, qa_autoapprove, rca_review_auto, qa_testrail}),
+      body: JSON.stringify({tickets, log_level, qa_autoapprove, rca_review_auto, qa_testrail, context, ticket_contexts}),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     watchBatch(data.batch_id);
+    // Start the NEXT batch from a clean context slate — #tickets itself keeps its existing
+    // persistence behavior (see the loglevel/checkbox restore block below), unchanged here.
+    document.getElementById("defaultContext").value = "";
+    Object.keys(perTicketContextValues).forEach(k => delete perTicketContextValues[k]);
+    renderPerTicketContext();
     closeSlideover();
     setTab("live");
   } catch (err) {
@@ -1256,7 +1319,8 @@ function currentStepCaption(t) {
 
 function rowHtml(t, isAuto) {
   const selected = t.ticket === selectedTicket ? " selected" : "";
-  return `<div class="ticket-row st-${t.status}${selected}" data-select="${esc(t.ticket)}" data-auto="${isAuto ? 1 : 0}">
+  const contextTitle = t.context ? ` title="Context: ${esc(t.context)}"` : "";
+  return `<div class="ticket-row st-${t.status}${selected}" data-select="${esc(t.ticket)}" data-auto="${isAuto ? 1 : 0}"${contextTitle}>
     <div class="row-id">
       ${t.status === "paused" ? `<span class="needs-input" title="Waiting on your decision"></span>` : ""}
       <div style="min-width:0">
@@ -1866,6 +1930,9 @@ function addTicket(key) {
   const existing = ta.value.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
   if (existing.includes(key)) return;    // dedupe what's already typed
   ta.value = existing.concat(key).join("\n");
+  // A plain .value assignment doesn't fire the `input` event renderPerTicketContext listens for —
+  // call it directly so the "+ Add" path (Discovered list) keeps the per-ticket panel in sync too.
+  renderPerTicketContext();
 }
 
 // ── History tab ───────────────────────────────────────────────────────────
