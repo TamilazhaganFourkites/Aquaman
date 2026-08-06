@@ -1352,11 +1352,22 @@ def _junit_pass_fail(junit_path) -> tuple:
             except (TypeError, ValueError):
                 return 0
         tests += _i("tests"); failures += _i("failures"); errors += _i("errors"); skipped += _i("skipped")
+    # P2 hardening (judge follow-up): some junit writers populate ONLY testcase-level <failure>/<error>
+    # (and testcases) with a suite-level failures="0" — trusting the attrs alone would read that as a
+    # clean PASS. Cross-check the element-level counts and take the worst case, so a testcase-only
+    # failure can never flip a real failure to passed. (Double-counting can only inflate a non-zero,
+    # never mask one, so max() is safe for the boolean.)
+    tc_total = len(root.findall(".//testcase"))
+    tc_bad = len(root.findall(".//testcase/failure")) + len(root.findall(".//testcase/error"))
+    tc_skipped = len(root.findall(".//testcase/skipped"))
+    tests = max(tests, tc_total)
+    skipped = max(skipped, tc_skipped)
+    bad = max(failures + errors, tc_bad)
     executed = tests - skipped
-    detail = f"tests={tests} failures={failures} errors={errors} skipped={skipped}"
+    detail = f"tests={tests} failures={failures} errors={errors} skipped={skipped} tc_bad={tc_bad}"
     if executed <= 0:
         return "failed", f"nothing executed ({detail})"   # 0 tests, or all skipped, is never a PASS
-    return ("passed" if (failures == 0 and errors == 0) else "failed"), detail
+    return ("passed" if bad == 0 else "failed"), detail
 
 
 # ------------------------------------------------------------------ Station 6c — execute the approved SIT
@@ -1695,6 +1706,15 @@ async def sit_triage(state: OceanState) -> dict:
                          f"'{v.automation_result}' -> trusting the deterministic junit parse")
             telemetry.station_event(exec_id, 6.4, "det_override",
                                     det_result=det_result, llm_result=v.automation_result, detail=det_detail)
+            # P1 (judge follow-up): if the junit says PASSED but the LLM thought it FAILED, the skill
+            # never ran its on-PASS side-effect (commit the SIT + open the test-automation draft PR) --
+            # so this now-passing run has NO test-automation PR. Flag it loudly for manual follow-up
+            # rather than let a green run silently ship without its SIT PR.
+            if det_result == "passed" and not v.test_automation_pr_url:
+                ui.milestone("F1/P1: junit PASSED but the triage opened no test-automation PR (it "
+                             "believed the run failed) -- the SIT passed WITHOUT a PR; needs a manual "
+                             "PR or a re-run to produce one")
+                telemetry.station_event(exec_id, 6.4, "pass_without_test_pr", detail=det_detail)
     telemetry.station_event(exec_id, 6.4, "end", automation_result=automation_result,
                             failure_class=failure_class, execution_mode=v.execution_mode,
                             needs_onboarding=v.needs_onboarding, graded_junit_sha=_junit_sha)  # F4: audit fingerprint
