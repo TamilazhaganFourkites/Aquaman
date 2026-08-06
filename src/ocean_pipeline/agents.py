@@ -41,11 +41,28 @@ class StationError(RuntimeError):
     """A node's worker failed to run or to produce a valid verdict. Carries node
     context so the top-level handler can emit a clean failed telemetry row."""
 
-    def __init__(self, node: str, source: str, detail: str):
+    def __init__(self, node: str, source: str, detail: str, quota_exhausted: bool = False):
         super().__init__(f"node {node} ({source}): {detail}")
         self.node = node
         self.source = source
         self.detail = detail
+        # MM-14793 (I2): the org's monthly Claude Code spend limit ran dry mid-run — distinct
+        # from a real code/env/transport failure. Set via _is_quota_error() at every raise site
+        # below so cli.py's top-level handler and the monitor can classify + surface it
+        # separately from a generic "failed", instead of the two collapsing into one bucket.
+        self.quota_exhausted = quota_exhausted
+
+
+# Substrings observed in the actual "Claude Code returned an error result" message when the
+# org's monthly spend limit is exhausted (run-monitoring-findings.md I2). Matched
+# case-insensitively against str(exc) — this is a message-content sniff, not a typed SDK
+# exception, because the SDK surfaces this as a generic transport/CLI error like any other.
+_QUOTA_MARKERS = ("monthly spend limit", "usage-credits", "spend limit")
+
+
+def _is_quota_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _QUOTA_MARKERS)
 
 # Operating guardrails handed to every worker. These are SAFETY constraints, not process
 # framing — the graph decides what runs when; the worker only obeys these while doing its one job.
@@ -60,8 +77,17 @@ class StationError(RuntimeError):
 AGENT_GUARDRAILS = """\
 Operating guardrails for ticket {ticket_id}:
 - Never fork cloudqwest repos -- push branches directly to upstream
-- Clone over HTTPS with the gh token: `git clone https://$(gh auth token)@github.com/cloudqwest/<repo>.git`
-  -- never `git@github.com:` (SSH keys are not configured; it fails `Permission denied (publickey)`)
+- Clone with `gh repo clone cloudqwest/<repo> <dest>` (reuses `gh`'s own authenticated session --
+  never `git@github.com:`, SSH keys are not configured and it fails `Permission denied (publickey)`).
+  Do NOT clone via `git clone https://$(gh auth token)@github.com/...` -- that writes the live token
+  into the checkout's own `.git/config` (`remote.origin.url`) in plaintext, on disk, indefinitely;
+  `gh repo clone` authenticates the same way without that residue.
+- **NEVER hardcode a real token/credential literal as a fallback** (e.g. `TOK="$(gh auth token)";
+  [ -z "$TOK" ] && TOK="gho_..."`) -- a real run did exactly this when `gh auth token` resolved
+  empty, writing a live credential in plaintext into the run log (I10, run-monitoring-findings-
+  06af6088.md). If `gh auth token`/`$GH_TOKEN` is empty, STOP and surface that as a genuine
+  environment gap (e.g. a build/coder-verdict blocker) -- never substitute a literal value you
+  happen to know, from this session or anywhere else, in its place.
 - Every commit must include {ticket_id} in the message
 - Never write FK service code into fk-aideveloper -- clone the target repo
 - Parameterized queries only -- no SQL string concatenation
@@ -791,6 +817,14 @@ async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
                 ui.milestone(f"transient error ({type(e).__name__}) after the verdict was already "
                              f"written — ignoring it, not re-driving the station")
                 return
+            if _is_quota_error(e):
+                # MM-14793 (I2): the org's spend pool is dry — every subsequent attempt hits the
+                # identical wall (run-monitoring-findings.md: "every subsequent station call just
+                # burns another error cycle"). Retrying with backoff can't help this the way it
+                # helps a real transient SDK/network blip, so fail fast instead of spending the
+                # whole MAX_AGENT_RETRIES budget for nothing.
+                ui.milestone(f"quota exhausted (org monthly spend limit) — failing fast, not retrying")
+                raise
             last = e
             if attempt >= config.MAX_AGENT_RETRIES:
                 break
@@ -889,7 +923,8 @@ async def run_agent(
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         if not verdict_path.exists():
             _capture_partial(node, execution_id, cwd)   # SDK crash / timeout with no verdict (full probe)
-        raise StationError(node, agent_md, f"agent run failed: {type(e).__name__}: {e}") from e
+        raise StationError(node, agent_md, f"agent run failed: {type(e).__name__}: {e}",
+                            quota_exhausted=_is_quota_error(e)) from e
     except BaseException:   # noqa: BLE001 — a KILL / Ctrl-C / cancel: fast breadcrumb, then let it propagate
         if not verdict_path.exists():
             _capture_partial(node, execution_id, cwd, fast=True)   # tight budget — exit fast on a kill
@@ -922,7 +957,8 @@ async def run_agent(
         except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
             if not verdict_path.exists():
                 _capture_partial(node, execution_id, cwd)
-            raise StationError(node, agent_md, f"agent run failed (verdict re-drive): {type(e).__name__}: {e}") from e
+            raise StationError(node, agent_md, f"agent run failed (verdict re-drive): {type(e).__name__}: {e}",
+                                quota_exhausted=_is_quota_error(e)) from e
         except BaseException:   # noqa: BLE001 — KILL / cancel during the re-drive: fast breadcrumb, then propagate
             if not verdict_path.exists():
                 _capture_partial(node, execution_id, cwd, fast=True)
@@ -933,7 +969,8 @@ async def run_agent(
     try:
         return verdict_model.model_validate_json(_read(verdict_path))
     except Exception as e:  # noqa: BLE001 — malformed / schema-violating verdict
-        raise StationError(node, agent_md, f"invalid verdict json: {type(e).__name__}: {e}") from e
+        raise StationError(node, agent_md, f"invalid verdict json: {type(e).__name__}: {e}",
+                            quota_exhausted=_is_quota_error(e)) from e
 
 
 async def run_skill(
@@ -971,4 +1008,5 @@ async def run_skill(
             verdict_path=verdict_path,
         )
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
-        raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}") from e
+        raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}",
+                            quota_exhausted=_is_quota_error(e)) from e

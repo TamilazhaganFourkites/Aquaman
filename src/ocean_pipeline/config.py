@@ -117,6 +117,18 @@ MAX_CONCURRENT_BUILDS = int(os.environ.get("OCEAN_PIPELINE_MAX_CONCURRENT_BUILDS
 # "proceed anyway past the deadline, the live headroom check is the real backstop" philosophy.
 BUILD_SLOT_WAIT_SECONDS = int(os.environ.get("OCEAN_PIPELINE_BUILD_SLOT_WAIT_SECONDS", "1800"))
 
+# Third, SEPARATE pool: qa_scenarios' GAN loop (S2, run-monitoring-findings.md) fans out up to 4
+# sub-agents/round for up to 3 rounds INSIDE one node's single run_skill call — invisible to the SIT
+# and build slots above (this is LLM sub-agent/API concurrency, not Docker memory). Two tickets'
+# GANs running head-to-head observed at ~20-22 min each vs. Tier A's ~18-19 min solo-run projection,
+# plus a TestRail 429 the agent attributed to "the parallel sit_run/other load" — i.e. contention
+# hits both local CPU/LLM concurrency and the shared external TestRail API. Default 1 = serialize the
+# GAN loop machine-wide (the single biggest contention source identified); a wedged holder still can't
+# block forever (same wait-then-proceed-anyway posture as the two pools above).
+MAX_CONCURRENT_GAN = int(os.environ.get("OCEAN_PIPELINE_MAX_CONCURRENT_GAN", "1"))
+# Shorter than SIT's 2h (a GAN loop is ~20-25 min end to end, not a multi-hour stack).
+GAN_SLOT_WAIT_SECONDS = int(os.environ.get("OCEAN_PIPELINE_GAN_SLOT_WAIT_SECONDS", "1800"))
+
 
 def sit_infra_project(execution_id: str) -> str:
     """Deterministic compose project name for a run's SIT infra, so a retry reuses the SAME stack and
@@ -210,6 +222,11 @@ MAX_ENV_RETRY_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_ENV_RETRY_ATTEMP
 # made prep_image ALWAYS time out on a fresh lockfile → orphaned build (B2) + a duplicate rebuild by
 # prep_container (B3). 1800s lets a cold build finish in-stage. (EXE-6fca4a71.)
 IMAGE_PREWARM_TIMEOUT = int(os.environ.get("OCEAN_PIPELINE_IMAGE_PREWARM_TIMEOUT", "1800"))
+
+# I8 (run-monitoring-findings-06af6088.md): prep_image now clones a repo's first-ever local
+# checkout (via `gh repo clone`) so it gets a chance to pre-warm before the coder does -- bounded
+# separately from IMAGE_PREWARM_TIMEOUT since this is a plain git clone, not a Docker build.
+CLONE_PREWARM_TIMEOUT = int(os.environ.get("OCEAN_PIPELINE_CLONE_PREWARM_TIMEOUT", "300"))
 
 # Local mock-first SIT: the LocalStack SQS endpoint the test-automation SQS client must target.
 # Without this exported, that client silently constructs as None and crashes on `.meta`, so the

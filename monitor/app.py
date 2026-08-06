@@ -57,6 +57,13 @@ from runtime import runtime
 AQUAMAN_BIN = environ.get("AQUAMAN_BIN", "ocean-pipeline")
 AQUAMAN_DIR = environ.get("AQUAMAN_DIR") or None
 MAX_CONCURRENT_TICKETS = int(environ.get("AQUAMAN_MAX_CONCURRENT", "3"))
+# I2 recurrence (run-monitoring-findings-06af6088.md): the existing quota_exhausted classification +
+# fail-fast (agents.py) stops WASTEFUL IN-PROCESS retries, but does nothing about a human (or a
+# script) repeatedly clicking retry on a ticket whose last failure was the org spend limit -- a real
+# batch burned ~40+ hits over ~1h this way, each retry re-entering the SAME node fresh only to hit
+# the still-dry pool again seconds later. This cooldown makes a blind rapid retry require an
+# explicit override instead of silently repeating the exact same failure.
+QUOTA_RETRY_COOLDOWN_SECONDS = int(environ.get("AQUAMAN_QUOTA_RETRY_COOLDOWN_SECONDS", "600"))
 
 LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
@@ -114,6 +121,9 @@ _BANNER_EXE_RE = re.compile(r"run (EXE-[0-9a-f]+)")
 _DONE_RE = re.compile(r"^\[DONE\]\s+(\S+)\s+status=(\S+)(?:\s+pr=#(\d+))?")
 _FAILED_RE = re.compile(r"^\[FAILED\]\s*(.*)$")
 _PAUSED_RE = re.compile(r"^\[PAUSED\]\s*(.*)$", re.S)
+# MM-14793 (I2): distinct from [FAILED] — the org's Claude Code spend pool ran dry, not a real
+# code/env/transport failure (run-monitoring-findings.md). cli.py prints this instead of [FAILED].
+_QUOTA_RE = re.compile(r"^\[QUOTA_EXHAUSTED\]\s*(.*)$", re.S)
 _RESULT_RE = re.compile(r"^\s*RESULT:\s*(\S+)")
 
 
@@ -452,6 +462,22 @@ async def _drive_process(run: TicketRun, args: list[str],
                 run.final_outcome = run.final_outcome or m.group(1).strip()
                 continue
 
+            m = _QUOTA_RE.match(line)
+            if m:
+                # MM-14793 (I2): distinct from a generic failure — the org's spend pool is dry.
+                # Auto-pause the auto-discovery worker so it doesn't pick up NEW tickets into the
+                # same known-dry wall (mirrors runtime.py's own documented scope: this stops the
+                # auto-worker from starting new work, it does NOT retroactively stop sibling
+                # tickets in the SAME manual batch that are already running concurrently — those
+                # were dispatched together at batch-launch time, before this line could arrive).
+                run.final_status = "quota_exhausted"
+                run.final_outcome = run.final_outcome or m.group(1).strip()
+                if not runtime.paused:
+                    runtime.paused, runtime.paused_reason = True, (
+                        f"auto-paused: org monthly spend limit hit on {run.ticket} — "
+                        f"resume once credits return")
+                continue
+
             m = _RESULT_RE.match(line)
             if m and not run.final_outcome:
                 run.final_outcome = line.strip()
@@ -776,6 +802,24 @@ async def resume_batch(batch_id: str, body: ResumeBody) -> dict:
     return {"resumed": run.ticket, "args": args}
 
 
+def _quota_cooldown_block(final_status: str | None, finished_at: float | None, force: bool) -> str | None:
+    """I2 recurrence: if the LAST attempt ended in quota_exhausted and finished less than
+    QUOTA_RETRY_COOLDOWN_SECONDS ago, block a retry unless the caller explicitly passes
+    ?force=true. Returns an error message to raise as a 409, or None to let the retry proceed.
+    A missing/unknown finished_at (e.g. an old history row from before this field existed)
+    fails OPEN (returns None) -- this is a courtesy speed-bump against blind rapid-fire retries,
+    not a hard safety gate, so an inability to compute the cooldown must never itself block a
+    legitimate retry."""
+    if force or final_status != "quota_exhausted" or not finished_at:
+        return None
+    remaining = QUOTA_RETRY_COOLDOWN_SECONDS - (time.time() - finished_at)
+    if remaining <= 0:
+        return None
+    return (f"last attempt hit the org spend limit {int(time.time() - finished_at)}s ago -- "
+            f"retrying now will very likely hit the same wall (this already burned ~40+ cycles "
+            f"in one batch). Wait {int(remaining)}s, or pass ?force=true to retry anyway.")
+
+
 def _resolve_batch(batch_id: str) -> "Batch | None":
     """"auto" resolves to the auto-queue singleton — it's never registered in BATCHES (that dict is
     manual batches only), but the UI's unified Live view treats an auto-picked ticket like a manual
@@ -784,13 +828,16 @@ def _resolve_batch(batch_id: str) -> "Batch | None":
 
 
 @app.post("/batches/{batch_id}/tickets/{ticket}/retry")
-async def retry_ticket(batch_id: str, ticket: str) -> dict:
+async def retry_ticket(batch_id: str, ticket: str, force: bool = False) -> dict:
     """Plain checkpoint resume for a FAILED/INTERRUPTED ticket — distinct from /resume above (which
     only ever answers a paused GATE decision, --approve/--reject/--qa). ocean-pipeline's own --resume
     replays from the last LangGraph checkpoint regardless of why the run stopped: a StationError
     (e.g. "no verdict written" after a killed background task) does not invalidate that checkpoint,
     so this can genuinely pick back up — the coder's own re-entry logic already checks git state for
-    already-completed work — rather than starting the ticket over from scratch."""
+    already-completed work — rather than starting the ticket over from scratch.
+
+    `force=true` bypasses the quota-cooldown speed-bump below (I2 recurrence) for a deliberate
+    early retry once credits are confirmed back."""
     batch = _resolve_batch(batch_id)
     if not batch:
         raise HTTPException(404, "batch not found")
@@ -799,6 +846,9 @@ async def retry_ticket(batch_id: str, ticket: str) -> dict:
         raise HTTPException(409, "no failed/interrupted ticket with that id to retry")
     if not run.execution_id:
         raise HTTPException(409, "no execution id recorded for this ticket — nothing to resume from")
+    block = _quota_cooldown_block(run.final_status, run.finished_at, force)
+    if block:
+        raise HTTPException(409, block)
 
     args = ["--resume", run.execution_id, "--log-level", batch.log_level]
     # "queued", not "running" — see resume_batch's own comment: _drive_process flips this to
@@ -916,14 +966,16 @@ async def delete_history_row(row_id: int) -> dict:
 
 
 @app.post("/history/{row_id}/retry")
-async def retry_history_ticket(row_id: int) -> dict:
+async def retry_history_ticket(row_id: int, force: bool = False) -> dict:
     """Retry a ticket from persisted History — the ONLY way to retry a failed/interrupted run once
     the monitor has restarted, since BATCHES/`_auto_batch` are in-memory only but this table
     survives. Creates a fresh single-ticket manual batch wrapping the same execution_id (a plain
     --resume checkpoint replay, same as /batches/{id}/tickets/{ticket}/retry) so the Live tab shows
     it exactly like any other manual batch. Defaults to "team" log level — the original batch's
     level isn't looked up here, matching this app's existing bias toward one simple default over
-    per-call config plumbing for a rarely-used recovery path."""
+    per-call config plumbing for a rarely-used recovery path.
+
+    `force=true` bypasses the quota-cooldown speed-bump below (I2 recurrence)."""
     row = store.get_ticket(row_id)
     if not row:
         raise HTTPException(404, "no history row with that id")
@@ -931,6 +983,9 @@ async def retry_history_ticket(row_id: int) -> dict:
         raise HTTPException(409, "only a failed/interrupted history entry can be retried")
     if not row["execution_id"]:
         raise HTTPException(409, "no execution id recorded for this ticket — nothing to resume from")
+    block = _quota_cooldown_block(row["final_status"], row["finished_at"], force)
+    if block:
+        raise HTTPException(409, block)
 
     # status="queued". started_at is inherited from the original row (a real past timestamp, not
     # "now") so the retried run's duration badge reflects the full original-to-completion span

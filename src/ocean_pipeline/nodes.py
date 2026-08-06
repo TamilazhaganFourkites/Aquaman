@@ -19,7 +19,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import agents, config, gitops, jira, schemas, telemetry
+from . import agents, config, gitops, jira, schemas, telemetry, ui
 from .state import OceanState
 
 
@@ -98,6 +98,67 @@ async def _acquire_sit_slot(execution_id: str) -> str:
 
 def _release_sit_slot(execution_id: str) -> None:
     fd = _SIT_SLOT_FDS.pop(execution_id, None)
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    finally:
+        fd.close()
+
+
+# ---- GAN concurrency slot (S2, run-monitoring-findings.md): a THIRD, separate cross-process
+# semaphore from the SIT/build slots above, gating qa_scenarios' GAN loop specifically — that loop
+# fans out up to 4 sub-agents/round for up to 3 rounds INSIDE one run_skill call, entirely inside the
+# skill's own agentic session (invisible to this control plane's Python), so it can't be metered the
+# way Docker memory is. Bounding it to config.MAX_CONCURRENT_GAN concurrent NODES machine-wide is a
+# coarse but effective proxy: at most that many tickets' GAN fan-outs run at once, instead of every
+# batch ticket's GAN racing every other's for the same local CPU/LLM concurrency and the shared
+# TestRail API. Same shape as the SIT slot (simpler than the build slot — no Docker headroom check
+# needed here, this isn't about container memory).
+_GAN_SLOT_FDS: dict = {}
+
+
+def _gan_slot_dir() -> Path:
+    d = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline")) / "gan-slots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _try_acquire_gan_slot(execution_id: str) -> bool:
+    """ONE non-blocking pass: grab a free GAN slot if any is free, else return False. Idempotent per
+    exec_id (a retry re-entering qa_scenarios keeps its existing slot)."""
+    if execution_id in _GAN_SLOT_FDS:
+        return True
+    n = max(1, config.MAX_CONCURRENT_GAN)
+    for i in range(n):
+        fd = open(_gan_slot_dir() / f"slot-{i}.lock", "w")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fd.close()
+            continue
+        _GAN_SLOT_FDS[execution_id] = fd
+        return True
+    return False
+
+
+async def _acquire_gan_slot(execution_id: str) -> str:
+    """Wait (INTERRUPTIBLY) for a free GAN slot, then hold it. Gives up after GAN_SLOT_WAIT_SECONDS
+    and proceeds anyway (a queue, not a crash — same philosophy as the SIT/build slots) so a wedged
+    holder can't deadlock a whole batch."""
+    if _try_acquire_gan_slot(execution_id):
+        return "held" if execution_id in _GAN_SLOT_FDS else "acquired"
+    deadline = time.monotonic() + max(0, config.GAN_SLOT_WAIT_SECONDS)
+    while True:
+        await asyncio.sleep(5.0)
+        if _try_acquire_gan_slot(execution_id):
+            return "acquired after waiting"
+        if time.monotonic() >= deadline:
+            return f"no free GAN slot after {config.GAN_SLOT_WAIT_SECONDS}s — proceeding anyway"
+
+
+def _release_gan_slot(execution_id: str) -> None:
+    fd = _GAN_SLOT_FDS.pop(execution_id, None)
     if fd is None:
         return
     try:
@@ -533,6 +594,43 @@ def _kill_proc_group(proc) -> None:
         pass
 
 
+async def _clone_for_prewarm(repo: str, worktree: Path) -> bool:
+    """I8: clone a repo's FIRST-EVER local checkout so prep_image gets a chance to pre-warm it,
+    instead of silently skipping (leaving the coder to eat a fully cold build alone later, with no
+    earlier opportunity to warm it). Best-effort and bounded — `gh repo clone` reuses whatever `gh`
+    auth is already set up elsewhere in this codebase (no manual token/URL construction needed).
+    True on success (worktree now has a `.git` dir AND `gh` reported a clean exit); False on any
+    failure — caller treats that exactly like today's existing "no checkout" skip, never raises.
+    A failed clone that got as far as creating `.git` (git does this before fetching any refs/
+    objects, so an auth/network failure partway through still leaves a `.git` skeleton behind) is
+    torn down on the way out -- otherwise the NEXT run's `worktree.exists() and not .git` guard
+    above would never trip (the broken `.git` is already there), the next attempt would try to
+    clone into a non-empty directory and fail immediately, and the broken checkout would persist
+    forever, silently reused as "warm" by every downstream station keyed on the same worktree path
+    (sync_local_checkout's researcher/SME/dep-resolver/reachability callers included)."""
+    if worktree.exists() and not (worktree / ".git").exists():
+        return False   # exists but isn't a git repo -- don't clone into/clobber an unknown directory
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "gh", "repo", "clone", repo, str(worktree),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=config.CLONE_PREWARM_TIMEOUT)
+        except asyncio.TimeoutError:
+            _kill_proc_group(proc)
+            shutil.rmtree(worktree, ignore_errors=True)
+            return False
+    except OSError:
+        shutil.rmtree(worktree, ignore_errors=True)
+        return False
+    if proc.returncode == 0 and (worktree / ".git").exists():
+        return True
+    shutil.rmtree(worktree, ignore_errors=True)
+    return False
+
+
 async def prep_image(state: OceanState) -> dict:
     """#2 latency: pre-build/cache the Ruby ocean Docker image CONCURRENTLY with sme_consult/
     dep_resolver, so it is hot before the coder (the ~32m station) and reachability need it -- moving
@@ -543,6 +641,11 @@ async def prep_image(state: OceanState) -> dict:
     ruby_image_cache, so a warm cache returns fast."""
     exec_id = state["execution_id"]
     telemetry.station_event(exec_id, 0.6, "start")
+    # E1 (run-monitoring-findings.md): this node does its own subprocess/Docker work directly and
+    # never calls run_agent/run_skill (the only other place that prints a "▶" header), so without
+    # this the monitor's last-seen station label goes stale for the ENTIRE image-build duration
+    # (observed 2+ stations / 4-7 min behind reality during a concurrent build).
+    ui.station_start("prep_image")
     target_repos = state.get("target_repos") or []
     # Build-slot capacity gate (only for Ruby/Docker tickets — a Go/Java-only ticket never even
     # attempts this): non-blocking single try, matching this function's own already-fallback-safe
@@ -564,7 +667,20 @@ async def prep_image(state: OceanState) -> dict:
             if not tool.exists():
                 results.append(f"{name}: skip (image-cache tool not found)"); continue
             if not (worktree / ".git").exists():
-                results.append(f"{name}: skip (no local checkout to build from)"); continue
+                # I8 (run-monitoring-findings-06af6088.md): a repo's FIRST-EVER touch on this
+                # machine has no checkout yet, so this used to just skip -- meaning prep_image
+                # structurally could NEVER pre-warm a first-time repo, and the coder later ate a
+                # fully cold, auth-requiring, >10-min build alone (the exact D6-violation/
+                # background-and-yield incident this finding traces). `sync_local_checkout`
+                # (gitops.py) deliberately does NOT clone a missing repo -- "the coder clones fresh
+                # into its own workspace" is its own documented contract, used by the read-only
+                # analysis stations (researcher/SME/dep-resolver/reachability) where a clone isn't
+                # this control plane's job. prep_image is different: its ENTIRE purpose is doing
+                # Docker work off the coder's critical path, so cloning here (once, best-effort,
+                # bounded) directly serves that purpose instead of leaving the coder to eat the
+                # full cold-checkout-then-cold-build cost with no earlier chance to warm it.
+                if not await _clone_for_prewarm(repo, worktree):
+                    results.append(f"{name}: skip (no local checkout, clone failed/unavailable)"); continue
             try:
                 env, has_token = _image_cache_env()
                 proc = await asyncio.create_subprocess_exec(
@@ -601,6 +717,7 @@ async def prep_container(state: OceanState) -> dict:
     or a start failure all leave container_ready=False and the stations use their own recipe."""
     exec_id = state["execution_id"]
     telemetry.station_event(exec_id, 3.5, "start")
+    ui.station_start("prep_container")   # E1 -- same reasoning as prep_image above
     ruby = next((r for r in (state.get("target_repos") or [])
                  if "docker" in (r.get("build_env") or "").lower() or (r.get("language") or "").lower() == "ruby"),
                 None)
@@ -706,12 +823,21 @@ async def dep_resolver(state: OceanState) -> dict:
     )
     telemetry.station_event(state["execution_id"], 1, "end", blocking=v.blocking)
     return {"dependency_report": {"report_path": v.report_path, "notes": v.notes},
-            "dependency_blocking": v.blocking}
+            "dependency_blocking": v.blocking,
+            "has_reachability_claims": v.has_reachability_claims}
 
 
 # ------------------------------------------------------------------ Station 1.5
 async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
+    # E2 (run-monitoring-findings.md): dep_resolver's own claim of whether it made any
+    # ALREADY_MET/PARTIALLY_MET/reuse/reachable claim this run. .get(..., True) so an older/unset
+    # value (or a resumed checkpoint predating this field) always defaults to running the gate --
+    # this must never silently skip a real check just because the signal wasn't present.
+    if not state.get("has_reachability_claims", True):
+        telemetry.station_event(state["execution_id"], 1.5, "skip",
+                                reason="dep_resolver made zero reachability claims -- nothing to verify")
+        return {"reachability_report": {}, "reachability_blocking": False}
     # Same build-slot gate as coder/harsh_reviewer — defensive here specifically: reachability's own
     # Docker usage (a fallback ruby_image_cache.py call in reachability.md) isn't confirmed wired to
     # _container_directive today, so this errs toward protecting it; can be removed later if a
@@ -740,6 +866,23 @@ async def reachability_gate(state: OceanState) -> dict:
 
 
 # ------------------------------------------------------------------ 1.6 — GAN-hardened test scenarios (MM-14738)
+def _gan_verdict(partial: dict) -> str:
+    """I7 (run-monitoring-findings-06af6088.md): the GAN verdict contract is unenforced prose, and
+    two real runs in the SAME batch persisted it in different shapes — one top-level
+    (`{"qa_gan_verdict": "REJECT"}`), one nested (`{"qa_gan": {"qa_gan_verdict": "REJECT"}}`, no
+    top-level key at all). A bare `partial.get("qa_gan_verdict", "")` silently returns "" for the
+    nested shape, dropping a genuine REJECT + open HIGH gap into state as if it never happened.
+    Tolerate both shapes; top-level wins if somehow both are present (it's the documented/primary
+    contract). A malformed `qa_gan` (e.g. a bare string instead of the nested-object shape) must
+    fall back to "" rather than raise -- an agent emitting a third, unanticipated shape should
+    degrade the verdict, not crash the node."""
+    top = partial.get("qa_gan_verdict")
+    if top:
+        return top
+    nested = partial.get("qa_gan")
+    return nested.get("qa_gan_verdict", "") if isinstance(nested, dict) else ""
+
+
 async def qa_scenarios(state: OceanState) -> dict:
     """Design + GAN-harden the SIT test scenarios BEFORE any code exists (skill Station-independent —
     calls `ocean-qa-agent` directly, not `ocean-automation-testing`, since that skill's own contract
@@ -755,37 +898,68 @@ async def qa_scenarios(state: OceanState) -> dict:
         scenarios_path.unlink()  # fresh attempt -- don't let a stale prior-attempt file fool the
                                   # verdict_path retry-guard below into thinking THIS attempt already
                                   # succeeded (same pattern as sit_resolve's automation_verdict_path).
-    # MM-14793 (GAN A1): clear any stale per-round GAN progress sidecar left by a PRIOR run for this
-    # ticket, so Step 5d resumes only against THIS run's rounds. This entry unlink runs ONCE, before
-    # run_skill -- run_skill's internal drive-retries re-enter Step 5d and legitimately resume from the
-    # sidecar the aborted drive wrote during THIS node entry; only a cross-run leftover is cleared here.
+    # MM-14793 (GAN A1): clear any stale per-round GAN progress sidecar left by a PRIOR, UNRELATED
+    # run for this ticket, so Step 5d resumes only against THIS run's rounds. But an unconditional
+    # unlink here also destroys a genuinely resumable sidecar: a real abort+retry (e.g. EXE-a43959ff's
+    # spend-limit abort mid-round-3) re-enters this SAME node on a FRESH process (`--resume EXE-...`)
+    # with the SAME execution_id -- from this node's perspective that's indistinguishable from any
+    # other "entry into qa_scenarios" unless the sidecar itself says whose run it belongs to (I3,
+    # run-monitoring-findings.md: the driver had no positive signal to trust its OWN sidecar, so it
+    # safely defaulted to fresh and threw away ~2 completed GAN rounds). Fix: only unlink when the
+    # sidecar's stored execution_id does NOT match this run's -- a same-run sidecar (this run's own
+    # aborted attempt) is left in place for Step 5d's resume check to find and trust.
     gan_progress_path = scenarios_path.with_name(scenarios_path.stem + "-gan-progress.json")
     if gan_progress_path.exists():
-        gan_progress_path.unlink()
-    await agents.run_skill(
-        skill_name="ocean-qa-agent",
-        node="qa_scenarios",
-        ticket_id=tid,
-        task_prompt=(
-            f"Run /ocean-qa-agent {tid} --scenarios-only --no-review, HEADLESS. No code or PR exists "
-            f"yet for this ticket -- design the test scenarios from the ticket's ACs ALONE (Steps "
-            f"1-2d, 5, 5b, 5d -- Step 2e is disabled, skip it), GAN-harden them (Step 5d test-case "
-            f"GAN), and persist the hardened scenario list + qa_gan_verdict to {scenarios_path}. "
-            f"**Phase 1 is AC-ONLY — read NO code and NO automation-testing files** (MM-14132/"
-            f"EXE-44302b71): do NOT run Step 3/3b (PR/diff search — none exists yet) AND do NOT run "
-            f"Step 4/4a (sibling-test / helper-file reading) — the sibling-test conventions are applied "
-            f"later in sit_author when the pytest is actually WRITTEN (`--use-scenarios` runs Step "
-            f"3/3b/4/4a for real then). Do NOT write a pytest file (Step 7) here either.\n\n{_summary(state)}\n\n"
-            f"Reachability report (for AC/behavior context):\n{_brief(state.get('reachability_report'), limit=8000)}\n\n"
-            f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}"
-        ),
-        verdict_path=scenarios_path,  # EXE-2755f777: a transient post-success error must not blindly
-                                       # redrive this whole (expensive, multi-step) invocation from scratch
-    )
+        try:
+            sidecar_data = json.loads(gan_progress_path.read_text())
+            # SKILL.md's Step 5d instruction specifies a single JSON OBJECT (not a bare array) --
+            # but this is LLM-followed prose, not an enforced schema, so a non-compliant agent could
+            # still write something else (e.g. a bare list). Guard the .get() call itself rather than
+            # assume the shape, so an unexpected type degrades to "no match" instead of an AttributeError
+            # crashing the node on exactly the abort+retry re-entry this fix targets.
+            sidecar_exec_id = sidecar_data.get("execution_id") if isinstance(sidecar_data, dict) else None
+        except (json.JSONDecodeError, OSError):
+            sidecar_exec_id = None   # corrupt/partial (a crash mid-write) -- treat as no match, same
+                                     # safe-default-to-fresh behavior as the old unconditional unlink
+        if sidecar_exec_id != exec_id:
+            gan_progress_path.unlink()
+    # S2 (run-monitoring-findings.md): serialize the GAN loop machine-wide (config.MAX_CONCURRENT_GAN)
+    # so a batch's tickets don't all fan out 4 sub-agents/round at once and contend for local CPU/LLM
+    # concurrency (and the shared TestRail API downstream). Mandatory/waiting acquisition -- this node
+    # must run, it just may queue briefly first (same posture as coder/harsh_reviewer's build-slot wait).
+    gan_slot = await _acquire_gan_slot(exec_id)
+    telemetry.station_event(exec_id, 1.6, "gan_slot", gan_slot=gan_slot)
+    try:
+        await agents.run_skill(
+            skill_name="ocean-qa-agent",
+            node="qa_scenarios",
+            ticket_id=tid,
+            task_prompt=(
+                f"Run /ocean-qa-agent {tid} --scenarios-only --no-review, HEADLESS. This run's "
+                f"execution_id is {exec_id} -- stamp it into the Step 5d per-round GAN progress sidecar "
+                f"(see SKILL.md's sidecar write instruction) so a resumed process can verify it's "
+                f"resuming ITS OWN aborted run, not trusting a stale one (I3, MM-14793). No code or PR "
+                f"exists yet for this ticket -- design the test scenarios from the ticket's ACs ALONE (Steps "
+                f"1-2d, 5, 5b, 5d -- Step 2e is disabled, skip it), GAN-harden them (Step 5d test-case "
+                f"GAN), and persist the hardened scenario list + qa_gan_verdict to {scenarios_path}. "
+                f"**Phase 1 is AC-ONLY — read NO code and NO automation-testing files** (MM-14132/"
+                f"EXE-44302b71): do NOT run Step 3/3b (PR/diff search — none exists yet) AND do NOT run "
+                f"Step 4/4a (sibling-test / helper-file reading) — the sibling-test conventions are applied "
+                f"later in sit_author when the pytest is actually WRITTEN (`--use-scenarios` runs Step "
+                f"3/3b/4/4a for real then). Do NOT write a pytest file (Step 7) here either.\n\n{_summary(state)}\n\n"
+                f"Reachability report (for AC/behavior context):\n{_brief(state.get('reachability_report'), limit=8000)}\n\n"
+                f"Ocean SME ownership/reuse guidance:\n{_brief(state.get('sme_findings'))}"
+            ),
+            verdict_path=scenarios_path,  # EXE-2755f777: a transient post-success error must not blindly
+                                           # redrive this whole (expensive, multi-step) invocation from scratch
+        )
+    finally:
+        _release_gan_slot(exec_id)
     partial = _load_json(str(scenarios_path))
-    telemetry.station_event(exec_id, 1.6, "end", qa_gan_verdict=partial.get("qa_gan_verdict", ""))
+    gan_verdict = _gan_verdict(partial)
+    telemetry.station_event(exec_id, 1.6, "end", qa_gan_verdict=gan_verdict)
     return {"qa_scenarios_path": str(scenarios_path),
-            "qa_gan_verdict": partial.get("qa_gan_verdict", ""),
+            "qa_gan_verdict": gan_verdict,
             "qa_gan_phase0_gaps": partial.get("qa_gan_phase0_gaps", [])}
 
 
