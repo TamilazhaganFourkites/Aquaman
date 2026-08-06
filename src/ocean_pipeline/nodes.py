@@ -823,21 +823,18 @@ async def dep_resolver(state: OceanState) -> dict:
     )
     telemetry.station_event(state["execution_id"], 1, "end", blocking=v.blocking)
     return {"dependency_report": {"report_path": v.report_path, "notes": v.notes},
-            "dependency_blocking": v.blocking,
-            "has_reachability_claims": v.has_reachability_claims}
+            "dependency_blocking": v.blocking}
 
 
 # ------------------------------------------------------------------ Station 1.5
 async def reachability_gate(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 1.5, "start")
-    # E2 (run-monitoring-findings.md): dep_resolver's own claim of whether it made any
-    # ALREADY_MET/PARTIALLY_MET/reuse/reachable claim this run. .get(..., True) so an older/unset
-    # value (or a resumed checkpoint predating this field) always defaults to running the gate --
-    # this must never silently skip a real check just because the signal wasn't present.
-    if not state.get("has_reachability_claims", True):
-        telemetry.station_event(state["execution_id"], 1.5, "skip",
-                                reason="dep_resolver made zero reachability claims -- nothing to verify")
-        return {"reachability_report": {}, "reachability_blocking": False}
+    # NOTE: an earlier "skip the gate when dep_resolver made zero reachability claims"
+    # optimization (has_reachability_claims) was REMOVED (MM-14816) -- its skip signal covered only
+    # 4 of the gate's 5 verification categories (it omitted "build-new-mechanism" self-solves and
+    # "blocked" classifications), so it could skip a legitimate check; the saving fired only on rare
+    # claim-less tickets. The gate is a safety check -- always run it. On a genuinely claim-less
+    # ticket it verifies nothing and passes cheaply, which is the correct, fail-safe behavior.
     # Same build-slot gate as coder/harsh_reviewer — defensive here specifically: reachability's own
     # Docker usage (a fallback ruby_image_cache.py call in reachability.md) isn't confirmed wired to
     # _container_directive today, so this errs toward protecting it; can be removed later if a
