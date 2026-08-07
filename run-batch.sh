@@ -64,7 +64,10 @@ for t in "${tickets[@]}"; do
   echo "    live:  tail -f $log"
   start="$(date +%s)"
   if [[ -n "${CONTEXT:-}" ]]; then
-    ocean-pipeline "$t" --context "$CONTEXT" >"$log" 2>&1
+    # `--context=<value>`, one argv element — the same fix monitor/app.py carries. As a separate
+    # argument, a CONTEXT that argparse reads as an option string (e.g. "--strict-unmocked")
+    # dies with `expected one argument` and the ticket never launches.
+    ocean-pipeline "$t" --context="$CONTEXT" >"$log" 2>&1
   else
     ocean-pipeline "$t" >"$log" 2>&1
   fi

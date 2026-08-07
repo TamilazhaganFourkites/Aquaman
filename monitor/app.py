@@ -535,7 +535,13 @@ async def _run_batch_from(batch: Batch, start: int) -> None:
         run = batch.tickets[i]
         args = [run.ticket, "--log-level", batch.log_level]
         if run.context:
-            args += ["--context", run.context]
+            # `--context=<value>` (single argv element), NOT `--context <value>`. As a SEPARATE
+            # argument, a value argparse recognizes as an option string dies with
+            # `expected one argument` and the ticket never launches — e.g. a bare "--strict-unmocked".
+            # (argparse does accept a `--`-prefixed value CONTAINING a space, so the failure is
+            # narrower than first described; the `=` form removes the class entirely.) A single
+            # leading `-` was always fine.
+            args += [f"--context={run.context}"]
         asyncio.create_task(_drive_process(run, args, batch.env_overrides, batch=batch))
     # Informational only now (no control-flow decision reads it) — "every ticket in this
     # batch has been dispatched," not "which one is currently active" (that concept no
