@@ -1,0 +1,30 @@
+# F5 routing/domain-bucket eval corpus (SEED). Ground truth for `scripts/eval_routing.py`.
+# `route` is required + always scored. `domain_bucket` is scored ONLY for coding tickets with a
+# NON-EMPTY, VERIFIED bucket — leave it "" when unverified (route-only scoring) rather than guess:
+# a wrong ground-truth label poisons the eval worse than an unscored one.
+#
+# STATUS OF THESE ROWS (checked against live Jira, 2026-08-07). An earlier version of this header
+# said "Each row = one closed MM ticket". That was false: only MM-14065 and MM-13527 are closed, and
+# they are exactly the two `rca` rows — every `coding` row below is Open or In-Dev. The claim
+# mattered because the harness leaned on it to argue the replay was blind.
+#
+# LEAKAGE, and why the harness now scrubs its input. 7 of the 7 `coding` rows have OPEN PRs whose
+# titles name both the target repo and the domain; 0 of the 2 `rca` rows have any. "Does a PR exist
+# for this ticket?" is therefore a near-perfect route oracle over this corpus — and research.md
+# MANDATES the `gh pr list --search "<TICKET>"` that would find them. Several of those PRs were
+# authored by this pipeline itself. eval_routing.py now replays from title+description only, with the
+# worker's tools reduced to Write, so none of that is reachable. Keep it that way: adding a row does
+# NOT require the ticket to be closed, but the harness must never be given a live ticket id to look up.
+#
+# EXPAND THIS to ~30 tickets with human-verified labels before trusting the accuracy number (the
+# architecture review's target sample). 9 rows is a seed, not a baseline — and note only 4 of them
+# carry a verified domain_bucket, so bucket accuracy is currently computed over 4 tickets.
+{"ticket_id": "MM-14312", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
+{"ticket_id": "MM-14381", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
+{"ticket_id": "MM-14132", "route": "coding", "domain_bucket": "callback_notification"}
+{"ticket_id": "MM-13446", "route": "coding", "domain_bucket": "callback_notification"}
+{"ticket_id": "MM-14475", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14457", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14060", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14065", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-13527", "route": "rca", "domain_bucket": ""}

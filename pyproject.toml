@@ -1,0 +1,29 @@
+[project]
+name = "ocean-pipeline"
+version = "0.1.0"
+description = "MM-14615: LangGraph orchestrator for the Ocean/MM (isbu) lean manufacturing pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2.0",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    "aiosqlite>=0.20.0",          # AsyncSqliteSaver backend (async graph -> async checkpointer)
+    "claude-agent-sdk>=0.1.0",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+studio = ["langgraph-cli[inmem]>=0.1.55"]   # `langgraph dev` -> LangGraph Studio UI
+langfuse = ["langfuse>=2.53", "langchain>=0.3"]   # self-hosted tracing UI (langfuse.fourkites.com); handler needs langchain
+telemetry = ["mcp>=1.0"]   # aidev-db HTTP MCP client (usually already present via claude-agent-sdk)
+
+[project.scripts]
+ocean-pipeline = "ocean_pipeline.cli:main"
+ocean-pipeline-qa-batch = "ocean_pipeline.qa_batch:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocean_pipeline"]
