@@ -92,3 +92,55 @@ def comment_once(ticket_id: str, body: str, marker: str) -> None:
         if DEBUG:
             print(f"[jira] comment_once existence-check failed ({type(e).__name__}); posting anyway")
     comment(ticket_id, body)
+
+
+def issue_text(ticket_id: str) -> tuple:
+    """Return (summary, description) for a ticket — nothing else. Returns ("", "") when Jira is not
+    configured or the fetch fails; never raises.
+
+    This is the routing EVAL's input scrubber (F5). The eval's "BLIND replay" claim was false: it
+    drove the full live researcher against a bare ticket id, and research.md MANDATES reading the
+    ticket's comment thread (G8), searching every target repo for the ticket's PRs (G19), and reading
+    linked tickets (G21). A review found 7 of 7 `coding` rows in the corpus have open PRs whose titles
+    name the repo and domain, while 0 of 2 `rca` rows do — so "does a PR exist for this ticket?" was a
+    near-perfect route oracle, one MANDATORY command away. Worse, several of those PRs were authored
+    by this very pipeline, so the eval was grading a researcher on tickets the same system had already
+    solved and pushed.
+
+    Requesting ONLY `summary,description` from the REST API is the fix, and it restores the precedent
+    the eval's own docstring cites: ocean-rca's 69.4% -> 98.4% benchmark was explicitly
+    title-plus-description-only. `fields=` is enforced server-side, so unlike a prompt instruction it
+    cannot be talked around."""
+    if not _enabled() or not ticket_id:
+        return "", ""
+    try:
+        # RELATIVE path — `_req` already prefixes `/rest/api/2/`. Passing an absolute `/rest/api/3/...`
+        # built `.../rest/api/2//rest/api/3/issue/...`, a hard 404 on every ticket; `issue_text` then
+        # swallowed it, returned ("",""), and every row became `__error__` without run_agent ever
+        # being called — the entire eval fix was inert (judge review caught it).
+        data = _req("GET", f"issue/{ticket_id}?fields=summary,description")
+    except Exception:  # noqa: BLE001 — the eval reports the miss; it must never crash on one ticket
+        return "", ""
+    fields = (data or {}).get("fields") or {}
+    desc = fields.get("description")
+    # api/2 returns `description` as a wiki-markup STRING; api/3 would return Atlassian Document
+    # Format. `_req` is pinned to api/2, so the string branch is the live one — the ADF flattener
+    # below only runs if that pin ever moves, and is kept so this doesn't silently return "{}".
+    if isinstance(desc, dict):          # Atlassian Document Format -> flatten to plain text
+        out: list[str] = []
+
+        def _walk(node):
+            if isinstance(node, dict):
+                if node.get("type") == "text" and isinstance(node.get("text"), str):
+                    out.append(node["text"])
+                for child in (node.get("content") or []):
+                    _walk(child)
+                if node.get("type") in ("paragraph", "heading", "listItem"):
+                    out.append("\n")
+            elif isinstance(node, list):
+                for child in node:
+                    _walk(child)
+
+        _walk(desc)
+        desc = "".join(out)
+    return str(fields.get("summary") or ""), str(desc or "")

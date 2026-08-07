@@ -969,8 +969,18 @@ async def run_agent(
     cwd: Path | None = None,
     permission_mode: str | None = None,
     model: str | None = None,   # F7: override the model for this node (e.g. JUDGE_MODEL for harsh_reviewer)
+    allowed_tools: list[str] | None = None,
 ) -> T:
-    """Run one agents/pipeline/fk-*.md worker for a single node and return its validated verdict."""
+    """Run one agents/pipeline/fk-*.md worker for a single node and return its validated verdict.
+
+    `allowed_tools` OVERRIDES the worker's own frontmatter allowlist. Normal stations must not pass it
+    -- restricting a station's capabilities only starves it (see CLAUDE.md, "capabilities are
+    ambient"). It exists for the routing EVAL, which has the opposite requirement: the eval must
+    prevent the researcher from reaching context a real run legitimately wants. research.md MANDATES
+    reading the ticket's comment thread (G8), searching each repo for the ticket's PRs (G19), and
+    reading linked tickets (G21) -- so an eval that hands it a bare ticket id is not blind, and a
+    prompt asking it not to do those things would be prompt-versus-prompt against its own MANDATORY
+    rules. Removing the tools is the only version of that restriction that actually holds."""
     verdict_path = config.artifacts_dir(execution_id) / f"{node}.verdict.json"
     if verdict_path.exists():
         verdict_path.unlink()
@@ -988,7 +998,8 @@ async def run_agent(
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
             permission_mode=permission_mode or config.STATION_PERMISSION_MODE,
             label=node,
-            allowed_tools=_ensure_verdict_tool_allowed(_frontmatter_tools(path)),
+            allowed_tools=_ensure_verdict_tool_allowed(
+                allowed_tools if allowed_tools is not None else _frontmatter_tools(path)),
             verdict_path=verdict_path,
             model=model,
         )

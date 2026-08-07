@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
 """F5 (Aquaman architecture review): routing / domain-bucket eval harness.
 
-Replays closed tickets BLIND through the `researcher` station and scores its route +
-domain_bucket against a ground-truth corpus. This is the measurement the architecture
-review flags as the prerequisite for trusting F1-F7 (or ANY prompt/model change): without
-a routing-accuracy baseline you cannot tell whether a change improved outcomes or just
-moved them around. (ocean-rca did exactly this — 69.4% -> 98.4% — once it had the harness.)
+Scores the `researcher` station's route + domain_bucket against a ground-truth corpus, replaying
+each ticket from its TITLE AND DESCRIPTION ONLY. This is the measurement the architecture review
+flags as the prerequisite for trusting F1-F7 (or ANY prompt/model change): without a routing-accuracy
+baseline you cannot tell whether a change improved outcomes or just moved them around. (ocean-rca did
+exactly this — 69.4% -> 98.4% — once it had the harness, and it scored on title+description too.)
 
-The researcher is READ-ONLY (it queries Jira/GitHub and classifies; it never codes, opens
-PRs, or mutates state), so replaying it has no side effects beyond its own artifacts dir.
+WHAT "BLIND" MEANS HERE, and what it did not mean before. This header used to claim it "replays
+CLOSED tickets BLIND". Both halves were false, and a review demonstrated it:
+  * NOT closed — only 2 of the 9 corpus tickets are closed, and they are exactly the two `rca` rows;
+    every `coding` row is Open or In-Dev.
+  * NOT blind — it drove the full live researcher against a bare ticket id, and research.md MANDATES
+    reading the comment thread (G8), `gh pr list --search "<TICKET>"` per repo (G19), and linked
+    tickets (G21). 7/7 coding rows have open PRs naming repo and domain; 0/2 rca rows do — so PR
+    existence alone was a near-perfect route oracle. Several of those PRs were authored by THIS
+    pipeline, so it was grading a researcher on tickets the system had already solved.
+Blindness is now enforced structurally, not requested: `jira.issue_text` fetches only
+`fields=summary,description` (server-side), and the worker runs with `allowed_tools=["Write"]` so the
+mandated lookups are not available to perform. See `_predict` for the full reasoning.
+
+The researcher classifies and never codes, opens PRs, or mutates state, so replaying it has no side
+effects beyond its own artifacts dir.
 
 Corpus format — JSONL, one object per line (``#`` lines and blanks ignored):
     {"ticket_id": "MM-14312", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
@@ -34,12 +47,35 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from ocean_pipeline import agents, schemas  # noqa: E402
+from ocean_pipeline import agents, jira, schemas  # noqa: E402
 
 
 async def _predict(ticket_id: str) -> tuple[str, str]:
-    """Drive ONLY the researcher for one ticket; return (route, domain_bucket).
-    Any failure is surfaced as route='__error__' so one bad ticket never sinks the whole eval."""
+    """Classify ONE ticket from its title + description ONLY; return (route, domain_bucket).
+    Any failure is surfaced as route='__error__' so one bad ticket never sinks the whole eval.
+
+    BLINDNESS — the reason this does not just pass a ticket id. A review established that the earlier
+    version was not blind at all: it drove the full live researcher against a bare id, and
+    research.md MANDATES reading the ticket's comment thread (G8), running
+    `gh pr list --search "<TICKET>"` on every target repo (G19), and reading linked tickets (G21).
+    Measured over this corpus, 7/7 `coding` rows have open PRs whose titles name the repo and the
+    domain; 0/2 `rca` rows have any. "Does a PR exist for this ticket?" was therefore a near-perfect
+    route oracle, one MANDATORY command away — and several of those PRs were authored by this very
+    pipeline, so the eval was grading a researcher on tickets the same system had already solved.
+
+    Two mechanisms make it blind, and neither is a request to behave:
+      1. the INPUT is the scrubbed title+description fetched by `jira.issue_text` (server-side
+         `fields=summary,description`), not a live id to look up;
+      2. the TOOLS are reduced to Write only, so the mandated `gh`/comment/linked-ticket lookups are
+         not available to perform. A prompt asking the worker to skip them would be
+         prompt-versus-prompt against its own MANDATORY rules; removing the tools actually holds.
+    This also restores the precedent this script's own header cites — ocean-rca's 69.4% -> 98.4%
+    benchmark was explicitly title-plus-description-only."""
+    summary, description = jira.issue_text(ticket_id)
+    if not summary and not description:
+        # No text = nothing to classify blind. Report it rather than silently falling back to a live
+        # lookup, which is exactly the leak this function exists to close.
+        return "__error__", "could not fetch title/description (JIRA_API_TOKEN set?)"
     try:
         v: schemas.ResearchVerdict = await agents.run_agent(
             agent_md="research.md",
@@ -47,11 +83,18 @@ async def _predict(ticket_id: str) -> tuple[str, str]:
             ticket_id=ticket_id,
             execution_id=f"EVAL-{ticket_id}",
             task_prompt=(
-                f"Research {ticket_id} and classify its route + domain_bucket ONLY. This is a "
-                f"routing-accuracy EVALUATION replay — do NOT code, open PRs, or take any action; "
-                f"produce the ResearchVerdict (route, domain_bucket, target_repos) and stop."
+                f"Classify the route + domain_bucket for the ocean ticket below.\n\n"
+                f"This is a BLIND routing-accuracy evaluation. The ticket's title and description are "
+                f"the ONLY inputs — you have no tools for looking anything else up, by design. Do not "
+                f"attempt to read its comments, its linked tickets, or any repo/PR/branch: a real "
+                f"run's resolution context would tell you the answer instead of testing whether you "
+                f"can derive it. Classify from the text, then write the ResearchVerdict "
+                f"(route, domain_bucket, target_repos) and stop. Leave target_repos empty if the text "
+                f"does not name a repo; do not guess one to look complete.\n\n"
+                f"--- TITLE ---\n{summary}\n\n--- DESCRIPTION ---\n{description[:12000]}"
             ),
             verdict_model=schemas.ResearchVerdict,
+            allowed_tools=["Write"],
         )
         return v.route, (v.domain_bucket or "")
     except Exception as e:  # noqa: BLE001 — record the error as a miss, keep going
@@ -102,8 +145,28 @@ async def main() -> int:
     ap.add_argument("--out", default="", help="write the full JSON report (summary + per-ticket) here")
     args = ap.parse_args()
 
-    rows = [json.loads(ln) for ln in Path(args.corpus).read_text().splitlines()
-            if ln.strip() and not ln.lstrip().startswith("#")]
+    # Per-row parse guard. `_predict` is carefully hardened so one bad TICKET never sinks the eval,
+    # but this loader was a bare comprehension 47 lines below it — one malformed JSONL row raised
+    # JSONDecodeError and killed the whole run before a single ticket was scored (reproduced in
+    # review). A bad row is skipped loudly and counted, never silently dropped.
+    rows, bad_rows = [], []
+    for n, ln in enumerate(Path(args.corpus).read_text().splitlines(), start=1):
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        try:
+            row = json.loads(ln)
+        except json.JSONDecodeError as e:
+            bad_rows.append((n, str(e)))
+            continue
+        if not isinstance(row, dict) or not row.get("ticket_id"):
+            bad_rows.append((n, "row is not an object with a ticket_id"))
+            continue
+        rows.append(row)
+    for n, why in bad_rows:
+        print(f"corpus line {n}: SKIPPED — {why}", file=sys.stderr)
+    if bad_rows:
+        print(f"corpus: {len(bad_rows)} unparseable row(s) skipped, {len(rows)} scored — the accuracy "
+              f"below is over the {len(rows)} rows that parsed, NOT the whole corpus", file=sys.stderr)
     if args.limit:
         rows = rows[:args.limit]
     if not rows:
