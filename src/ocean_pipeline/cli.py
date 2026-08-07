@@ -34,7 +34,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from . import config, metrics, report, telemetry, tracing, ui
 from .graph import build_graph, compile_app
-from .nodes import _release_build_slot, _release_sit_slot
+from .nodes import _release_build_slot, _release_gan_slot, _release_sit_slot
 from .state import OceanState
 
 # Loops (review x code_fault) can chain well past LangGraph's default of 25 node
@@ -321,10 +321,23 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
                 print(f"[DONE] {ticket_id} status={final.get('final_status') or 'completed'}"
                       + (f" pr=#{pr}" if pr else ""))
     except Exception as e:  # noqa: BLE001 — never leave a `running` row orphaned (AP-223)
-        telemetry.execution_end(execution_id, ticket_id, "failed", "unknown",
+        # MM-14793 (I2): a StationError tagged quota_exhausted (agents.py's _is_quota_error) means
+        # the org's Claude Code spend pool ran dry, not a real code/env/transport failure —
+        # run-monitoring-findings.md's I2 asked this be classified distinctly rather than
+        # collapsing into the same generic "failed" every other exception produces, so a human
+        # (or the monitor) doesn't chase it as a phantom pipeline defect.
+        quota_exhausted = getattr(e, "quota_exhausted", False)
+        final_status = "quota_exhausted" if quota_exhausted else "failed"
+        telemetry.execution_end(execution_id, ticket_id, final_status, "unknown",
                                 final_outcome=f"{type(e).__name__}: {e}")
-        print(f"\n[FAILED] {type(e).__name__}: {e}")
-        final = {**final, "final_status": final.get("final_status") or "failed",
+        if quota_exhausted:
+            # Distinct marker (monitor/app.py's _QUOTA_RE) — never collapsed into [FAILED], so the
+            # monitor can surface it separately and auto-pause further auto-queue dispatch instead
+            # of burning more work into the same dry pool (see monitor/app.py's handling).
+            print(f"\n[QUOTA_EXHAUSTED] {ticket_id} {type(e).__name__}: {e}")
+        else:
+            print(f"\n[FAILED] {type(e).__name__}: {e}")
+        final = {**final, "final_status": final.get("final_status") or final_status,
                  "final_outcome": final.get("final_outcome") or f"{type(e).__name__}: {e}"}
         raise
     finally:
@@ -356,6 +369,9 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
                 # teardown_container runs) must still free it on process exit. Safe/no-op if this
                 # execution never held one.
                 _release_build_slot(execution_id)
+                # S2: same backstop for the GAN slot — a crash mid-qa_scenarios (before its own
+                # `finally` runs) must still free it. Safe/no-op if this execution never held one.
+                _release_gan_slot(execution_id)
         except Exception:
             pass
         if handler is not None:
