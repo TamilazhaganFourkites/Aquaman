@@ -38,11 +38,24 @@ from .state import OceanState
 
 def _qa_batch_finish(state: OceanState) -> dict:
     """Terminal node for THIS subgraph only — batch mode never flips a PR, unlike the main graph's
-    flip_ready. A 'passed' ticket here just means local testing is green; ready-for-review is a
-    decision for a full `ocean-pipeline <ticket>` run or an engineer, not this unattended sweep."""
+    flip_ready. A `final_status: "completed"` here means local testing is green AND at real fidelity
+    (fidelity_rung >= 1, not just a trivial-green Rung 0 — see the check below); ready-for-review is
+    still a decision for a full `ocean-pipeline <ticket>` run or an engineer, not this unattended
+    sweep, regardless of rung."""
     result = state.get("automation_result", "failed")
     fc = state.get("failure_class", "")
-    if result == "passed":
+    # Finding 2c (whole-diff judge review): the main graph's after_sit_triage refuses to treat a
+    # Rung-0 "trivial green" (schemas.AutomationVerdict.fidelity_rung — the SUT never really got
+    # exercised) as a genuine pass. This subgraph reuses the SAME sit_triage node and therefore sees
+    # the identical verdict, but was computing its own "completed"/sit_passed" outcome independently
+    # -- without this check, the exact false-confidence scenario this fix exists to prevent (a
+    # trivial-green pass reading as a clean re-verification) would report as "completed" here even
+    # though the main graph would stop for human review on the SAME verdict. qa-batch mode never
+    # flips a PR either way, but the summary must still tell a human this wasn't a real re-check.
+    trivial_green = result == "passed" and state.get("fidelity_rung", 0) == 0
+    if trivial_green:
+        outcome = "sit_unverified: trivial_green_no_signal (qa-batch mode: SIT passed but proved nothing -- needs a human look, not a clean re-verification)"
+    elif result == "passed":
         outcome = "sit_passed (qa-batch mode: not flipped; re-run the full pipeline or flip by hand)"
     elif fc == "code_fault":
         outcome = "code_fault: needs a coder re-run (`ocean-pipeline <ticket>`) — not fixable in qa-batch mode"
@@ -50,7 +63,8 @@ def _qa_batch_finish(state: OceanState) -> dict:
         outcome = "repo_onboarding_exhausted"
     else:
         outcome = fc or "sit_failed"
-    return {"final_status": "completed" if result == "passed" else "failed", "final_outcome": outcome}
+    passed = result == "passed" and not trivial_green
+    return {"final_status": "completed" if passed else "failed", "final_outcome": outcome}
 
 
 def build_qa_subgraph():

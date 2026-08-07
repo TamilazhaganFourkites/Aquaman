@@ -139,6 +139,14 @@ def after_qa_review(state: OceanState):
 
 def after_sit_triage(state: OceanState) -> str:
     if state.get("automation_result") == "passed":
+        # Finding 2c (architecture review of PR Aquaman#4/fk-aideveloper#294): a Rung-0 "trivial
+        # green" pass (schemas.AutomationVerdict.fidelity_rung — the SUT errored before ever touching
+        # the receiving service, so the assertion held by inaction, not by real signal) must not
+        # silently reach flip_ready the same way a genuine pass does. Route it through stop_run
+        # instead, same as could_not_verify: left in draft, needs a human, never looped/retried (a
+        # fidelity problem isn't something retrying the SAME mock-first run would fix).
+        if state.get("fidelity_rung", 0) == 0:
+            return "stop"
         return "pass"
     # failed:
     # A late-surfaced unsupported repo the graph can onboard, then re-run Station 6 (capped).

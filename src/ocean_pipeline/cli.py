@@ -262,6 +262,12 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
     # (EXE-0417bc97's whole-disk grep) was only diagnosable by external forensics because nothing was
     # logged; a per-station log makes the worker's last action visible in ~1s.
     os.environ["OCEAN_PIPELINE_EXEC_ID"] = execution_id
+    # Finding 2a: also export the artifacts ROOT, so a tool a worker launches (notably
+    # ocean_mock_helper.py, which defaults its unmocked-path audit file to
+    # <ARTIFACTS>/<EXEC_ID>/unmocked_paths.json) lands it exactly where this control plane looks for
+    # it. A judge review found exporting only EXEC_ID left that default resolving to "" whenever the
+    # operator hadn't set ARTIFACTS themselves, silently disabling the audit.
+    os.environ["OCEAN_PIPELINE_ARTIFACTS"] = str(config.ARTIFACTS_ROOT)
     report.start(ticket_id, execution_id)
     out_dir = config.artifacts_dir(execution_id)
     handler = tracing.callback_handler()   # self-hosted Langfuse, or None if unconfigured

@@ -94,6 +94,21 @@ def _fmt_elapsed(sec: float) -> str:
     return f"{m}m {s:02d}s" if m else f"{s}s"
 
 
+def _safe_rung(upd: dict) -> int:
+    """This display layer must never crash a run over a malformed value -- unlike
+    schemas.AutomationVerdict's own `_coerce_fidelity_rung` (which every real verdict goes through),
+    _details/_highlight read the raw state dict directly and can't assume it always passed through
+    that validation (a future code path, a hand-built state, or test code could hand this something
+    else). Judge review reproduced a live crash (`'<' not supported between instances of 'str' and
+    'int'`) on a non-int fidelity_rung before this guard existed. Falls back to 0 (the safe/most-
+    suspicious default) on anything that doesn't cleanly coerce, mirroring the schema validator's own
+    fail-safe direction."""
+    try:
+        return int(upd.get("fidelity_rung", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _details(node: str, upd: dict) -> list[str]:
     """A few important sub-steps per station, from the structured data it returned.
     Kept short (a handful of lines) — informative, not the --verbose firehose."""
@@ -140,6 +155,13 @@ def _details(node: str, upd: dict) -> list[str]:
         if tests:
             passed = sum(1 for t in tests if isinstance(t, dict) and t.get("result") == "passed")
             d.append(f"{passed}/{len(tests)} tests passed")
+        if upd.get("automation_result") == "passed":
+            rung = _safe_rung(upd)
+            if rung < 2:
+                d.append(f"fidelity: Rung {rung}" + (" — UNVERIFIED, no real signal" if rung == 0 else " — partial signal"))
+        unmocked = rep.get("unmocked_paths_hit") or []
+        if unmocked:
+            d.append(f"unmocked: {', '.join(unmocked[:4])}" + (f" (+{len(unmocked) - 4} more)" if len(unmocked) > 4 else ""))
         crs = rep.get("changed_repos") or []
         ran = [f"{c['repo']} {c.get('ran_on', '')}".strip()
                for c in crs if isinstance(c, dict) and c.get("repo")]
@@ -196,7 +218,19 @@ def _highlight(node: str, upd: dict) -> str:
         return "TestRail cases written"
     if node == "sit_triage" and upd.get("automation_result"):
         fc = upd.get("failure_class")
-        return f"SIT {upd['automation_result']}" + (f" ({fc})" if fc else "")
+        line = f"SIT {upd['automation_result']}" + (f" ({fc})" if fc else "")
+        # Finding 2c (whole-diff judge review): a "passed" alone reads identically whether the SIT
+        # ran at full fidelity or never really got exercised (Rung 0) -- surface the rung right in
+        # the console/run-report line, the cheapest, most-visible place a human actually looks,
+        # rather than requiring them to dig into sit_report for something this consequential.
+        if upd["automation_result"] == "passed":
+            rung = _safe_rung(upd)
+            if rung < 2:
+                line += " — Rung " + str(rung) + (" (UNVERIFIED, no real signal)" if rung == 0 else " (partial signal)")
+        unmocked = (upd.get("sit_report") or {}).get("unmocked_paths_hit") or []
+        if unmocked:
+            line += f" — {len(unmocked)} unmocked path(s)"
+        return line
     if node == "learn_repo":
         return f"onboarded {upd.get('repo_onboarded', '')}".strip()
     if node == "flip_ready" and upd.get("ready_flipped"):

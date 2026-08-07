@@ -177,7 +177,75 @@ class AutomationVerdict(BaseModel):
     # preflight short-circuit (preflight_failed=True) never retries, since more Docker memory
     # doesn't appear between attempts.
     failure_class: Literal["", "code_fault", "could_not_verify", "environment_failure"] = ""
+    # Finding 2d: kept a free str (an unexpected value must never fail-parse a whole verdict — the
+    # convention every other field here follows), but NO LONGER unvalidated: _coerce_execution_mode
+    # below normalizes the two real values and maps anything else to "unknown", which
+    # nodes._real_service_gap treats as "cannot prove how this ran" and routes to a human. Before
+    # this, the field was recorded and displayed but read by nothing at all — the finding's exact
+    # complaint ("the verdict knows it ran on mocks; nothing reads it").
     execution_mode: str = "local-mock-first"
+    # Fidelity ladder (architecture review of PR Aquaman#4/fk-aideveloper#294, Finding 2c): mirrors
+    # fk-aideveloper skills/ocean-qa-agent/references/local_service_execution.md's 3-rung definition
+    # EXACTLY (that doc is the single source of truth for what each rung means — do not redefine it
+    # here). 0 = trivial green (SUT errored before touching the receiving service; the assertion held
+    # by inaction). 1 = cross-repo reached (SUT calls the receiving service, but the reviewed logic
+    # branch is short-circuited). 2 = full fidelity (the reviewed logic ran end-to-end against real
+    # local services). Defaults to 0 -- the SAFEST/most-suspicious value -- so a skill run that hasn't
+    # been updated yet to emit this field is treated as UNVERIFIED (gated, see graph.py::
+    # after_sit_triage) rather than silently trusted the way a passed-with-no-rung-field run was
+    # before this field existed. This was previously defined in prose only and never wired into the
+    # verdict or any gate -- a mock-only false-pass (catch-all 200 / manufactured polled value) could
+    # flip a PR to ready with nobody able to tell from the verdict alone.
+    fidelity_rung: int = 0
+    # Finding 2d (PARTIAL — see needs_ref_load below): true iff the SIT used --ref-load real
+    # reference data, not just the mock's synthesized defaults. Read ONLY inside
+    # _cap_rung_on_missing_ref_load's three-way self-contradiction check; never gated on directly.
+    ref_load_used: bool = False
+    # Finding 2d. `execution_mode` IS now gated: _coerce_execution_mode maps an unrecognized value to
+    # "unknown", and nodes._real_service_gap refuses the automatic ready-flip on it (as it does on
+    # fidelity_rung < 2, and on a changed repo that did not run for real / none recorded at all). What
+    # "a real-service run" means here is DELIBERATELY defined as "the repos under review actually
+    # executed for real, and the reviewed logic ran end-to-end (Rung 2)" -- not "QAT was used", since
+    # the ocean SIT's whole design is to run every CHANGED repo real locally and mock the rest, and QAT
+    # is simply a different real environment. A run that cannot demonstrate that goes to a human
+    # instead of auto-flipping. The narrower needs_ref_load contradiction check below is an ADDITIONAL
+    # signal on top of that gate, not the gate itself.
+    #
+    # What needs_ref_load itself means: local_service_execution.md's fidelity ladder requires real-load replay
+    # for Rung 2 ONLY on "deep-engine" tests -- a test whose reviewed logic is a real business-logic
+    # computation (load-refresh/enrichment, ETA calculation, milestone processing, etc.) that only
+    # behaves realistically against real-shaped reference data, as opposed to a simple pass-through/
+    # CRUD assertion where the mock's synthesized defaults are already sufficient for Rung 2. Rather
+    # than guess this from repo/file names (an unreliable heuristic, and a repo can hold both kinds of
+    # logic), the classifying skill self-declares it explicitly: true iff THIS test's Rung-2 claim
+    # specifically depends on deep-engine logic. Defaults False (no claim of needing it -- most tests).
+    # The validator below only ever downgrades a SELF-CONTRADICTION (claimed deep-engine + claimed
+    # Rung 2 + didn't use ref-load), never a test that genuinely doesn't need ref-load for Rung 2 --
+    # so this can't wrongly punish a legitimately-Rung-2 simple test the way a blanket rung-vs-
+    # ref_load_used check would have.
+    needs_ref_load: bool = False
+    # ── Finding 2e: a pass that FOLLOWS a test edit is not the same as a pass ──────────────────────
+    # The review: "the agent that calls a failure `test_fault` then edits the test and re-runs it" —
+    # SKILL.md legitimately allows fixing a stale/wrong test and re-running (capped at 2), but nothing
+    # recorded that it happened, so a first-try pass and a pass-after-rewriting-the-assertion were
+    # indistinguishable in the verdict. Worse, `_coerce_failure_class` maps test_fault -> "" (it is
+    # not a terminal failure), which ERASED the only trace. `_capture_test_edit_signal` below now
+    # latches test_edited=True from that same raw value BEFORE the coercion runs, so the signal
+    # survives even if the skill forgets to set it, and `nodes._test_edit_ack_reason` forces a human
+    # acknowledgement before the ready-flip.
+    test_edited: bool = False          # a test_fault fix + re-run happened somewhere in this run
+    test_diff: str = ""               # `git diff` of the test file across that edit (truncated is fine)
+    ac_before: list[str] = Field(default_factory=list)   # AC ids the test cited BEFORE the edit
+    ac_after: list[str] = Field(default_factory=list)    # AC ids it cites AFTER — a shrink is a red flag
+    # Finding 2a: any request path that fell through ocean_mock_helper.py's lenient catch-all. The
+    # skill reports what it saw here, but it is not the only source — the mock writes its own deduped
+    # audit to <artifacts>/<exec_id>/unmocked_paths.json and nodes._read_unmocked_paths unions that in
+    # at triage, so a skipped self-report is usually still caught. (Caveat, stated honestly: if the mock
+    # was launched with no OCEAN_PIPELINE_EXEC_ID in env, it writes no audit at all, and "audit
+    # disabled" then looks identical to "zero unmocked paths".) Non-empty means
+    # some collaborator call got a synthesized `__unmocked__` 200 rather than a genuine answer — a
+    # negative-path AC routed there couldn't be exercised. Additive/optional; [] is backward-compatible.
+    unmocked_paths_hit: list[str] = Field(default_factory=list)
     tests: list[AutomationTest] = Field(default_factory=list)
     # MM-14628: a ticket's PR can change 1..N ocean repos and the SIT runs EVERY changed repo real
     # (see ocean-automation-testing SKILL.md §2 + Station 3 verdict `changed_repos[]`).
@@ -215,6 +283,49 @@ class AutomationVerdict(BaseModel):
                 return [{"name": x} if isinstance(x, str) else x for x in v]
         return v
 
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_test_edit_signal(cls, data):
+        """Finding 2e: latch `test_edited` from a raw `failure_class: "test_fault"` BEFORE
+        _coerce_failure_class erases it to "". Runs mode="before" specifically so it sees the
+        worker's original value. Never clears an explicitly-set test_edited=True; only ever turns it
+        ON, so a skill that reports the edit properly and one that only reports test_fault both end
+        up with the signal the ready-flip gate needs."""
+        if isinstance(data, dict):
+            raw = data.get("failure_class")
+            if isinstance(raw, str) and raw.strip().lower() == "test_fault":
+                data = {**data, "test_edited": True}
+        return data
+
+    @field_validator("execution_mode", mode="before")
+    @classmethod
+    def _coerce_execution_mode(cls, v):
+        """Finding 2d: normalize the two documented values; map anything else (including None/
+        non-str) to "unknown" rather than letting an unrecognized mode read as if it were a known,
+        trusted one. "unknown" is not inert — nodes._real_service_gap refuses the automatic ready-flip
+        on it, so a verdict that can't say how it executed goes to a human instead of through."""
+        if not isinstance(v, str):
+            return "unknown"
+        s = v.strip().lower().replace("_", "-")
+        if s in ("local-mock-first", "qat-fallback"):
+            return s
+        return "unknown" if s else "local-mock-first"
+
+    @field_validator("fidelity_rung", mode="before")
+    @classmethod
+    def _coerce_fidelity_rung(cls, v):
+        """Only 0/1/2 are canonical (see the field's own docstring). Any non-numeric value, or a
+        number outside that range, coerces to 0 — the safest/most-suspicious value — rather than
+        raising and failing the whole verdict parse over a worker's vocabulary slip, and rather than
+        silently accepting an out-of-range number as if it meant something. Fail-safe in the SAME
+        direction as _coerce_result/_coerce_failure_class: an unparseable rung can never accidentally
+        read as fully-verified."""
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return n if n in (0, 1, 2) else 0
+
     @field_validator("automation_result", mode="before")
     @classmethod
     def _coerce_result(cls, v):
@@ -249,3 +360,35 @@ class AutomationVerdict(BaseModel):
     # AC traceability (ocean-qa-agent-ac-driven-plan.md): which acceptance criterion each test verifies.
     # Additive + optional — a skill that doesn't emit this yet is fully backward-compatible.
     ac_coverage: list[dict] = Field(default_factory=list)   # [{"ac": "AC3", "test": "test_...", "result": "passed"}]
+
+    @model_validator(mode="after")
+    def _cap_rung_on_unmocked_hit(self) -> "AutomationVerdict":
+        """Finding 2a (judge review of this same fix): the skill is INSTRUCTED (SKILL.md's
+        "Check for unmocked-catch-all hits") to cap fidelity_rung at 1 itself when
+        unmocked_paths_hit is non-empty, but nothing enforced that -- a self-report the model could
+        just as easily forget under time pressure, exactly the class of gap ReviewVerdict's own
+        _gate_verdict_on_severity above exists to close for review findings. Enforce it here instead
+        of trusting the prose instruction: any non-empty unmocked_paths_hit structurally caps the
+        rung, regardless of what the skill claimed. Fail-safe direction only (can only lower the
+        rung, never raise it)."""
+        if self.unmocked_paths_hit and self.fidelity_rung > 1:
+            self.fidelity_rung = 1
+        return self
+
+    @model_validator(mode="after")
+    def _cap_rung_on_missing_ref_load(self) -> "AutomationVerdict":
+        """Finding 2d, PARTIAL only — this does NOT "require a real-service run before a PR goes to
+        review" (the review's actual fix text); see the needs_ref_load field's own comment above for
+        exactly what's still missing. The skill self-declares needs_ref_load
+        when THIS test's Rung-2 claim specifically depends on deep-engine logic (see that field's own
+        docstring for why this isn't inferred/guessed here). If it claims BOTH "this needs real-load
+        replay for full fidelity" AND fidelity_rung == 2 AND ref_load_used is False, that's a direct
+        self-contradiction — not a guess about which tests need ref-load, just enforcing the skill's
+        own stated requirement against its own stated result. Downgrade to Rung 1 (cross-repo
+        reached, real signal just not the full deep-engine path) rather than trusting the model to
+        remember its own rule under time pressure — same rationale as _cap_rung_on_unmocked_hit
+        above. Never touches a verdict where needs_ref_load is False (the overwhelming majority of
+        tests, which never claimed to need it) or where ref_load_used is already True."""
+        if self.needs_ref_load and self.fidelity_rung == 2 and not self.ref_load_used:
+            self.fidelity_rung = 1
+        return self

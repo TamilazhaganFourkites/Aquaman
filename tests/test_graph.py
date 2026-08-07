@@ -121,11 +121,25 @@ def _install(script: Script, tmp_path, monkeypatch):
             return  # onboarding pass writes no final verdict
         if node == "sit_run":
             # sit_triage now refuses to triage without THIS run's own junit (EXE-f749212a evidence
-            # guard) — nodes.sit_run's real code embeds the exact absolute --junitxml path literally
+            # guard) — nodes.sit_run's real code embeds the exact absolute junit path literally
             # in the prompt text (there's no execution_id kwarg on run_skill to derive it from), so
             # the mock reads it out the same way sit_testrail's mock already has to for its own path.
-            m = re.search(r"--junitxml=(\S+)`", kw["task_prompt"])
-            Path(m.group(1)).write_text("<testsuite/>")
+            # S4/I12 (run-monitoring-findings-06af6088.md) rewrote the literal phrasing from a bare
+            # `--junitxml=<path>` to the per-file-batching recipe's own wording — keep this regex in
+            # sync with whatever nodes.sit_run's task_prompt currently says, not the old flag syntax.
+            m = re.search(r"authoritative junit is the ABSOLUTE path (\S+) —", kw["task_prompt"])
+            # A bare `<testsuite/>` (tests defaults to 0) reads as a genuine FAILURE under F1's real
+            # deterministic junit parse ("nothing executed" -- not a pass by inaction) and OVERRIDES
+            # whatever automation_result the sit_triage fake below writes -- so the junit here MUST
+            # agree with THIS attempt's intended scenario, not a single hardcoded default. sit_resolve
+            # always runs before sit_run and already set script._cur via next_sit(), so it's available
+            # here; mirror it into a real pass/fail-shaped testsuite instead of an always-empty one.
+            if script._cur == "passed":
+                junit = '<testsuite tests="1" failures="0" errors="0"><testcase name="test_x"/></testsuite>'
+            else:
+                junit = ('<testsuite tests="1" failures="1" errors="0">'
+                         '<testcase name="test_x"><failure message="simulated"/></testcase></testsuite>')
+            Path(m.group(1)).write_text(junit)
             return
         if node == "sit_author":
             path.write_text(json.dumps({"ticket_id": kw["ticket_id"], "test_path": "test_MM_1_ocean.py"}))
@@ -161,6 +175,16 @@ def _install(script: Script, tmp_path, monkeypatch):
             "automation_result": result,
             "failure_class": "" if outcome == "passed" else outcome,
             "execution_mode": "local-mock-first",
+            # Finding 2c: fidelity_rung defaults to 0 (untrusted) when absent, and after_sit_triage
+            # now gates a "passed" result on it -- omitting this field here (as the fixture did
+            # before that gate existed) silently turned every intended-PASS scenario in this file
+            # into a routed "stop", not a "pass". This fixture simulates a genuine, fully-exercised
+            # SIT (real junit, real assertions), so rung 2 is the honest value for a passed outcome.
+            "fidelity_rung": 2 if outcome == "passed" else 0,
+            # Finding 2d: a passing verdict must record that the code under review actually RAN for
+            # real -- an empty changed_repos is now a real-service gap that forces a human, so the
+            # fixture has to express a genuine run rather than relying on the field's absence.
+            "changed_repos": [{"repo": "ocean-worker", "ran_on": "local", "port": 8089}],
             "tests": [{"name": "test_x", "result": result}],
             "test_automation_pr_url": "https://github.com/cloudqwest/test-automation/pull/9" if outcome == "passed" else "",
             "findings_for_coder": [{"test": "test_x", "cause": "bug"}] if outcome == "code_fault" else [],
@@ -385,7 +409,13 @@ def test_after_sit_resolve():
 
 
 def test_after_sit_triage():
-    assert graph.after_sit_triage({"automation_result": "passed"}) == "pass"
+    assert graph.after_sit_triage({"automation_result": "passed", "fidelity_rung": 2}) == "pass"
+    assert graph.after_sit_triage({"automation_result": "passed", "fidelity_rung": 1}) == "pass"
+    # Finding 2c: a Rung-0 "trivial green" PASS must not auto-flip -- routes to stop_run instead.
+    assert graph.after_sit_triage({"automation_result": "passed", "fidelity_rung": 0}) == "stop"
+    # A pre-Finding-2c state with no fidelity_rung key at all defaults to 0 (fail-safe: an older/
+    # resumed run without this field is treated as unverified, never as a silent full-fidelity pass).
+    assert graph.after_sit_triage({"automation_result": "passed"}) == "stop"
     assert graph.after_sit_triage({"automation_result": "failed", "failure_class": "code_fault",
                                    "coding_attempts": 0}) == "code_fault"
     assert graph.after_sit_triage({"automation_result": "failed", "failure_class": "code_fault",
@@ -458,7 +488,12 @@ def test_sit_triage_substitutes_testrail_case_ids_before_commit(tmp_path, monkey
         "def test_d(): ...\n"
     )
     junit_path = tmp_path / "junit.xml"
-    junit_path.write_text("<testsuite/>")
+    # F1 (Aquaman architecture review): sit_triage's real code parses this junit DETERMINISTICALLY
+    # and that result WINS over whatever automation_result the fake verdict below claims -- a bare
+    # `<testsuite/>` (tests=0) reads as "nothing executed" -> failed, contradicting this test's own
+    # intended "passed" scenario. Give it one real passing testcase.
+    junit_path.write_text('<testsuite tests="1" failures="0" errors="0">'
+                          '<testcase name="test_x"/></testsuite>')
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: tmp_path / f"{tid}.json")
     state = {
         "execution_id": "EXE-sub", "ticket_id": "MM-1",
@@ -553,10 +588,16 @@ def test_sit_testrail_passes_scenario_path_to_skill(tmp_path, monkeypatch):
     assert result["qa_testrail_case_map"] == {"TCNOTADDED1": 555}
 
 
-def test_sit_testrail_prompt_falls_back_to_scenario_plan_docstring(tmp_path, monkeypatch):
+def test_sit_testrail_prompt_falls_back_to_committed_file_reconstruction(tmp_path, monkeypatch):
     """When qa_scenarios_path isn't in state (older checkpoint, or standalone use with no such
     artifact), the prompt must still tell the executing agent WHERE to source rows.json's content
-    from -- the test file's own SCENARIO PLAN docstring -- not silently drop the instruction."""
+    from -- not silently drop the instruction. Per ocean-automation-testing/SKILL.md's own
+    documented fallback (its Station 1b section): there is NO persisted "SCENARIO PLAN" block on
+    disk in this scenario (that block only ever exists in Step 5c's interactive terminal
+    presentation, never written to a file) -- so asserting that literal phrase would check for
+    exactly the wrong thing. The correct, documented fallback is reconstruction from what the
+    COMMITTED TEST FILE actually carries: the AC MAP comment block, each method's own AC-citing
+    docstring, and its TCNOTADDED{N} parametrize marker -- assert on THAT instead."""
     monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
     captured = {}
 
@@ -570,7 +611,10 @@ def test_sit_testrail_prompt_falls_back_to_scenario_plan_docstring(tmp_path, mon
     state = {"ticket_id": "MM-1", "execution_id": "EXE-scn2", "qa_test_path": "test_MM_1_ocean.py"}
     asyncio.run(nodes.sit_testrail(state))
 
-    assert "SCENARIO PLAN" in captured["task_prompt"]
+    prompt = captured["task_prompt"]
+    assert "AC MAP" in prompt
+    assert "AC-citing docstrings" in prompt
+    assert "TCNOTADDED" in prompt
 
 
 # ----------------------------------------------------------------- full paths
@@ -647,12 +691,21 @@ def test_review_loop_then_approve(tmp_path, monkeypatch):
 
 
 def test_review_iteration_cap(tmp_path, monkeypatch):
+    """A real diff exists (coder wrote code) but the reviewer never approves it -- unresolved MAJOR
+    findings survive to budget exhaustion. The graph must STOP here (review_stop_blocking), not
+    silently proceed to open_pr/SIT with code the reviewer explicitly flagged as still broken --
+    this is stop_run's `review_stop_blocking` case (same safety fix that
+    test_review_budget_exhausted_with_no_diff_stops_cleanly guards for the no-diff variant just
+    below). This test previously asserted the OLD (pre-fix) "proceeds anyway" behavior; that was
+    an intentional, correct behavior change elsewhere, not a regression -- updated to match it."""
     s = Script(review_seq=["CHANGES_REQUIRED"], sit_seq=["passed"])  # never approves
     _install(s, tmp_path, monkeypatch)
     final = _run()
-    # capped at MAX_REVIEW_ITERATIONS then proceeds to open_pr and on to SIT
     assert s.calls["harsh_reviewer"] == config.MAX_REVIEW_ITERATIONS
-    assert final["final_status"] == "completed"
+    assert final["final_status"] == "failed"
+    assert s.calls["open_pr"] == 0        # never reached -- unresolved MAJOR findings block it
+    assert s.calls["sit_resolve"] == 0    # SIT never runs on a diff the reviewer rejected
+    assert "review_budget_exhausted_blocking_findings" in final["final_outcome"]
 
 
 def test_review_budget_exhausted_with_no_diff_stops_cleanly(tmp_path, monkeypatch):
@@ -713,6 +766,22 @@ def test_environment_failure_retries_sit_run_only_then_passes(tmp_path, monkeypa
     real_fake_run_skill = agents.run_skill
 
     async def fake_run_skill_env_retry(**kw):
+        if kw["node"] == "sit_run":
+            # The shared fixture's own sit_run branch keys its junit content off script._cur, which
+            # (per this test's own docstring) never moves across this retry loop -- it would write a
+            # "passed" junit on BOTH attempts, and F1's real deterministic parse would then override
+            # the first attempt's intended environment_failure back to "passed" regardless of what
+            # sit_triage's fake verdict below claims. Key this attempt's junit off the SAME
+            # first-attempt tracking sit_triage uses below instead.
+            first_attempt = s.calls["sit_run"] == 0
+            m = re.search(r"authoritative junit is the ABSOLUTE path (\S+) —", kw["task_prompt"])
+            if first_attempt:
+                Path(m.group(1)).write_text('<testsuite tests="0" failures="0" errors="0"/>')
+            else:
+                Path(m.group(1)).write_text('<testsuite tests="1" failures="0" errors="0">'
+                                            '<testcase name="test_x"/></testsuite>')
+            s.calls["sit_run"] += 1
+            return
         if kw["node"] == "sit_triage":
             first_attempt = s.calls["sit_triage"] == 0
             s.calls["sit_triage"] += 1
@@ -723,6 +792,12 @@ def test_environment_failure_retries_sit_run_only_then_passes(tmp_path, monkeypa
                 "automation_result": "failed" if first_attempt else "passed",
                 "failure_class": outcome if first_attempt else "",
                 "execution_mode": "local-mock-first",
+                # Finding 2c: fidelity_rung defaults to 0 when absent, and after_sit_triage gates a
+                # "passed" result on it -- the SECOND attempt here is a genuine full-fidelity pass.
+                "fidelity_rung": 0 if first_attempt else 2,
+                # Finding 2d: the second (passing) attempt must record a real run, or the ready-flip
+                # gate correctly holds it for a human instead of auto-flipping.
+                "changed_repos": [{"repo": "ocean-worker", "ran_on": "local", "port": 8089}],
                 "tests": [{"name": "test_x", "result": "failed" if first_attempt else "passed"}],
                 "test_automation_pr_url": "" if first_attempt else "https://github.com/cloudqwest/test-automation/pull/9",
                 "findings_for_coder": [], "needs_onboarding": False, "onboard_repo": "",
@@ -1613,6 +1688,223 @@ def test_ui_highlight_shows_dep_resolver_blocking():
         == "BLOCKING: blocked on X"
     assert ui._highlight("dep_resolver", {"dependency_blocking": False,
                                           "dependency_report": {"notes": ""}}) == "no blockers"
+
+
+def test_ui_highlight_sit_triage_surfaces_fidelity_rung_and_unmocked_hits():
+    """Finding 2c whole-diff follow-up: a bare 'SIT passed' reads identically whether the run was
+    genuine full fidelity or never really got exercised -- the console/report line must distinguish
+    them, and must never crash on a missing/malformed fidelity_rung (judge-review finding: a plain
+    `rung < 2` comparison crashed on a non-int value before ui._safe_rung existed)."""
+    # Rung 0 (trivial green) -> flagged UNVERIFIED right in the highlight line.
+    h0 = ui._highlight("sit_triage", {"automation_result": "passed", "fidelity_rung": 0, "sit_report": {}})
+    assert "Rung 0" in h0 and "UNVERIFIED" in h0
+    # Rung 1 (partial signal) -> flagged, but not as unverified.
+    h1 = ui._highlight("sit_triage", {"automation_result": "passed", "fidelity_rung": 1, "sit_report": {}})
+    assert "Rung 1" in h1 and "partial signal" in h1
+    # Rung 2 (genuine full fidelity) -> clean, no rung noise.
+    h2 = ui._highlight("sit_triage", {"automation_result": "passed", "fidelity_rung": 2, "sit_report": {}})
+    assert "Rung" not in h2
+    # A FAILED result never shows rung noise (that field only matters for a claimed pass).
+    hf = ui._highlight("sit_triage", {"automation_result": "failed", "failure_class": "code_fault",
+                                       "fidelity_rung": 0, "sit_report": {}})
+    assert "Rung" not in hf
+    # Missing fidelity_rung entirely (older/pre-feature state) -> defaults to 0, still doesn't crash.
+    hm = ui._highlight("sit_triage", {"automation_result": "passed", "sit_report": {}})
+    assert "Rung 0" in hm
+    # Malformed fidelity_rung (non-int) -> must not crash; falls back to the safe default.
+    hbad = ui._highlight("sit_triage", {"automation_result": "passed", "fidelity_rung": "nonsense", "sit_report": {}})
+    assert "Rung 0" in hbad
+    # Unmocked catch-all hits surfaced regardless of rung.
+    hu = ui._highlight("sit_triage", {"automation_result": "passed", "fidelity_rung": 2,
+                                       "sit_report": {"unmocked_paths_hit": ["/a", "/b"]}})
+    assert "2 unmocked path(s)" in hu
+
+
+def test_read_unmocked_paths_is_deterministic_and_tolerant(tmp_path, monkeypatch):
+    """Finding 2a: the mock writes its own audit of every catch-all hit; the control plane reads that
+    file rather than trusting the agent to grep+self-report. Must tolerate absent/corrupt files."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    assert nodes._read_unmocked_paths("EXE-none") == []          # no file yet
+    d = tmp_path / "EXE-x"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "unmocked_paths.json").write_text('["GET /api/v1/a", "POST /api/v1/b"]')
+    assert nodes._read_unmocked_paths("EXE-x") == ["GET /api/v1/a", "POST /api/v1/b"]
+    (d / "unmocked_paths.json").write_text("{ not json")          # corrupt -> [] not a crash
+    assert nodes._read_unmocked_paths("EXE-x") == []
+    (d / "unmocked_paths.json").write_text('{"a": 1}')            # wrong shape -> []
+    assert nodes._read_unmocked_paths("EXE-x") == []
+
+
+def test_resolve_test_file_handles_every_real_verdict_path_shape(tmp_path, monkeypatch):
+    """Finding 2e: a judge review measured the deterministic test-edit latch as inert on 0/12 REAL
+    verdicts because it assumed `test_path` was absolute. These are the shapes actually observed in
+    those verdicts -- all must resolve, and a genuinely-missing file must still yield "" (never a
+    guess, which would produce a false 'the test was edited' accusation)."""
+    monkeypatch.setattr(config, "PROJECTS_ROOT", tmp_path)
+    ta = tmp_path / "test-automation" / "system_integration_test" / "test_cases" / "ocean"
+    ta.mkdir(parents=True)
+    (ta / "t.py").write_text("x")
+    ew = tmp_path / "eta-worker" / "src" / "test" / "java"
+    ew.mkdir(parents=True)
+    (ew / "E.java").write_text("y")
+
+    assert nodes._resolve_test_file(str(ta / "t.py"))                                    # absolute
+    assert nodes._resolve_test_file("system_integration_test/test_cases/ocean/t.py")     # repo-relative
+    assert nodes._resolve_test_file("test_cases/ocean/t.py")                             # checkout-relative
+    # repo-qualified label, both punctuations seen in the wild
+    assert nodes._resolve_test_file("cloudqwest/test-automation :: test_cases/ocean/t.py")
+    assert nodes._resolve_test_file("cloudqwest/eta-worker:src/test/java/E.java")        # other repo
+    # Negatives: never guess.
+    assert nodes._resolve_test_file("") == ""
+    assert nodes._resolve_test_file("nope/missing.py") == ""
+    assert nodes._resolve_test_file("cloudqwest/test-automation :: does/not/exist.py") == ""
+
+
+def test_authored_test_snapshot_yields_a_real_diff_on_a_mid_run_rewrite(tmp_path, monkeypatch):
+    """Finding 2e: the hash alone told the human an edit happened but not WHAT changed — they were
+    asked to acknowledge something invisible. sit_author now snapshots the authored content so triage
+    can reconstruct the actual diff, and must never fabricate one when the snapshot is missing."""
+    monkeypatch.setattr(config, "PROJECTS_ROOT", tmp_path)
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path / "art")
+    d = tmp_path / "test-automation" / "system_integration_test" / "test_cases"
+    d.mkdir(parents=True)
+    f = d / "test_x.py"
+    f.write_text('def test_a():\n    assert result == "EXPECTED"\n')
+
+    assert nodes._snapshot_authored_test("EXE-d", str(f)) is True
+    sha_before = nodes._file_sha(str(f))
+    # sit_run narrows the assertion to make a red test green -- the exact abuse shape 2e targets.
+    f.write_text("def test_a():\n    assert True  # narrowed\n")
+    assert nodes._file_sha(str(f)) != sha_before
+
+    diff = nodes._diff_against_snapshot("EXE-d", str(f))
+    assert "EXPECTED" in diff and "narrowed" in diff        # the human can see what changed
+    assert len(nodes._diff_against_snapshot("EXE-d", str(f), max_chars=20)) == 20   # bounded
+    # No snapshot / no file -> "" rather than an invented diff.
+    assert nodes._diff_against_snapshot("EXE-absent", str(f)) == ""
+    assert nodes._diff_against_snapshot("EXE-d", "nope/missing.py") == ""
+    assert nodes._snapshot_authored_test("EXE-d", "nope/missing.py") is False
+
+
+def test_file_sha_detects_change_and_tolerates_missing(tmp_path):
+    """Finding 2e: the deterministic test-edit detector. Same content -> same hash; any edit changes
+    it; a missing/unset path yields "" (which the caller treats as 'unknown', never as an edit)."""
+    f = tmp_path / "test_x.py"
+    f.write_text("def test_a(): assert True\n")
+    h1 = nodes._file_sha(str(f))
+    assert h1 and nodes._file_sha(str(f)) == h1                   # stable
+    f.write_text("def test_a(): assert False\n")
+    assert nodes._file_sha(str(f)) != h1                          # edit detected
+    assert nodes._file_sha("") == ""
+    assert nodes._file_sha(str(tmp_path / "nope.py")) == ""
+    assert nodes._file_sha(str(tmp_path)) == ""                   # a directory, not a file
+
+
+def test_real_service_gap_blocks_auto_flip_on_mock_only_runs():
+    """Finding 2d: "require a real-service run before a PR goes to review". A genuine Rung-2 local run
+    with its changed repo run for real has no gap (auto-flip preserved); everything that can't prove it
+    exercised the change against real services returns a reason, which human_gate turns into a forced
+    pause even when REQUIRE_APPROVAL is off."""
+    ok = {"fidelity_rung": 2, "execution_mode": "local-mock-first",
+          "sit_report": {"changed_repos": [{"repo": "ocean-worker", "ran_on": "local"}]}}
+    assert nodes._real_service_gap(ok) == ""
+    # QAT is a real service, not a gap (given the changed repo did run).
+    assert nodes._real_service_gap(
+        {"fidelity_rung": 2, "execution_mode": "qat-fallback",
+         "sit_report": {"changed_repos": [{"repo": "ocean-worker", "ran_on": "real-local"}]}}) == ""
+    # An EMPTY changed_repos is absence of evidence, not a pass -- it must NOT vacuously satisfy the
+    # "did the code under review actually run?" check.
+    assert "no changed_repos recorded" in nodes._real_service_gap(
+        {"fidelity_rung": 2, "execution_mode": "qat-fallback", "sit_report": {}})
+    # Rung 1: reached the service but the reviewed branch was short-circuited -> not a verification.
+    assert "Rung 1" in nodes._real_service_gap({"fidelity_rung": 1, "execution_mode": "local-mock-first",
+                                                 "sit_report": {}})
+    # Unrecognized execution_mode -> can't tell how it ran.
+    assert "not a recognized mode" in nodes._real_service_gap(
+        {"fidelity_rung": 2, "execution_mode": "unknown", "sit_report": {}})
+    # A CHANGED repo that was mocked means the code under review never executed.
+    assert "did not run for real" in nodes._real_service_gap(
+        {"fidelity_rung": 2, "execution_mode": "local-mock-first",
+         "sit_report": {"changed_repos": [{"repo": "ocean-worker", "ran_on": "mocked"}]}})
+    # Malformed rung must not crash the gate.
+    assert nodes._real_service_gap({"fidelity_rung": "nonsense", "sit_report": {}})
+
+
+def test_test_edit_ack_reason_requires_human_and_flags_ac_shrink():
+    """Finding 2e: a green following a test edit requires a human acknowledgement, and an AC shrink
+    (fewer criteria cited after the edit) is called out as the specific abuse shape."""
+    assert nodes._test_edit_ack_reason({"sit_report": {}}) == ""
+    assert nodes._test_edit_ack_reason({"sit_report": {"test_edited": False}}) == ""
+    plain = nodes._test_edit_ack_reason({"sit_report": {"test_edited": True}})
+    assert plain and "followed a test edit" in plain and "SHRANK" not in plain
+    shrink = nodes._test_edit_ack_reason(
+        {"sit_report": {"test_edited": True, "ac_before": ["AC1", "AC2"], "ac_after": ["AC1"]}})
+    assert "SHRANK" in shrink and "AC2" in shrink
+    # No shrink when coverage is unchanged or grew.
+    assert "SHRANK" not in nodes._test_edit_ack_reason(
+        {"sit_report": {"test_edited": True, "ac_before": ["AC1"], "ac_after": ["AC1", "AC2"]}})
+
+
+def test_human_gate_forces_pause_on_2d_2e_blockers_even_with_approval_off(monkeypatch):
+    """Findings 2d/2e wiring (the judge flagged the helpers were covered but the gate wiring wasn't):
+    with REQUIRE_APPROVAL OFF, a clean run must still pass through untouched, but a run that can't prove
+    a real-service execution, or whose green followed a test edit, must interrupt for a human anyway."""
+    import langgraph.types as lt
+    monkeypatch.setattr(config, "REQUIRE_APPROVAL", False)
+    seen = {}
+    monkeypatch.setattr(lt, "interrupt", lambda payload: seen.update(payload) or "approve")
+
+    real = {"execution_id": "E", "ticket_id": "MM-1", "fidelity_rung": 2,
+            "execution_mode": "local-mock-first",
+            "sit_report": {"changed_repos": [{"repo": "ocean-worker", "ran_on": "local"}]}}
+
+    # Clean green + approval off -> untouched pass-through (no regression to the auto-flip default).
+    seen.clear()
+    assert asyncio.run(nodes.human_gate(dict(real))) == {}
+    assert not seen
+
+    # 2d: Rung 1 -> forced pause, reason handed to the human.
+    seen.clear()
+    asyncio.run(nodes.human_gate({**real, "fidelity_rung": 1}))
+    assert "Rung 1" in seen.get("real_service_gap", "")
+
+    # 2d: nothing recorded as having run -> forced pause.
+    seen.clear()
+    asyncio.run(nodes.human_gate({**real, "sit_report": {}}))
+    assert "no changed_repos recorded" in seen.get("real_service_gap", "")
+
+    # 2e: a green after a test edit -> forced pause, with the diff + AC sets attached for the reviewer.
+    seen.clear()
+    asyncio.run(nodes.human_gate({**real, "sit_report": {
+        **real["sit_report"], "test_edited": True, "test_diff": "D" * 9000,
+        "ac_before": ["AC1", "AC2"], "ac_after": ["AC1"]}}))
+    assert "followed a test edit" in seen.get("test_edit_ack_reason", "")
+    assert "SHRANK" in seen["test_edit_ack_reason"]        # the AC-narrowing abuse shape
+    assert len(seen["test_diff"]) == 4000                  # truncated, but attached
+    assert seen["ac_before"] == ["AC1", "AC2"]
+
+
+def test_qa_batch_finish_treats_trivial_green_as_unverified_not_completed():
+    """Finding 2c whole-diff follow-up: qa_batch.py is a SEPARATE terminal node reusing the same
+    sit_triage verdict the main graph gates on -- without this check it reported a Rung-0 trivial
+    green as a clean 'completed' pass, the exact false-confidence scenario this fix targets."""
+    from ocean_pipeline import qa_batch
+
+    trivial = qa_batch._qa_batch_finish({"automation_result": "passed", "fidelity_rung": 0})
+    assert trivial["final_status"] == "failed"
+    assert "trivial_green_no_signal" in trivial["final_outcome"]
+
+    genuine = qa_batch._qa_batch_finish({"automation_result": "passed", "fidelity_rung": 2})
+    assert genuine["final_status"] == "completed"
+    assert "sit_passed" in genuine["final_outcome"]
+
+    # A genuine failure must be completely unaffected by fidelity_rung -- trivial_green must not
+    # leak into (or otherwise alter) the already-existing failed-path messaging.
+    failed = qa_batch._qa_batch_finish({"automation_result": "failed", "failure_class": "code_fault",
+                                        "fidelity_rung": 0})
+    assert failed["final_status"] == "failed"
+    assert "code_fault" in failed["final_outcome"]
+    assert "trivial_green" not in failed["final_outcome"]
 
 
 # ----------------------------------------------------------------- gitops.py real logic

@@ -74,8 +74,21 @@ def test_batch_is_sequential_and_never_flips_a_pr(tmp_path, monkeypatch):
             # sit_triage refuses to triage without THIS run's own junit (EXE-f749212a evidence
             # guard) — see test_graph.py's _install for why the path has to come out of the
             # prompt text (run_skill has no execution_id kwarg to derive it from directly).
-            m = _re.search(r"--junitxml=(\S+)`", kw["task_prompt"])
-            _Path(m.group(1)).write_text("<testsuite/>")
+            # S4/I12 rewrote the literal phrasing from a bare `--junitxml=<path>` to the per-file-
+            # batching recipe's own wording (test_graph.py's _install hit the same regression) --
+            # keep this regex matching whatever nodes.sit_run's task_prompt currently says.
+            m = _re.search(r"authoritative junit is the ABSOLUTE path (\S+) —", kw["task_prompt"])
+            # F1's deterministic junit parse now WINS over whatever automation_result sit_triage's
+            # fake below writes -- a bare `<testsuite/>` (tests=0) always reads as "failed", which
+            # would silently break MM-A's intended "passed" outcome. Match this ticket's own
+            # intended scenario (MM-A passed, MM-B could_not_verify) instead of one hardcoded shape.
+            if tid == "MM-A":
+                _Path(m.group(1)).write_text('<testsuite tests="1" failures="0" errors="0">'
+                                             '<testcase name="test_x"/></testsuite>')
+            else:
+                _Path(m.group(1)).write_text('<testsuite tests="1" failures="1" errors="0">'
+                                             '<testcase name="test_x"><failure message="simulated"/>'
+                                             '</testcase></testsuite>')
             return
         if node == "learn_repo":
             return
@@ -90,6 +103,9 @@ def test_batch_is_sequential_and_never_flips_a_pr(tmp_path, monkeypatch):
         path.write_text(_json.dumps({
             "ticket_id": tid, "automation_result": "passed" if outcome == "passed" else "failed",
             "failure_class": "" if outcome == "passed" else outcome, "execution_mode": "local-mock-first",
+            # Finding 2c: fidelity_rung defaults to 0 (untrusted) when absent, and after_sit_triage
+            # gates a "passed" result on it -- MM-A's is a genuine full-fidelity pass here.
+            "fidelity_rung": 2 if outcome == "passed" else 0,
             "tests": [], "needs_onboarding": False, "onboard_repo": "",
         }))
 

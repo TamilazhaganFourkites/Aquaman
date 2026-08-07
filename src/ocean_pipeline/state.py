@@ -40,11 +40,17 @@ class OceanState(TypedDict, total=False):
     target_repos: list[TargetRepo]   # carries the language-scoped Docker decision
     domain_bucket: str               # ocean domain; drives the SME-consult node
     sme_findings: dict               # ownership/reuse guidance from the consulted ocean SME
+    # Finding 3 (architecture review, "Give Pipeline Memory"): recurring failure patterns this same
+    # domain_bucket has hit on PRIOR tickets (lessons.recall_lessons, written by stop_run's
+    # record_failure) — [{domain_bucket, action_sig, fail_sig, recurrence_count, tickets, note}, ...].
+    # Folded into _summary() so every downstream station sees it. [] when nothing recurring yet, or
+    # for a route with no domain_bucket.
+    recurring_lessons: list
 
     # --- RCA branch (diagram: RCA agent -> rca_report (plain-code Jira post) -> RCA review gate -> RCA Done -> Fix needed -> coder) ---
     rca_fix_needed: bool
     rca_findings: list               # implementation brief handed to the coder on fix_needed
-    rca_report_path: str             # absolute path the rca worker wrote the 5-part report to; rca_report posts it
+    rca_report_path: str             # absolute path the rca worker wrote the 7-part report to; rca_report posts it
     rca_approval_decision: str       # "approve" | "reject" (set on resume); "" when auto-approved
 
     # --- Station 1 / 1.5 ---
@@ -94,6 +100,14 @@ class OceanState(TypedDict, total=False):
     automation_result: AutomationResult
     failure_class: FailureClass
     execution_mode: str              # local-mock-first | qat-fallback
+    # Finding 2c (architecture review): mirrors schemas.AutomationVerdict.fidelity_rung exactly (0
+    # trivial-green / 1 cross-repo-reached / 2 full-fidelity) -- see that field's own docstring for
+    # the canonical rung definitions. after_sit_triage gates on this: a "passed" result at rung 0
+    # routes to stop_run instead of flip_ready. Default 0 via .get(..., 0) everywhere it's read, so
+    # an older run's state (recorded before this field existed) is treated as unverified, never as a
+    # silent full-fidelity pass.
+    fidelity_rung: int
+    ref_load_used: bool              # true iff the SIT used --ref-load real reference data
     sit_report: dict                 # tests[] / changed_repos[] / dependencies / evidence
     test_automation_pr_url: str      # opened by the skill on pass
     sit_findings: list               # findings_for_coder (code_fault -> fk-coder)
@@ -120,6 +134,10 @@ class OceanState(TypedDict, total=False):
 
     # --- QA review gate (human 3-way: approve+TestRail / approve / changes) ---
     qa_test_path: str                # drafted SIT file, shown to the reviewer
+    # Finding 2e: sha256[:16] of qa_test_path as sit_author left it. sit_triage re-hashes before its
+    # own TCNOTADDED substitution; a mismatch proves sit_run rewrote the test mid-run and forces a
+    # human acknowledgement at the ready-flip. Deterministic — not a self-reported flag.
+    qa_test_sha: str
     qa_decision: str                 # approve_testrail | approve_no_testrail | changes
     qa_note: str                     # reviewer feedback carried back to sit_author on "changes"
     qa_review_iteration: int         # capped by MAX_QA_REVIEW_ITERATIONS

@@ -19,7 +19,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import agents, config, gitops, jira, schemas, telemetry, ui
+from . import agents, config, gitops, jira, lessons, schemas, telemetry, ui
 from .state import OceanState
 
 
@@ -341,6 +341,26 @@ def _summary(state: OceanState) -> str:
     if state.get("rca_findings"):
         # RCA-originated fix: the gates + coder work from the RCA brief, not a coding-route packet.
         s += f"Origin: RCA fix. RCA brief: {json.dumps(state['rca_findings'])}\n"
+    # Finding 3 (architecture review, "Give Pipeline Memory"): recurring failure patterns this SAME
+    # domain has hit before (lessons.recall_lessons via researcher) — top 3 by recurrence, one line
+    # each, so every station sees "this has happened before" without blowing the token budget.
+    recurring = state.get("recurring_lessons") or []
+    if recurring:
+        def _tickets_str(r: dict) -> str:
+            # Judge-review finding: a hand-edited/corrupted lessons.json could carry a non-list
+            # `tickets` value (e.g. null survives a `.get(..., [])` fallback since the KEY is present,
+            # just not list-shaped) — guard here rather than let a malformed record on disk crash
+            # EVERY downstream node for every future ticket in the domain via this shared helper.
+            tickets = r.get("tickets")
+            if not isinstance(tickets, list):
+                return "?"
+            return ", ".join(str(t) for t in tickets[-3:])
+        lines = "; ".join(
+            f"{r.get('fail_sig', '?')} at {r.get('action_sig', '?')} "
+            f"(x{r.get('recurrence_count', '?')}, tickets: {_tickets_str(r)})"
+            for r in recurring[:3] if isinstance(r, dict)
+        )
+        s += f"Known recurring failure patterns in this domain: {lines}\n"
     return s
 
 
@@ -537,11 +557,18 @@ async def researcher(state: OceanState) -> dict:
     # re-sync while nobody actually did). Deterministic, best-effort, never blocks the run.
     sync_status = [gitops.sync_local_checkout(gitops.repo_slug(r.get("repo", "")))
                    for r in (v.target_repos or []) if r.get("repo")]
+    # Finding 3 (architecture review, "Give Pipeline Memory"): recall recurring failure patterns
+    # this SAME domain has hit on prior tickets (written by stop_run's record_failure call) and fold
+    # them into _summary() so every downstream station (SME, dep-resolver, qa_scenarios, coder,
+    # harsh_reviewer, sit_run) sees them automatically -- without this, ticket 200 in a domain starts
+    # exactly as blind as ticket 1 did, however many times the SAME failure has already recurred.
+    recurring = lessons.recall_lessons(v.domain_bucket) if v.domain_bucket else []
     telemetry.station_event(state["execution_id"], 0, "end", route=v.route,
-                            domain_bucket=v.domain_bucket,
+                            domain_bucket=v.domain_bucket, recurring_lessons=len(recurring),
                             checkout_sync="; ".join(sync_status) or "no target repo to sync")
     return {"route": v.route, "research_packet": _load_json(v.packet_path),
-            "target_repos": v.target_repos, "domain_bucket": v.domain_bucket}
+            "target_repos": v.target_repos, "domain_bucket": v.domain_bucket,
+            "recurring_lessons": recurring}
 
 
 # ------------------------------------------------------------------ Station 0.5 — ocean SME consult
@@ -1317,7 +1344,27 @@ async def sit_author(state: OceanState) -> dict:
     )
     partial = _load_json(str(config.automation_verdict_path(tid)))
     telemetry.station_event(exec_id, 6.1, "end")
-    return {"qa_test_path": partial.get("test_path") or partial.get("existing_test_path", ""),
+    # Finding 2e: accept every key real verdicts have used for this (a judge review found `test_path`
+    # absent or differently-named in most of 12 real runs) -- `sit_test_path` is the third observed one.
+    authored_path = (partial.get("test_path") or partial.get("existing_test_path")
+                     or partial.get("sit_test_path") or partial.get("target_test_path") or "")
+    # Fingerprint the AUTHORED test now, so sit_triage can tell DETERMINISTICALLY whether sit_run
+    # rewrote it mid-station (the test_fault -> fix -> re-run path). Without this the ready-flip gate
+    # depends entirely on the agent volunteering `test_edited`, and the automatic latch cannot fire on
+    # a PASS (failure_class is "" on a pass by contract, so there is no `test_fault` to latch from).
+    authored_sha = _file_sha(authored_path)
+    if authored_sha:
+        _snapshot_authored_test(exec_id, authored_path)   # content, so a later diff is real
+    if not authored_sha:
+        # NEVER fail silently here: an empty hash disables the 2e latch entirely, which is exactly how
+        # this mechanism was found inert the first time. Say so, loudly, in the run log and telemetry.
+        ui.milestone(f"Finding 2e: could not fingerprint the authored SIT file "
+                     f"({authored_path or 'no test path in the verdict'}) — the deterministic "
+                     f"test-edit check is DISABLED for this run; it falls back to the skill's own "
+                     f"`test_edited` report")
+        telemetry.station_event(exec_id, 6.1, "test_sha_unavailable", raw_path=(authored_path or "")[:120])
+    return {"qa_test_path": authored_path,
+            "qa_test_sha": authored_sha,
             "qa_review_iteration": it + 1, "qa_note": ""}
 
 
@@ -1412,6 +1459,124 @@ def _recover_sit_junit(exec_id: str, junit_path) -> None:
                 return
         except OSError:
             continue
+
+
+def _resolve_test_file(raw: str) -> str:
+    """Turn whatever the SIT skill recorded as its test path into a real absolute path, or "".
+
+    Finding 2e (second judge round): the deterministic test-edit latch was inert on 0/12 REAL verdicts
+    because it assumed `test_path` was absolute. Observed shapes across those verdicts:
+      * a repo-qualified LABEL — "cloudqwest/test-automation :: system_integration_test/test_cases/..."
+      * repo-relative        — "system_integration_test/test_cases/services/v1/ocean/..."
+      * checkout-relative    — "test_cases/services/v1/ocean/..."
+      * absent, or under a differently-named key (handled by the caller)
+    Rather than demand the skill change shape (which wouldn't fix already-running variants), resolve
+    all of them here. Tries, in order: the path as given; the part after a "::" label; the same
+    candidates under the local test-automation checkout, with and without its `system_integration_test`
+    prefix. Returns "" only when nothing on disk matches — which the caller reports loudly instead of
+    silently disabling the check."""
+    cand = (raw or "").strip()
+    if not cand:
+        return ""
+    # Strip a repo qualifier, in either observed punctuation: "owner/repo :: path" or "owner/repo:path".
+    # The single-colon form appears on non-test-automation repos (e.g. a Java test in eta-worker), so
+    # remember which repo it named and search THAT checkout too, not just test-automation.
+    repo_hint = ""
+    if "::" in cand:
+        left, cand = cand.split("::", 1)
+        repo_hint, cand = left.strip(), cand.strip()
+    elif ":" in cand and not cand.startswith("/") and not re.match(r"^[A-Za-z]:[\\/]", cand):
+        left, right = cand.split(":", 1)
+        if "/" in left:                    # looks like owner/repo, not a stray colon in a filename
+            repo_hint, cand = left.strip(), right.strip()
+    roots = []
+    if repo_hint:
+        roots.append(config.PROJECTS_ROOT / repo_hint.split("/")[-1])
+    roots.append(config.PROJECTS_ROOT / "test-automation")
+    tries = [Path(cand)]
+    for r in roots:
+        tries += [r / cand, r / "system_integration_test" / cand]
+        # A path may already carry the system_integration_test/ prefix; also try it stripped.
+        if cand.startswith("system_integration_test/"):
+            tries.append(r / cand[len("system_integration_test/"):])
+    for p in tries:
+        try:
+            if p.is_file():
+                return str(p.resolve())
+        except OSError:
+            continue
+    return ""
+
+
+def _test_snapshot_path(exec_id: str) -> Path:
+    return config.artifacts_dir(exec_id) / "authored_test_snapshot.txt"
+
+
+def _snapshot_authored_test(exec_id: str, raw_path: str) -> bool:
+    """Finding 2e: save the authored test's CONTENT (not just its hash) so that when the deterministic
+    latch fires, `_diff_against_snapshot` can hand the human an actual diff. A judge review found the
+    hash alone left the reviewer acknowledging an edit they could not see. Best-effort; returns whether
+    a snapshot was written."""
+    resolved = _resolve_test_file(raw_path)
+    if not resolved:
+        return False
+    try:
+        shutil.copyfile(resolved, _test_snapshot_path(exec_id))
+        return True
+    except OSError:
+        return False
+
+
+def _diff_against_snapshot(exec_id: str, raw_path: str, max_chars: int = 4000) -> str:
+    """Unified diff of the authored snapshot vs the test file as it stands now, or "" if either side is
+    unavailable. Used only when a test edit was detected, to give the human the actual change."""
+    resolved = _resolve_test_file(raw_path)
+    snap = _test_snapshot_path(exec_id)
+    if not resolved or not snap.exists():
+        return ""
+    try:
+        import difflib
+        before = snap.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        after = Path(resolved).read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        d = "".join(difflib.unified_diff(before, after, fromfile="as-authored", tofile="at-triage"))
+        return d[:max_chars]
+    except OSError:
+        return ""
+
+
+def _file_sha(path: str) -> str:
+    """Short content fingerprint of a file, or "" if unreadable/absent. Used by Finding 2e to detect a
+    mid-run test rewrite deterministically instead of trusting a self-reported flag. Accepts any of the
+    path shapes _resolve_test_file handles."""
+    try:
+        import hashlib
+        resolved = _resolve_test_file(path)
+        return hashlib.sha256(Path(resolved).read_bytes()).hexdigest()[:16] if resolved else ""
+    except OSError:
+        return ""
+
+
+def _read_unmocked_paths(exec_id: str) -> list[str]:
+    """Finding 2a: read the mock's OWN deterministic audit of every catch-all (unmocked) path it
+    served, written by ocean_mock_helper.py's `_record_unmocked` to
+    <artifacts>/<exec_id>/unmocked_paths.json (its default location, derived from the same
+    OCEAN_PIPELINE_ARTIFACTS/OCEAN_PIPELINE_EXEC_ID the pipeline exports).
+
+    Why this exists rather than trusting the verdict's own `unmocked_paths_hit`: a judge review found
+    the first cut of this fix asked the SIT agent to grep the mock's stdout for a marker and
+    self-report the result -- so an agent that simply skipped the grep produced an empty list, the
+    rung cap never fired, and a run that silently degraded through the catch-all was indistinguishable
+    from a clean one. Reading the file here makes the signal the control plane's own, not a
+    self-report. Best-effort: a missing/corrupt file returns [] (the mock may predate this feature or
+    have been launched without the audit path), which simply falls back to the verdict's own field."""
+    try:
+        p = config.artifacts_dir(exec_id) / "unmocked_paths.json"
+        if not p.exists():
+            return []
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return [str(x) for x in data] if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001 — an audit-file hiccup must never break triage
+        return []
 
 
 def _junit_pass_fail(junit_path) -> tuple:
@@ -1702,12 +1867,33 @@ async def sit_triage(state: OceanState) -> dict:
         # per-attempt signal for the verdict_path retry-guard below (EXE-2755f777).
         verdict_path.unlink()
 
+    # Finding 2e: compare the test file's fingerprint against the one sit_author recorded, BEFORE this
+    # node does its own TCNOTADDED substitution below (otherwise our own rewrite would look like an
+    # agent edit). A mismatch means sit_run rewrote the test mid-station -- the test_fault -> fix ->
+    # re-run path -- which is the thing that needs a human acknowledgement. Deterministic: it does not
+    # depend on the agent reporting anything. Only meaningful when both hashes are known; an unknown
+    # hash on either side yields False rather than a false accusation.
+    _authored_sha = state.get("qa_test_sha") or ""
+    _current_sha = _file_sha(state.get("qa_test_path") or "")
+    detected_test_edit = bool(_authored_sha and _current_sha and _authored_sha != _current_sha)
+    detected_diff = ""
+    if detected_test_edit:
+        # Produce the ACTUAL diff from the authoring snapshot, so the human asked to acknowledge this
+        # edit can see it even when the skill reported no test_diff of its own.
+        detected_diff = _diff_against_snapshot(exec_id, state.get("qa_test_path") or "")
+        ui.milestone("Finding 2e: the SIT file changed between authoring and triage — a test edit "
+                     "happened during the run; the ready-flip will require a human acknowledgement")
+        telemetry.station_event(exec_id, 6.4, "test_edit_detected",
+                                authored=_authored_sha, current=_current_sha,
+                                diff_bytes=len(detected_diff))
+
     # MM-14738: fan-in point -- both sit_run (already executed against the placeholder-keyed file)
     # and sit_testrail (created the real cases) are guaranteed done by here. Plain-code substitution,
     # no agent: replace TCNOTADDED{N} with its real case id BEFORE the commit-skill call below, so
     # cloudqwest/test-automation never receives a placeholder for a case that actually exists.
     case_map = state.get("qa_testrail_case_map") or {}
-    test_path_str = state.get("qa_test_path") or ""
+    test_path_str = _resolve_test_file(state.get("qa_test_path") or "")
+    _post_subst_sha = ""
     if case_map and test_path_str:
         test_file = Path(test_path_str)
         if test_file.exists():
@@ -1719,6 +1905,11 @@ async def sit_triage(state: OceanState) -> dict:
             for placeholder in sorted(case_map, key=len, reverse=True):
                 content = content.replace(placeholder, str(case_map[placeholder]))
             test_file.write_text(content)
+            # Finding 2e: re-baseline the fingerprint to OUR OWN post-substitution content. Without
+            # this, an environment_failure retry (sit_triage -> prep_env_retry -> sit_run -> sit_triage,
+            # which does NOT re-run sit_author) would compare the second pass against the stale
+            # pre-substitution hash and report a spurious test edit on every retry.
+            _post_subst_sha = _file_sha(test_path_str)
 
     await agents.run_skill(
         skill_name="ocean-automation-testing",
@@ -1801,18 +1992,53 @@ async def sit_triage(state: OceanState) -> dict:
                              "believed the run failed) -- the SIT passed WITHOUT a PR; needs a manual "
                              "PR or a re-run to produce one")
                 telemetry.station_event(exec_id, 6.4, "pass_without_test_pr", detail=det_detail)
+    # Finding 2a (judge follow-up): the DISK audit the mock wrote itself is authoritative over the
+    # verdict's self-reported list — same principle as F1's junit-over-LLM rule above. Union rather
+    # than replace, so a path the agent reported but the mock's audit missed (e.g. a second mock
+    # launched without the audit path) still counts. Re-apply the rung cap here because the schema's
+    # own `_cap_rung_on_unmocked_hit` only saw the SELF-REPORTED list at validation time.
+    unmocked_paths = sorted(set(v.unmocked_paths_hit) | set(_read_unmocked_paths(exec_id)))
+    fidelity_rung = v.fidelity_rung
+    if unmocked_paths and fidelity_rung > 1:
+        if not v.unmocked_paths_hit:
+            ui.milestone(f"Finding 2a: the mock's own audit recorded {len(unmocked_paths)} unmocked "
+                         f"path(s) the triage verdict did not report — capping fidelity to Rung 1")
+            telemetry.station_event(exec_id, 6.4, "unmocked_selfreport_gap",
+                                    disk=len(unmocked_paths), reported=0)
+        fidelity_rung = 1
     telemetry.station_event(exec_id, 6.4, "end", automation_result=automation_result,
                             failure_class=failure_class, execution_mode=v.execution_mode,
-                            needs_onboarding=v.needs_onboarding, graded_junit_sha=_junit_sha)  # F4: audit fingerprint
+                            needs_onboarding=v.needs_onboarding, graded_junit_sha=_junit_sha,  # F4: audit fingerprint
+                            fidelity_rung=fidelity_rung, ref_load_used=v.ref_load_used,  # Finding 2c
+                            unmocked_paths_hit=len(unmocked_paths))  # Finding 2a: count only (telemetry is flat kwargs)
     return {
         "automation_result": automation_result,
         "failure_class": failure_class,
         "execution_mode": v.execution_mode,
+        "fidelity_rung": fidelity_rung,
+        "ref_load_used": v.ref_load_used,
         "test_automation_pr_url": v.test_automation_pr_url,
         "sit_findings": v.findings_for_coder,
         "needs_onboarding": v.needs_onboarding,
         "onboard_repo": v.onboard_repo,
+        # Finding 2e: carry the post-substitution baseline forward so an env-retry's second triage
+        # compares against what WE wrote, not the pre-substitution authoring hash (else every retry
+        # reports a spurious test edit). Unset when we didn't substitute — keep the original baseline.
+        **({"qa_test_sha": _post_subst_sha} if _post_subst_sha else {}),
         "sit_report": {
+            "unmocked_paths_hit": unmocked_paths,  # Finding 2a: full list lives in the report, not flat state
+            # Finding 2e: a green that followed a test edit must be visible to the ready-flip gate
+            # (_test_edit_ack_reason) and to the human it pauses for. OR-ed with the deterministic
+            # hash comparison above so an agent that never sets the flag (the common case on a PASS,
+            # where failure_class is "" by contract and the automatic latch cannot fire) still trips
+            # the acknowledgement.
+            "test_edited": bool(v.test_edited or detected_test_edit),
+            # Prefer whatever the skill supplied (it can scope the diff to the meaningful hunks);
+            # fall back to the diff WE computed from the authoring snapshot, so a detected-but-
+            # unreported edit still shows the human what actually changed.
+            "test_diff": v.test_diff or detected_diff,
+            "ac_before": v.ac_before,
+            "ac_after": v.ac_after,
             "tests": [t.model_dump() for t in v.tests],
             "changed_repos": [c.model_dump() for c in v.changed_repos],
             "dependencies": [d.model_dump() for d in v.dependencies],
@@ -1902,21 +2128,139 @@ async def prep_env_retry(state: OceanState) -> dict:
 
 
 # ------------------------------------------------------------------ human approval gate (optional)
+def _real_service_gap(state: OceanState) -> str:
+    """Finding 2d: "require a real-service run before a PR goes to review". Returns "" when this run
+    genuinely verified the change against real services, else a short human-readable reason why it
+    did not.
+
+    HONEST LIMIT (a judge review corrected an earlier overclaim in this docstring): every input below
+    is written by the triage skill itself. Nothing independently verifies that a changed repo really
+    executed, so a verdict asserting `fidelity_rung: 2` + `ran_on: "local"` clears this gate on its own
+    word. What the gate does buy is that the claim must be SPECIFIC and INTERNALLY CONSISTENT — silence
+    (no changed_repos at all), an unrecognized mode, a self-declared mock, or a short-circuited rung all
+    fail it. The one fully-independent backstop nearby is the mock's own unmocked-path audit, which caps
+    the rung from OUTSIDE the verdict (see _read_unmocked_paths).
+
+    The inputs:
+
+      * `fidelity_rung < 2` — Rung 2 is defined (local_service_execution.md) as "the SUT runs the
+        reviewed logic end-to-end against real local receiving service(s); a regression in that logic
+        would fail the test". Rung 1 means the SUT reached the service but the reviewed branch was
+        short-circuited — real signal, but NOT a verification of this change. Rung 0 never reaches
+        here (after_sit_triage stops it outright).
+      * an unrecognized `execution_mode` — see schemas._coerce_execution_mode.
+      * a CHANGED repo that did not run for real. `ChangedRepo.ran_on`'s own contract is that a changed
+        repo is always run real ("a mocked repo belongs in dependencies[]") — this VERIFIES that
+        contract instead of assuming it, which is the whole point of a gate.
+
+    Note qat-fallback is NOT a gap: QAT is a real service. The finding's concern is a mock-only run
+    reaching review, not which real environment was used."""
+    rung = state.get("fidelity_rung", 0)
+    if not isinstance(rung, int) or rung < 2:
+        return (f"fidelity Rung {rung} (<2) — the reviewed logic was not exercised end-to-end "
+                f"against real services, so this run did not verify the change itself")
+    mode = state.get("execution_mode", "")
+    if mode not in ("local-mock-first", "qat-fallback"):
+        return f"execution_mode {mode!r} is not a recognized mode — cannot tell how this run executed"
+    changed = (state.get("sit_report") or {}).get("changed_repos") or []
+    # An EMPTY changed_repos is not a pass — it's an absence of evidence. A judge review found the
+    # "did any changed repo run for real?" check below was vacuously true on an empty list, so a
+    # verdict that simply omitted the field (its default is [], and _coerce_list_fields maps null ->
+    # []) sailed through the very gate meant to require a real-service run. Fail-safe: no recorded
+    # execution of the code under review == cannot prove a real-service run.
+    if not changed:
+        return ("no changed_repos recorded — nothing states that the code under review actually ran, "
+                "so a real-service run cannot be verified")
+    # A non-dict entry (e.g. `changed_repos: ["ocean-worker"]`, a REAL observed drift shape per
+    # EXE-968500e9) states no ran_on at all, so it cannot evidence a real run -- count it, rather than
+    # skipping it into a vacuous pass.
+    not_real = [(c.get("repo") or "?") if isinstance(c, dict) else str(c) for c in changed
+                if not isinstance(c, dict) or c.get("ran_on") not in ("local", "real-local")]
+    if not_real:
+        return (f"changed repo(s) did not run for real: {', '.join(not_real)} — the code under review "
+                f"never actually executed")
+    return ""
+
+
+def _test_edit_ack_reason(state: OceanState) -> str:
+    """Finding 2e: "require a human acknowledgement" when a green run followed a test edit. Returns ""
+    when no edit happened. Three sources feed `sit_report["test_edited"]`, with HONEST coverage limits
+    on each (a judge review corrected an earlier "can't be bypassed" claim here):
+      1. the skill reporting it explicitly — omittable;
+      2. the automatic latch off a raw `failure_class: "test_fault"`
+         (schemas._capture_test_edit_signal) — cannot fire on a PASS, where failure_class is "" by
+         contract, which is exactly the case that matters most;
+      3. sit_triage's deterministic hash comparison against the authored file — needs no cooperation,
+         but only works when the recorded test path RESOLVES on this machine (see _resolve_test_file);
+         it is skipped, loudly, when it does not.
+    So on a PASS with an omitted flag AND an unresolvable path, the acknowledgement IS skipped. Source 3
+    is the one worth strengthening (a named absolute `test_path` in the verdict contract).
+    Also flags an AC SHRINK (the test cites fewer acceptance criteria after the edit than before) —
+    the specific abuse shape the review worried about: making a failing test pass by narrowing what
+    it claims to verify."""
+    rep = state.get("sit_report") or {}
+    if not rep.get("test_edited"):
+        return ""
+    before, after = rep.get("ac_before") or [], rep.get("ac_after") or []
+    dropped = [a for a in before if a not in after] if isinstance(before, list) and isinstance(after, list) else []
+    detail = f"; AC coverage SHRANK — dropped {', '.join(map(str, dropped))}" if dropped else ""
+    return (f"this pass followed a test edit (test_fault -> fix -> re-run), so the green reflects a "
+            f"REWRITTEN test, not the original one{detail}")
+
+
 async def human_gate(state: OceanState) -> dict:
     """Optional human approval before the ready-flip (OCEAN_PIPELINE_REQUIRE_APPROVAL). Default OFF
     -> pass-through (auto-flip on green). When ON, interrupt() pauses the run until an engineer
     resumes with a decision (`ocean-pipeline --resume <exe> --approve|--reject`). Either way the
-    pipeline still never merges or deploys — that boundary is unchanged."""
-    if not config.REQUIRE_APPROVAL:
+    pipeline still never merges or deploys — that boundary is unchanged.
+
+    Finding 2d: the pass-through is now CONDITIONAL. A green run that cannot demonstrate it exercised
+    the change against real services (see _real_service_gap) always pauses for a human, even with
+    REQUIRE_APPROVAL off — "require a real-service run before a PR goes to review". This is the one
+    case where the default-off setting is overridden, and the reason is stated in the pause message so
+    the human isn't asked to approve something with no context (Finding 11)."""
+    # Two independent reasons a green run must still be seen by a human, regardless of
+    # REQUIRE_APPROVAL: it never exercised the change against real services (2d), or its green came
+    # from a test that was rewritten mid-run (2e). Both are reported, not just the first.
+    gap = _real_service_gap(state)
+    ack = _test_edit_ack_reason(state)
+    blockers = [b for b in (gap, ack) if b]
+    if not config.REQUIRE_APPROVAL and not blockers:
         return {}
+    for b in blockers:
+        ui.milestone(f"holding the ready-flip for human approval — {b}")
+    if gap:
+        telemetry.station_event(state["execution_id"], 6.45, "real_service_gap", reason=gap[:120])
+    if ack:
+        telemetry.station_event(state["execution_id"], 6.45, "test_edit_ack_required", reason=ack[:120])
     from langgraph.types import interrupt
     decision = interrupt({
         "action": "flip_service_pr_ready",
         "ticket_id": state["ticket_id"],
         "pr_number": state.get("pr_number"),
         "test_automation_pr_url": state.get("test_automation_pr_url"),
-        "prompt": ("SIT passed. Approve flipping the service PR to ready-for-review? "
-                   "Resume with --approve or --reject."),
+        # Finding 11: hand the human the evidence, not just a yes/no question.
+        "fidelity_rung": state.get("fidelity_rung", 0),
+        "execution_mode": state.get("execution_mode", ""),
+        "real_service_gap": gap,
+        "tests": ((state.get("sit_report") or {}).get("tests") or [])[:10],
+        "changed_repos": (state.get("sit_report") or {}).get("changed_repos") or [],
+        "unmocked_paths_hit": ((state.get("sit_report") or {}).get("unmocked_paths_hit") or [])[:10],
+        "evidence": (state.get("sit_report") or {}).get("evidence", ""),
+        # Finding 2e: the human acknowledging a post-edit pass needs to SEE the edit.
+        "test_edit_ack_reason": ack,
+        "test_edited": bool((state.get("sit_report") or {}).get("test_edited")),
+        "test_diff": ((state.get("sit_report") or {}).get("test_diff") or "")[:4000],
+        "ac_before": (state.get("sit_report") or {}).get("ac_before") or [],
+        "ac_after": (state.get("sit_report") or {}).get("ac_after") or [],
+        "prompt": (
+            ("SIT passed, but a human must look before this goes to review:\n"
+             + "\n".join(f"  - {b}" for b in blockers) + "\nApprove flipping the service PR to "
+             "ready-for-review anyway? "
+             if blockers else
+             "SIT passed. Approve flipping the service PR to ready-for-review? ")
+            + "Resume with --approve or --reject."
+        ),
     })
     return {"approval_decision": str(decision)}
 
@@ -2000,8 +2344,15 @@ async def stop_run(state: OceanState) -> dict:
         for f in (state.get("review_findings") or []))
     review_stop_no_diff = review_rejected and not branch_set
     review_stop_blocking = review_rejected and branch_set and not pr_opened and has_blocking
+    # Finding 2c (architecture review): after_sit_triage routes a Rung-0 "trivial green" PASS here
+    # (never a genuine failure) -- give it its own reason/label rather than falling through to the
+    # generic "sit_failed" (misleading: automation_result really was "passed", just untrustworthy).
+    trivial_green = (state.get("automation_result") == "passed"
+                      and state.get("fidelity_rung", 0) == 0)
     if state.get("needs_onboarding"):
         reason, station = "repo_onboarding_exhausted", 6   # still unsupported after MAX_ONBOARD_ATTEMPTS
+    elif trivial_green:
+        reason, station = "trivial_green_no_signal", 6
     elif review_stop_blocking:
         reason, station = "review_budget_exhausted_blocking_findings", 5
     elif review_stop_no_diff:
@@ -2016,6 +2367,18 @@ async def stop_run(state: OceanState) -> dict:
         reason, station = "could_not_verify", 6
     else:
         reason, station = "sit_failed", 6
+    # Finding 3 (architecture review, "Give Pipeline Memory"): record a structured lesson keyed by
+    # (domain_bucket, action_sig, fail_sig) so a LATER ticket in the SAME domain can recall it before
+    # starting fresh (see researcher()'s recall_lessons() call) instead of re-discovering the exact
+    # same failure pattern from zero every time. Best-effort -- never blocks or affects this run's
+    # own outcome; only feeds a future one.
+    lessons.record_failure(
+        domain_bucket=state.get("domain_bucket") or "",
+        action_sig=f"station_{station}",
+        fail_sig=reason,
+        ticket_id=state["ticket_id"],
+        execution_id=state["execution_id"],
+    )
     telemetry.station_event(state["execution_id"], station, "stop", reason=reason)
     if state.get("pr_number"):
         pr_note = f"service PR #{state['pr_number']} left draft"
@@ -2024,8 +2387,11 @@ async def stop_run(state: OceanState) -> dict:
                    f"CRITICAL/MAJOR at review-budget exhaustion; no PR opened, needs a human")
     else:
         pr_note = "no PR was opened -- no diff for the reviewer to approve"
-    # Don't prefix review-stage stops with "sit_failed:" -- they never reached SIT.
-    outcome_prefix = "review_stopped" if (review_stop_blocking or review_stop_no_diff) else "sit_failed"
+    # Don't prefix review-stage stops with "sit_failed:" -- they never reached SIT. Don't prefix a
+    # trivial-green stop with it either -- the SIT genuinely passed, it just didn't prove anything.
+    outcome_prefix = ("review_stopped" if (review_stop_blocking or review_stop_no_diff)
+                       else "sit_unverified" if trivial_green
+                       else "sit_failed")
     return {"final_status": "failed", "ready_flipped": False,
             "final_outcome": f"{outcome_prefix}:{reason}; {pr_note}"}
 
@@ -2043,13 +2409,21 @@ async def rca_agent(state: OceanState) -> dict:
         ticket_id=state["ticket_id"],
         execution_id=state["execution_id"],
         task_prompt=(
-            f"Produce the ocean-rca evidence-cited report for {state['ticket_id']}. "
-            f"WRITE the completed 5-part report as markdown to an absolute file path and return that "
-            f"path as `report_path`: root cause, evidence (with proof — specific SigNoz/ClickHouse log "
-            f"lines + the source that produced them + read-only Redshift records), affected "
-            f"service/component, and recommended fix. Do NOT post to Jira yourself — the graph's "
-            f"rca_report step posts the report as a SINGLE Jira comment (deterministic, one comment "
-            f"per investigation). "
+            f"Produce the ocean-rca evidence-cited report for {state['ticket_id']} following "
+            f"rca-research.md EXACTLY — its Step 0 connectivity gate, rejected-hypotheses discipline, "
+            f"and Step 5.5 adversarial self-critique are HARD REQUIREMENTS, not optional (an earlier "
+            f"version of this instruction said '5-part report' and omitted all three, which an "
+            f"architecture review flagged as the automated path silently dropping every guardrail the "
+            f"skill provides on a human-run investigation — do not reintroduce that gap). "
+            f"WRITE the completed **7-part report** as markdown to an absolute file path and return "
+            f"that path as `report_path`: (1) Flow Analysis, (2) Hypotheses Explored & Rejected — every "
+            f"plausible alternative mechanism + the SPECIFIC evidence that ruled it out, (3) Root Cause "
+            f"— code-, PR-, graph-, or log-verified with a specific file/function/config cited, "
+            f"(4) Impact, (5) Fix, (6) Prevention, (7) Adversarial Self-Critique — the Step 5.5 output: "
+            f"every `investigator-bias` entry from skills/ocean-rca/eval/bias-registry.json, the "
+            f"specific check performed against THIS hypothesis, and the verdict. Do NOT post to Jira "
+            f"yourself — the graph's rca_report step posts the report as a SINGLE Jira comment "
+            f"(deterministic, one comment per investigation). "
             f"STRICT PRODUCTION SAFETY: use rca-app / fourkites MCP tools for READ/GET only; NEVER call "
             f"any create/update/delete/resolve tool against production. Then decide: "
             f"does the root cause require a code fix in an ocean repo? If yes, set fix_needed=true "
@@ -2066,7 +2440,7 @@ async def rca_agent(state: OceanState) -> dict:
 
 # ------------------------------------------------------------------ RCA report post (plain code, one Jira comment)
 async def rca_report(state: OceanState) -> dict:
-    """Post the RCA worker's 5-part report to Jira as a SINGLE comment — deterministic plain code, run
+    """Post the RCA worker's 7-part report to Jira as a SINGLE comment — deterministic plain code, run
     by the graph, NOT the worker. This is the control-plane's own Jira transport (`jira.py`, the same
     Bearer-token REST path used for the lifecycle transitions), so RCA posting no longer depends on the
     headless worker having an interactively-authenticated Atlassian MCP (which may be absent in headless
@@ -2087,8 +2461,9 @@ async def rca_report(state: OceanState) -> dict:
 
 # ------------------------------------------------------------------ RCA review gate (human, before acting on the RCA)
 async def rca_review_gate(state: OceanState) -> dict:
-    """Human review of the RCA report rca_agent already posted as a Jira comment, before the
-    graph acts on its own conclusion — either ending at the terminal report (no fix) or
+    """Human review of the RCA report the graph's rca_report node already posted as a Jira comment
+    (rca_agent itself never posts), before the graph acts on its own conclusion — either ending at
+    the terminal report (no fix) or
     proceeding into autonomous coding (fix needed). Default ON (interrupt() + wait).
     OCEAN_PIPELINE_RCA_REVIEW_AUTO skips the pause and auto-approves, for the headless
     --rca-only control-plane flow."""

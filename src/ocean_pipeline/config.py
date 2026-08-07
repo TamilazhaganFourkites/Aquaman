@@ -177,8 +177,9 @@ LOG_LEVEL = _env_log_level if _env_log_level in _LOG_LEVELS else "developer"
 # oas-autodev spawn-aquaman.sh for the rca action) or the CLI --rca-only flag.
 RCA_ONLY = os.environ.get("OCEAN_PIPELINE_RCA_ONLY", "").lower() in ("1", "true", "yes")
 
-# RCA review gate. rca_agent already posts its 5-part evidence-cited report as a Jira comment,
-# but nothing gated on it before this — an LLM's own root-cause conclusion could silently kick
+# RCA review gate. The graph's rca_report node already posts the worker's 7-part evidence-cited
+# report as a Jira comment (rca_agent itself never posts — see nodes.py), but nothing gated on it
+# before this — an LLM's own root-cause conclusion could silently kick
 # off an entire autonomous coding run (fix_needed=true) with no human having read the analysis
 # first. Default ON (the graph interrupt()s and waits) — unlike REQUIRE_APPROVAL below, this is
 # the FIRST checkpoint before autonomous work starts, not the last one before a already-tested
@@ -193,6 +194,12 @@ MAX_REVIEW_ITERATIONS = 2
 # Optional human-approval gate before the ready-flip. Default OFF (auto-flip on green, the
 # intended terminal action). When ON, the graph interrupt()s and waits for an engineer to
 # resume with an approve/reject decision — the pipeline still never merges or deploys.
+# NOTE (Findings 2d/2e): OFF is no longer an unconditional auto-flip. human_gate ALWAYS pauses,
+# regardless of this setting, when the green cannot be trusted on its own — a run that didn't
+# exercise the change against real services (nodes._real_service_gap: Rung < 2, unrecognized
+# execution_mode, or a changed repo that didn't really run), or whose pass followed a mid-run test
+# edit (nodes._test_edit_ack_reason). Unattended/batch operators should expect those pauses; the
+# reason is always stated in the pause message.
 REQUIRE_APPROVAL = os.environ.get("OCEAN_PIPELINE_REQUIRE_APPROVAL", "").lower() in ("1", "true", "yes")
 
 # SIT QA review gate. After the SIT scenarios + sample test are drafted, a human reviews them and
