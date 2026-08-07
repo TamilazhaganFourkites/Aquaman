@@ -41,7 +41,7 @@ _STATION_NAMES = {
     0.6: "prep_image",
     1: "dependency_resolver", 1.5: "reachability_gate",
     3.5: "prep_container", 3.6: "teardown_container",
-    3.87: "open_pr", 4: "coder",
+    3.87: "open_pr", 4: "coder", 4.5: "quality_gate",
     5: "harsh_review", 5.9: "code_fault_rework",
     5.95: "learn_repo", 6.0: "sit_resolve", 6.1: "sit_author", 6.15: "qa_review_gate",
     6.2: "sit_run", 6.3: "sit_testrail", 6.4: "sit_triage", 6.45: "environment_failure_rework",

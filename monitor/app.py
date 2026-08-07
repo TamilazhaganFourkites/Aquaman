@@ -97,6 +97,7 @@ LABEL_TO_NODE = {
     "Open questions — awaiting approval": "blocked_review_gate",
     "GAN-hardened test scenarios": "qa_scenarios",
     "Coding": "coder",
+    "Static quality gate": "quality_gate",
     "Adversarial code review": "harsh_reviewer",
     "Open draft PR": "open_pr",
     "Local SIT — resolve & gate": "sit_resolve",

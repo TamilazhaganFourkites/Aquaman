@@ -81,6 +81,38 @@ def _has_blocking_findings(state: OceanState) -> bool:
     return any(schemas.is_blocking_finding(f) for f in (state.get("review_findings") or []))
 
 
+def after_quality_gate(state: OceanState) -> str:
+    """Station 4.5: deterministic zero-config static checks on the coder's CHANGED files.
+
+    Blocking on a real finding, but note what "blocking" means here — only SYNTAX/parse errors carry a
+    blocking severity. gofmt formatting is emitted at MINOR on purpose: 43 of 184 .go files in
+    ocean-service are already gofmt-dirty on an untouched checkout, so blocking on formatting would
+    kill legitimate runs on files the coder barely touched rather than gate them.
+
+    Uses `schemas.is_blocking_finding` — the SAME canonicalizer `after_review`, `_has_blocking_findings`
+    and ReviewVerdict's F2 validator use — so one severity string can never be blocking for one gate
+    and invisible to another (the lockstep failure a review already caught once).
+
+    Fails OPEN on infrastructure, CLOSED on evidence. Note the routing keys off FINDINGS ONLY, which
+    is what makes that true — NOT "a could-not-run gate produces no findings", which an earlier
+    version of this docstring claimed and which is false: the gate is multi-language, so partial
+    coverage is normal and a run can carry findings AND a could-not-run reason at once (see
+    quality.run_all's own docstring, which is the correct statement)."""
+    blocking = [f for f in (state.get("quality_gate_findings") or [])
+                if schemas.is_blocking_finding(f)]
+    if not blocking:
+        return "proceed"
+    # `>` not `>=`: MAX counts BOUNCES, and `quality_gate` has already incremented by the time this
+    # runs. With `>=` the first blocking finding stopped the run outright — the rework edge below was
+    # unreachable and the coder-prompt injection never executed (judge review).
+    if state.get("quality_gate_attempts", 0) > config.MAX_QUALITY_GATE_ATTEMPTS:
+        # Budget spent. Route to stop_run, NOT onward — "budget exhaustion converts to approve" is the
+        # escape class F3 already fixed, and letting a file that does not parse reach the reviewer
+        # (running on a different model) is exactly that mistake in a new place.
+        return "stop"
+    return "rework"
+
+
 def after_review(state: OceanState) -> str:
     if state.get("review_verdict") == "APPROVE":
         return "approve"
@@ -220,6 +252,11 @@ def build_graph():
         g.add_node("teardown_container", nodes.teardown_container)  # #1/#6: remove run-scoped Docker at end
     g.add_node("coder", nodes.coder)
     g.add_node("harsh_reviewer", nodes.harsh_reviewer)
+    if config.QUALITY_GATE:
+        # Station 4.5 — plain-code static checks between the coder and the LLM review.
+        # Registered conditionally (same shape as prep_image/prep_container) so with the knob
+        # off the compiled topology is byte-identical to before this feature existed.
+        g.add_node("quality_gate", nodes.quality_gate)
     g.add_node("open_pr", nodes.open_pr)
     # Station 6 decomposed into graph-owned phases (drives the skill one --only phase at a time).
     g.add_node("sit_resolve", nodes.sit_resolve)                 # resolve changed repo + onboarding check
@@ -287,7 +324,15 @@ def build_graph():
     # fixed target `coder` must satisfy. A code_fault rework re-enters at `coder` (below) and never
     # loops back through `qa_scenarios`, by construction (this is qa_scenarios' only outbound edge).
     g.add_edge("qa_scenarios", "coder")
-    g.add_edge("coder", "harsh_reviewer")
+    if config.QUALITY_GATE:
+        g.add_edge("coder", "quality_gate")
+        g.add_conditional_edges("quality_gate", after_quality_gate, {
+            "proceed": "harsh_reviewer",   # clean, or could-not-run (fails OPEN, loudly)
+            "rework": "coder",             # blocking finding, budget remaining
+            "stop": "stop_run",            # budget spent — needs a human, never ships
+        })
+    else:
+        g.add_edge("coder", "harsh_reviewer")
     g.add_conditional_edges("harsh_reviewer", after_review,
                             {"rework": "coder", "approve": "open_pr", "stop": "stop_run"})
 

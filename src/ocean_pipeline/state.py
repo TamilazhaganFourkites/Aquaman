@@ -89,6 +89,18 @@ class OceanState(TypedDict, total=False):
     files_changed: int
     worktree_dir: str        # absolute path of the coder's local clone; reviewer + rework cwd here
 
+    # --- Station 4.5: deterministic quality gate (plain code, no agent) ---
+    # Every one of these MUST be declared: LangGraph silently DROPS any key a node returns that the
+    # schema doesn't know about (see the rca_report_gate_problems comment above — this repo has now
+    # been bitten by that three times, twice while building gates exactly like this one).
+    quality_gate_findings: list      # [{severity,file,summary,line?,fix_direction?}] — [] on a clean pass
+    quality_gate_unverified: str     # non-empty when a language slice could NOT be checked (fails OPEN, loudly)
+    quality_gate_checked_files: int  # evidence the gate ACTUALLY ran; 0 with files derived == inert
+    quality_gate_attempts: int       # capped by MAX_QUALITY_GATE_ATTEMPTS; reset ONLY by prep_rework
+    quality_gate_stopped: bool       # set only on the stop branch, so stop_run can label it without
+                                     # keying on `attempts >= MAX` (which stays true for the rest of
+                                     # the run and would mislabel any LATER, unrelated stop)
+
     # --- Station 5: review loop (gated at MAX_REVIEW_ITERATIONS) ---
     review_verdict: ReviewVerdict
     review_iteration: int

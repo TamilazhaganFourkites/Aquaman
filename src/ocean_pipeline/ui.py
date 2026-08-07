@@ -39,6 +39,7 @@ _LABELS = {
     "blocked_review_gate": "Open questions — awaiting approval",
     "qa_scenarios":       "GAN-hardened test scenarios",
     "coder":              "Coding",
+    "quality_gate":       "Static quality gate",
     "harsh_reviewer":     "Adversarial code review",
     "open_pr":            "Open draft PR",
     "sit_resolve":        "Local SIT — resolve & gate",
@@ -132,6 +133,21 @@ def _details(node: str, upd: dict) -> list[str]:
         d.append(f"{fc} file(s) changed" if fc else "changes committed")
         if upd.get("branch"):
             d.append(f"pushed branch {upd['branch']}")
+    elif node == "quality_gate":
+        checked = upd.get("quality_gate_checked_files")
+        if checked is not None:
+            d.append(f"{checked} changed file(s) checked")
+        for f in (upd.get("quality_gate_findings") or [])[:3]:
+            if isinstance(f, dict):
+                where = f.get("file") or ""
+                line = f":{f['line']}" if f.get("line") else ""
+                d.append(f"  {f.get('severity', '?')}: {f.get('summary', '')}"
+                         f"{f' ({where}{line})' if where else ''}".rstrip())
+        extra = len(upd.get("quality_gate_findings") or []) - 3
+        if extra > 0:
+            d.append(f"  … +{extra} more")
+        if upd.get("quality_gate_unverified"):
+            d.append(f"  NOT fully checked: {str(upd['quality_gate_unverified'])[:120]}")
     elif node == "harsh_reviewer":
         findings = upd.get("review_findings") or []
         if findings:
@@ -198,6 +214,15 @@ def _highlight(node: str, upd: dict) -> str:
         return "code fix needed" if upd.get("rca_fix_needed") else "no code fix"
     if node == "rca_review_gate" and upd.get("rca_approval_decision"):
         return str(upd["rca_approval_decision"])
+    if node == "quality_gate":
+        from . import schemas as _s
+        blocking = [f for f in (upd.get("quality_gate_findings") or []) if _s.is_blocking_finding(f)]
+        checked = upd.get("quality_gate_checked_files") or 0
+        if blocking:
+            return f"{len(blocking)} blocking issue(s) — back to Coding"
+        if upd.get("quality_gate_unverified"):
+            return f"DID NOT fully run — {checked} file(s) checked"
+        return f"{checked} file(s) clean"
     if node == "coder":
         return "branch pushed"
     if node == "harsh_reviewer":

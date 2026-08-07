@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
 import json
 import os
 import re
@@ -2827,3 +2828,307 @@ def test_stop_run_labels_a_review_stop_consistently_with_the_gate(tmp_path, monk
 
     # A MINOR-only residual is NOT a review stop — it proceeds, so this must not over-trigger.
     assert _outcome("MINOR")[0] == "approve"
+
+
+# ----------------------------------------------------------------- Station 4.5: quality gate
+def test_after_quality_gate_router():
+    """Only syntax/parse errors block. gofmt formatting is MINOR by design — 43 of 184 .go files in
+    ocean-service are ALREADY gofmt-dirty on an untouched checkout, so blocking on it would kill
+    legitimate runs rather than gate them."""
+    crit = [{"severity": "CRITICAL", "file": "a.rb", "summary": "does not parse"}]
+    assert graph.after_quality_gate({}) == "proceed"
+    assert graph.after_quality_gate({"quality_gate_findings": []}) == "proceed"
+    assert graph.after_quality_gate({"quality_gate_findings": [{"severity": "MINOR"}]}) == "proceed"
+    # could-not-run yields no findings, so it always proceeds: fail OPEN on infra, CLOSED on evidence.
+    assert graph.after_quality_gate({"quality_gate_unverified": "gofmt missing"}) == "proceed"
+    # MAX counts BOUNCES, and the node has ALREADY incremented by the time the router reads it — so
+    # attempts == MAX is the first bounce (rework) and attempts > MAX is the stop. With `>=` here the
+    # first blocking finding ended the run outright, making the rework edge unreachable and the
+    # coder-prompt injection dead code (judge review). Note `attempts: 0` is deliberately NOT tested:
+    # the node can never produce it alongside a blocking finding, and asserting on impossible states
+    # is how the two halves of this gate passed their own tests while disagreeing with each other.
+    assert graph.after_quality_gate({"quality_gate_findings": crit,
+                                     "quality_gate_attempts": config.MAX_QUALITY_GATE_ATTEMPTS}) == "rework"
+    assert graph.after_quality_gate({"quality_gate_findings": crit,
+                                     "quality_gate_attempts": config.MAX_QUALITY_GATE_ATTEMPTS + 1}) == "stop"
+    # The shared canonicalizer must be in the path — a decorated severity still blocks.
+    assert graph.after_quality_gate({"quality_gate_findings": [{"severity": " **critical** "}],
+                                     "quality_gate_attempts": 1}) == "rework"
+
+
+def test_quality_gate_is_on_by_default():
+    """config.py states "a gate shipped default-off is not shipped". The wiring test monkeypatches
+    the flag, so nothing pinned the DEFAULT — a judge flipped it to "0" with the whole suite green."""
+    import importlib, os
+    from ocean_pipeline import config as _c
+    saved = os.environ.pop("OCEAN_PIPELINE_QUALITY_GATE", None)
+    try:
+        assert importlib.reload(_c).QUALITY_GATE is True
+    finally:
+        if saved is not None:
+            os.environ["OCEAN_PIPELINE_QUALITY_GATE"] = saved
+        importlib.reload(_c)
+
+
+def test_quality_gate_wiring_on_and_off(monkeypatch):
+    monkeypatch.setattr(config, "QUALITY_GATE", True)
+    edges = {(e.source, e.target) for e in graph.build_graph().compile().get_graph().edges}
+    assert ("coder", "quality_gate") in edges
+    assert ("quality_gate", "harsh_reviewer") in edges
+    assert ("quality_gate", "coder") in edges          # rework bounce
+    assert ("quality_gate", "stop_run") in edges       # budget spent
+    assert ("coder", "harsh_reviewer") not in edges    # the gate now sits between them
+
+    # OFF must restore the exact pre-feature topology.
+    monkeypatch.setattr(config, "QUALITY_GATE", False)
+    edges = {(e.source, e.target) for e in graph.build_graph().compile().get_graph().edges}
+    assert ("coder", "harsh_reviewer") in edges
+    assert not any("quality_gate" in n for e in edges for n in e)
+
+
+def test_quality_gate_state_keys_survive_the_schema():
+    """LangGraph silently DROPS undeclared keys — this repo has been bitten three times, twice while
+    building gates exactly like this one."""
+    from ocean_pipeline.state import OceanState
+    for k in ("quality_gate_findings", "quality_gate_unverified", "quality_gate_checked_files",
+              "quality_gate_attempts", "quality_gate_stopped"):
+        assert k in OceanState.__annotations__, k
+
+
+def test_quality_gate_findings_reach_the_coders_rework_prompt(tmp_path, monkeypatch):
+    """THE load-bearing edit. Without it the gate bounces the run back to the coder, which re-runs
+    BLIND, reproduces the same file, and the attempt budget turns a recoverable syntax error into a
+    failed run."""
+    seen = {}
+
+    async def fake_run_agent(**kw):
+        seen[kw["node"]] = kw["task_prompt"]
+        return schemas.CoderVerdict(branch="MM-1/x", files_changed=1, repo="cloudqwest/ocean-worker",
+                                    repo_dir=str(tmp_path))
+
+    monkeypatch.setattr(agents, "run_agent", fake_run_agent)
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes, "_any_docker_repo", lambda *a, **kw: False)
+
+    finding = {"severity": "CRITICAL", "file": "app/x.rb", "summary": "does not parse: unexpected end"}
+    asyncio.run(nodes.coder({"execution_id": "E", "ticket_id": "MM-1", "summary": "s",
+                             "route": "coding", "quality_gate_findings": [finding]}))
+    prompt = seen["coder"]
+    assert "STATIC QUALITY GATE" in prompt
+    assert "app/x.rb" in prompt, "the coder must be told WHICH file"
+    assert "do NOT" in prompt, "the bounce must be scoped to a fix, not a redesign"
+
+    # ...and a clean run must not carry the section at all.
+    seen.clear()
+    asyncio.run(nodes.coder({"execution_id": "E", "ticket_id": "MM-1", "summary": "s",
+                             "route": "coding", "quality_gate_findings": []}))
+    assert "STATIC QUALITY GATE" not in seen["coder"]
+
+
+def test_quality_gate_stop_is_labelled_against_station_45_not_sit(tmp_path, monkeypatch):
+    """A stop here must not read as `sit_failed` — that would send the triaging human to a station
+    that never ran. And the label keys on a dedicated boolean, NOT on `attempts >= MAX`, which stays
+    true for the rest of the run and would mislabel any later unrelated stop."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.jira, "comment", lambda *a, **kw: None)
+
+    out = asyncio.run(nodes.stop_run({
+        "execution_id": "E", "ticket_id": "MM-1", "branch": "MM-1/x", "quality_gate_stopped": True,
+        "quality_gate_findings": [{"severity": "CRITICAL", "file": "a.rb", "summary": "no parse"}]}))
+    assert out["final_status"] == "failed"
+    assert "quality_gate_stopped" in out["final_outcome"]
+    assert "sit_failed" not in out["final_outcome"]
+
+    # The budget being spent is NOT on its own a quality-gate stop.
+    out = asyncio.run(nodes.stop_run({
+        "execution_id": "E", "ticket_id": "MM-1", "branch": "MM-1/x",
+        "quality_gate_attempts": 99, "quality_gate_stopped": False, "failure_class": "code_fault"}))
+    assert "quality_gate" not in out["final_outcome"], "a later unrelated stop must not inherit the label"
+
+
+def test_prep_rework_is_the_only_place_the_gate_budget_resets():
+    """`harsh_reviewer --rework--> coder` goes DIRECTLY; prep_rework serves only the Station-6
+    code_fault loop. Resetting the counter anywhere on the review path makes the
+    coder <-> quality_gate cycle unbounded."""
+    out = asyncio.run(nodes.prep_rework({"execution_id": "E", "coding_attempts": 0}))
+    assert out["quality_gate_attempts"] == 0
+    assert out["quality_gate_findings"] == [] and out["quality_gate_stopped"] is False
+    src = inspect.getsource(nodes.coder)
+    assert "quality_gate_attempts" not in src, "the coder must NOT reset the gate budget"
+
+
+def _qg_repo(root, *, broken: bool):
+    """A real git repo whose branch changes one .rb — broken or valid."""
+    d = root / "workspace"
+    d.mkdir(parents=True, exist_ok=True)
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True)
+
+    g("init", "-q", "-b", "develop"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    (d / ".ruby-version").write_text(
+        subprocess.run(["ruby", "-e", "print RUBY_VERSION"], capture_output=True,
+                       text=True).stdout.strip() + "\n")
+    (d / "seed.rb").write_text("puts 1\n")
+    g("add", "-A"); g("commit", "-qm", "base"); g("update-ref", "refs/remotes/origin/develop", "HEAD")
+    g("checkout", "-qb", "MM-1/fix")
+    (d / "app.rb").write_text("def f\n  1\n" if broken else "def f\n  1\nend\n")
+    g("add", "-A"); g("commit", "-qm", "work")
+    return d
+
+
+@pytest.mark.skipif(not shutil.which("ruby") or not shutil.which("git"), reason="needs ruby + git")
+def test_quality_gate_node_output_composed_into_the_real_router(tmp_path, monkeypatch):
+    """The test that would have caught the worst bug in this feature.
+
+    Every other test here checks the node OR the router in isolation. A judge found they disagreed:
+    the node increments `quality_gate_attempts` BEFORE the router reads it, so with `>=` and
+    MAX_QUALITY_GATE_ATTEMPTS=1 the FIRST blocking finding routed straight to `stop` — the `rework`
+    edge was unreachable and the coder-prompt injection (the load-bearing half of the whole feature)
+    was dead code. Both halves passed their own tests. Compose them or you are testing neither."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "station_start", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "milestone", lambda *a, **kw: None)
+
+    d = _qg_repo(tmp_path / "E", broken=True)
+    state = {"execution_id": "E", "worktree_dir": str(d)}
+
+    # Derived from the config, not hardcoded to two firings — a judge found the hardcoded version
+    # turned the suite red under the supported OCEAN_PIPELINE_MAX_QUALITY_GATE_ATTEMPTS=2.
+    for firing in range(1, config.MAX_QUALITY_GATE_ATTEMPTS + 1):
+        out = asyncio.run(nodes.quality_gate(state))
+        state = {**state, **out}
+        assert out["quality_gate_checked_files"] > 0, "the gate must actually check something"
+        assert out["quality_gate_findings"], "a file with no `end` must produce a finding"
+        assert graph.after_quality_gate(state) == "rework", \
+            f"firing {firing} of {config.MAX_QUALITY_GATE_ATTEMPTS} must bounce to the coder, not end the run"
+        assert out["quality_gate_stopped"] is False
+
+    # One firing past the budget, defect unfixed: stop.
+    out2 = asyncio.run(nodes.quality_gate(state))
+    state2 = {**state, **out2}
+    assert graph.after_quality_gate(state2) == "stop"
+    assert out2["quality_gate_stopped"] is True
+
+    # And a VALID file must sail through — no false positive on real ruby.
+    clean = _qg_repo(tmp_path / "E2", broken=False)
+    out3 = asyncio.run(nodes.quality_gate({"execution_id": "E2", "worktree_dir": str(clean)}))
+    assert out3["quality_gate_findings"] == []
+    assert out3["quality_gate_checked_files"] > 0
+    assert graph.after_quality_gate({**out3}) == "proceed"
+
+
+def test_quality_gate_derived_zero_is_never_a_clean_pass(tmp_path, monkeypatch):
+    """`derived == 0` was the one shape that stayed silent: a judge evaded the invariant through it
+    three ways (non-ASCII filename, worktree left on the base branch, single-branch clone) and each
+    produced zero milestones, empty `unverified`, and a UI reading '0 file(s) clean'. The module's own
+    docstring names an empty changed-file list as the #1 inertness hazard."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "station_start", lambda *a, **kw: None)
+    said = []
+    monkeypatch.setattr(nodes.ui, "milestone", lambda m, *a, **kw: said.append(str(m)))
+
+    d = tmp_path / "EZ" / "workspace"
+    d.mkdir(parents=True)
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True)
+
+    g("init", "-q", "-b", "develop"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    (d / "seed.rb").write_text("puts 1\n")
+    g("add", "-A"); g("commit", "-qm", "base"); g("update-ref", "refs/remotes/origin/develop", "HEAD")
+    # HEAD == base: nothing was changed, so nothing can be derived.
+    out = asyncio.run(nodes.quality_gate({"execution_id": "EZ", "worktree_dir": str(d)}))
+    assert out["quality_gate_checked_files"] == 0
+    assert out["quality_gate_unverified"], "deriving nothing must NOT read as a clean pass"
+    assert any("DID NOT" in m for m in said), "and it must reach the loud channel"
+    assert "clean" not in nodes.ui._highlight("quality_gate", out)
+    assert graph.after_quality_gate({**out}) == "proceed"      # still fails OPEN
+
+
+def test_quality_gate_budget_is_per_defect_not_per_run(tmp_path, monkeypatch):
+    """`harsh_reviewer --rework--> coder` bypasses prep_rework, so the counter was a GLOBAL run
+    budget: a brand-new syntax error introduced on a later review round inherited the spent budget
+    and went straight to stop_run — killing a healthy run over a defect the coder never saw once."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "station_start", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "milestone", lambda *a, **kw: None)
+
+    d = _qg_repo(tmp_path / "EB", broken=True)
+    st = {"execution_id": "EB", "worktree_dir": str(d)}
+
+    def commit(text):
+        (d / "app.rb").write_text(text)
+        subprocess.run(["git", "-C", str(d), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(d), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "x"], capture_output=True)
+
+    out = asyncio.run(nodes.quality_gate(st)); st = {**st, **out}
+    assert graph.after_quality_gate(st) == "rework"
+    commit("def f\n  1\nend\n")                     # coder fixes it
+    out = asyncio.run(nodes.quality_gate(st)); st = {**st, **out}
+    assert graph.after_quality_gate(st) == "proceed"
+    assert out["quality_gate_attempts"] == 0, "a clean pass must RETURN the bounce budget"
+    commit("def g\n  2\n")                           # a NEW first-time defect, later round
+    out = asyncio.run(nodes.quality_gate(st)); st = {**st, **out}
+    assert graph.after_quality_gate(st) == "rework", \
+        "a defect the coder has never been handed must get its own bounce"
+
+
+def test_quality_gate_node_invariant_fires_when_nothing_is_checked(tmp_path, monkeypatch):
+    """derived > 0 with checked == 0 is the real inert shape (a judge reproduced it on a live run:
+    8 files derived, 0 checked, findings empty, route proceed). It must read as could-not-run."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "station_start", lambda *a, **kw: None)
+    said = []
+    monkeypatch.setattr(nodes.ui, "milestone", lambda m, *a, **kw: said.append(str(m)))
+
+    d = tmp_path / "E3" / "workspace"
+    d.mkdir(parents=True)
+
+    def g(*a):
+        return subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True)
+
+    g("init", "-q", "-b", "develop"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+    (d / "seed.txt").write_text("x\n")
+    g("add", "-A"); g("commit", "-qm", "base"); g("update-ref", "refs/remotes/origin/develop", "HEAD")
+    g("checkout", "-qb", "MM-1/fix")
+    (d / "notes.md").write_text("# hi\n")            # derived, but no checker exists for it
+    g("add", "-A"); g("commit", "-qm", "work")
+
+    out = asyncio.run(nodes.quality_gate({"execution_id": "E3", "worktree_dir": str(d)}))
+    assert out["quality_gate_checked_files"] == 0
+    assert out["quality_gate_unverified"], "checking nothing must NOT read as a clean pass"
+    assert any("DID NOT FULLY RUN" in m for m in said)
+    # ...but it still fails OPEN: no findings, so the run proceeds to the reviewer.
+    assert graph.after_quality_gate({**out}) == "proceed"
+
+
+def test_quality_gate_node_never_propagates_an_exception(tmp_path, monkeypatch):
+    """Fail-open is a CLASS guarantee, not a list of known triggers. A non-UTF-8 path once raised
+    UnicodeDecodeError straight out through run_all, asyncio.to_thread and this node, turning a run
+    that would have completed into `[FAILED] UnicodeDecodeError` — failing CLOSED on infrastructure,
+    which this node's contract forbids. That trigger is fixed; this pins the guarantee so no future
+    checker can reintroduce the class."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "station_start", lambda *a, **kw: None)
+    said = []
+    monkeypatch.setattr(nodes.ui, "milestone", lambda m, *a, **kw: said.append(str(m)))
+
+    def boom(*a, **kw):
+        raise UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(nodes.quality, "run_all", boom)
+    out = asyncio.run(nodes.quality_gate({"execution_id": "EX", "worktree_dir": str(tmp_path)}))
+    assert out["quality_gate_findings"] == []
+    assert out["quality_gate_unverified"], "a gate that raised must report could-not-run"
+    assert "UnicodeDecodeError" in out["quality_gate_unverified"]
+    assert any("DID NOT" in m for m in said), "and it must be loud"
+    assert graph.after_quality_gate({**out}) == "proceed", "fail OPEN, never CLOSED, on infra"

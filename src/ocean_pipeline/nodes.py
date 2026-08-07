@@ -21,7 +21,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import agents, config, gitops, jira, lessons, schemas, telemetry, ui
+from . import agents, config, gitops, jira, lessons, quality, schemas, telemetry, ui
 from .state import OceanState
 
 
@@ -1122,6 +1122,18 @@ async def coder(state: OceanState) -> dict:
     if sit_findings:
         rework += (f"\nAddress these Station 6 SIT code-fault findings (real defects a passing "
                    f"SIT would catch):\n{json.dumps(sit_findings, indent=2)}\n")
+    # Station 4.5. THE load-bearing half of the quality gate: without this the gate bounces the run
+    # back here and the coder re-runs BLIND, reproduces the same file, and the attempt budget turns a
+    # recoverable syntax error into a failed run.
+    quality_findings = state.get("quality_gate_findings", [])
+    if quality_findings and any(schemas.is_blocking_finding(f) for f in quality_findings):
+        rework += (
+            f"\nSTATIC QUALITY GATE — BLOCKING. A deterministic, non-LLM check ran plain `ruby -c` / "
+            f"`gofmt -l -e` / a Python or YAML parse over the files you changed and REJECTED them. "
+            f"These are mechanical facts, not review opinions — do NOT re-litigate them, and do NOT "
+            f"redesign or re-implement anything. Fix EXACTLY these files, re-run the same command "
+            f"yourself to confirm it now passes, commit, push, and STOP. Entries marked MINOR are "
+            f"advisory and do not block:\n{json.dumps(quality_findings, indent=2)}\n")
 
     # The graph owns the clone location: the coder clones into a per-run workspace and works
     # there, so the reviewer and any rework pass run against the SAME tree (reuse on re-entry).
@@ -1202,6 +1214,112 @@ async def coder(state: OceanState) -> dict:
             "worktree_dir": v.repo_dir or state.get("worktree_dir", ""),
             "pr_title": v.pr_title or state.get("pr_title", ""),
             "pr_body": v.pr_body or state.get("pr_body", "")}
+
+
+# ------------------------------------------------------------------ Station 4.5 (plain code, no agent)
+async def quality_gate(state: OceanState) -> dict:
+    """Deterministic zero-config static checks over the coder's CHANGED files, BEFORE the LLM review.
+
+    Closes the one path in the graph with no mechanical check at all: `coder` -> `harsh_reviewer` (an
+    LLM) -> `open_pr`. The junit parse (F1) is downstream at Station 6, so until now nothing ever
+    looked at a diff before a draft PR opened. This is a SYNTAX gate, not a quality gate — see
+    quality.py for why the obvious "run the repo's linter" design is unavailable (no ocean repo has one).
+
+    WHY IT RUNS BEFORE THE REVIEWER, not after. `harsh_reviewer` OVERWRITES `review_findings`
+    (its own return) and `prep_rework` CLEARS it. A gate that wrote findings there before the reviewer
+    would be wiped one node later — a textbook inert gate. Running first, with its own state keys, also
+    means a syntax error costs seconds instead of a full adversarial review.
+
+    NO BUILD SLOT, deliberately — the omission looks like an oversight next to `coder`/`harsh_reviewer`,
+    so: the Ruby path `docker exec`s into an ALREADY-RUNNING container (marginal Docker-VM memory ~0,
+    which is what the slot's headroom check bounds), `prep_container` already holds a slot for that
+    container's whole lifetime, and `_acquire_build_slot` waits up to BUILD_SLOT_WAIT_SECONDS (1800) —
+    a 30-minute queue in front of a 2-second gate. If a future revision ever makes this node START a
+    container, it must adopt the canonical acquire/`finally`-release pattern the coder uses.
+
+    Fails OPEN on could-not-run (loudly, and carried to the terminal), CLOSED on an actual finding.
+    """
+    exec_id = state["execution_id"]
+    telemetry.station_event(exec_id, 4.5, "start")
+    # Plain-code nodes must print their own header — run_agent/run_skill do it for agent nodes, so
+    # without this the monitor's last-seen station label stays on "Coding" for the gate's duration.
+    ui.station_start("quality_gate")
+
+    dirs = quality.repo_dirs(state.get("worktree_dir") or "", config.workspace_dir(exec_id))
+    container = (state.get("container_name") or "") if (
+        config.PERSISTENT_CONTAINER and state.get("container_ready")) else ""
+
+    try:
+        findings, unverified, checked, derived, uncovered = await asyncio.to_thread(
+            quality.run_all, dirs, container,
+            timeout=config.QUALITY_GATE_CMD_TIMEOUT,
+            cap=config.QUALITY_GATE_MAX_FILES,
+            java_on=config.QUALITY_GATE_JAVA)
+    except Exception as e:  # noqa: BLE001
+        # The CLASS, not one instance of it. A non-UTF-8 path once raised UnicodeDecodeError straight
+        # out through run_all, to_thread and this node, turning a run that would have completed into
+        # `[FAILED] UnicodeDecodeError` — failing CLOSED on infrastructure, which this node's own
+        # contract forbids. That specific trigger is fixed; this makes the guarantee unconditional,
+        # so no future checker can reintroduce it.
+        findings, unverified, checked, derived, uncovered = \
+            [], f"the gate itself raised {type(e).__name__}: {e}", 0, 0, 0
+
+    # THE anti-inertness invariant, and it is keyed on CHECKED — not on derived. A judge replayed this
+    # design against a real completed run (eta-worker/MM-14312) and it came out inert while reading
+    # clean: 8 files derived, 0 checked, no findings, route proceed. `derived == 0` never fires there.
+    if derived == 0:
+        # `derived == 0` is NOT a clean pass — it is "we found nothing to look at", and a judge
+        # evaded the invariant through this door three separate ways (a non-ASCII changed filename,
+        # a worktree left on the base branch, a single-branch clone whose base_ref resolves to the
+        # ticket branch). Every one produced zero milestones, empty `unverified`, and a UI reading
+        # "0 file(s) clean". This module's own docstring names an empty changed-file list as the #1
+        # inertness hazard, so it cannot also be the one shape that stays silent.
+        unverified = (f"derived NO changed files for this run"
+                      + (f" — {unverified}" if unverified else ""))
+    elif checked == 0:
+        unverified = (f"derived {derived} changed file(s) but CHECKED 0 of them"
+                      + (f" — {unverified}" if unverified else ""))
+
+    if unverified:
+        # LOUD. A gate that quietly disables itself is worse than no gate, because the run still looks
+        # gated (the lesson from _check_rca_report's four silent infra-failure modes).
+        ui.milestone(f"QUALITY GATE DID NOT FULLY RUN — {unverified}. "
+                     f"{checked} of {derived} changed file(s) were actually checked.")
+        telemetry.station_event(exec_id, 4.5, "skip", reason=unverified[:300],
+                                checked=checked, derived=derived)
+
+    blocking = [f for f in findings if schemas.is_blocking_finding(f)]
+    attempts = state.get("quality_gate_attempts", 0) + (1 if blocking else 0)
+    # Mirrors after_quality_gate's own "stop" condition. The router is a pure function and cannot
+    # write state, so the node computes it here — this boolean is what lets stop_run label the run
+    # without keying on `attempts >= MAX`, which stays true for the rest of the run and would
+    # mislabel any later, unrelated stop.
+    # A CLEAN pass returns the budget. Without this, `quality_gate_attempts` was a global run counter
+    # rather than a per-defect one: `harsh_reviewer --rework--> coder` bypasses `prep_rework`, so a
+    # brand-new syntax error introduced on a LATER review round inherited the spent budget and went
+    # straight to `stop_run` — terminating a healthy run over a defect the coder was never handed
+    # even once (judge review). Config calls this a BOUNCE budget; this makes it one.
+    attempts = attempts if blocking else 0
+    stopped = bool(blocking) and attempts > config.MAX_QUALITY_GATE_ATTEMPTS
+    if blocking:
+        for f in blocking[:4]:
+            ui.milestone(f"Quality gate: {f.get('file', '?')} — {f.get('summary', '?')}")
+        if stopped:
+            ui.milestone(f"Quality gate budget spent after {attempts} attempt(s) — stopping. The "
+                         f"changed files still do not parse; this needs an engineer. "
+                         f"(Set OCEAN_PIPELINE_QUALITY_GATE=0 to disable this gate entirely.)")
+
+    telemetry.station_event(exec_id, 4.5, "end", files_checked=checked, files_derived=derived,
+                            files_uncovered=uncovered, findings=len(findings),
+                            blocking=len(blocking), attempt=attempts)
+    # Every key is returned on EVERY pass: nothing else clears `quality_gate_findings` (prep_rework
+    # clears review_findings, not this), so a "write only what changed" shape would re-inject stale
+    # findings into every later coder prompt.
+    return {"quality_gate_findings": findings,
+            "quality_gate_unverified": unverified,
+            "quality_gate_checked_files": checked,
+            "quality_gate_attempts": attempts,
+            "quality_gate_stopped": stopped}
 
 
 # ------------------------------------------------------------------ Station 5
@@ -2254,8 +2372,14 @@ async def prep_rework(state: OceanState) -> dict:
     SIT run before this code fault was even diagnosed."""
     attempt = state.get("coding_attempts", 0) + 1
     telemetry.station_event(state["execution_id"], 5.9, "code_fault_rework", coding_attempt=attempt)
+    # `quality_gate_attempts` resets HERE AND NOWHERE ELSE. A Station-6 code fault is a fresh coding
+    # attempt and deserves its own gate budget, exactly like review_iteration and env_retry_attempts
+    # above. Do NOT also reset it in `coder` or on after_review's rework edge: `harsh_reviewer
+    # --rework--> coder` goes DIRECTLY (prep_rework serves only the code_fault loop), so resetting on
+    # that path makes the coder <-> quality_gate cycle genuinely unbounded.
     return {"coding_attempts": attempt, "review_iteration": 0, "review_findings": [],
-            "env_retry_attempts": 0}
+            "env_retry_attempts": 0, "quality_gate_attempts": 0,
+            "quality_gate_findings": [], "quality_gate_stopped": False}
 
 
 # ------------------------------------------------------------------ environment_failure retry prep
@@ -2501,7 +2625,14 @@ async def stop_run(state: OceanState) -> dict:
     # generic "sit_failed" (misleading: automation_result really was "passed", just untrustworthy).
     trivial_green = (state.get("automation_result") == "passed"
                       and state.get("fidelity_rung", 0) == 0)
-    if state.get("needs_onboarding"):
+    if state.get("quality_gate_stopped"):
+        # Station 4.5. Keyed on a boolean written ONLY on the stop branch, never on
+        # `quality_gate_attempts >= MAX` — that stays true for the rest of the run, so an unrelated
+        # LATER stop would inherit this label. Same class of mislabelling the review_stop_* branches
+        # were added to fix, inverted. It sits here, after the early-RETURN branches above
+        # (blocked_open_questions / rejected_by_engineer) so it can never preempt those.
+        reason, station = "quality_gate_exhausted", 4.5
+    elif state.get("needs_onboarding"):
         reason, station = "repo_onboarding_exhausted", 6   # still unsupported after MAX_ONBOARD_ATTEMPTS
     elif trivial_green:
         reason, station = "trivial_green_no_signal", 6
@@ -2534,6 +2665,9 @@ async def stop_run(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], station, "stop", reason=reason)
     if state.get("pr_number"):
         pr_note = f"service PR #{state['pr_number']} left draft"
+    elif state.get("quality_gate_stopped"):
+        pr_note = (f"no PR opened -- the deterministic quality gate still rejects the changed files "
+                   f"on branch {state.get('branch')!r}; needs an engineer")
     elif review_stop_blocking:
         pr_note = (f"a REJECTED diff exists on branch {state.get('branch')!r} -- unresolved "
                    f"CRITICAL/MAJOR at review-budget exhaustion; no PR opened, needs a human")
@@ -2541,7 +2675,8 @@ async def stop_run(state: OceanState) -> dict:
         pr_note = "no PR was opened -- no diff for the reviewer to approve"
     # Don't prefix review-stage stops with "sit_failed:" -- they never reached SIT. Don't prefix a
     # trivial-green stop with it either -- the SIT genuinely passed, it just didn't prove anything.
-    outcome_prefix = ("review_stopped" if (review_stop_blocking or review_stop_no_diff)
+    outcome_prefix = ("quality_gate_stopped" if state.get("quality_gate_stopped")
+                       else "review_stopped" if (review_stop_blocking or review_stop_no_diff)
                        else "sit_unverified" if trivial_green
                        else "sit_failed")
     return {"final_status": "failed", "ready_flipped": False,

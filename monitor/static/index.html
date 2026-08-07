@@ -1651,7 +1651,8 @@ const NODE_LABEL = {
   rca_done: "RCA report delivered", unsupported_route: "Unsupported ticket — stopped",
   dep_resolver: "Dependency resolution", reachability_gate: "Reachability verification",
   qa_scenarios: "GAN-hardened test scenarios",
-  coder: "Coding", harsh_reviewer: "Adversarial code review", open_pr: "Open draft PR",
+  coder: "Coding", quality_gate: "Static quality gate",
+  harsh_reviewer: "Adversarial code review", open_pr: "Open draft PR",
   sit_resolve: "Local SIT — resolve & gate", sit_author: "Local SIT — draft test",
   qa_review_gate: "QA review — awaiting approval", sit_run: "Local SIT — run",
   sit_testrail: "TestRail — writing cases", sit_triage: "Local SIT — triage & verdict",
@@ -1674,7 +1675,8 @@ const HAPPY_NEXT = {
   // sibling" case; this is only the fallback once every sibling is done.
   sme_consult: "reachability_gate", dep_resolver: "reachability_gate", prep_image: "reachability_gate",
   prep_container: "reachability_gate", reachability_gate: "qa_scenarios", qa_scenarios: "coder",
-  coder: "harsh_reviewer",
+  coder: "quality_gate",          // Station 4.5 sits between Coding and the review
+  quality_gate: "harsh_reviewer", // most runs pass the static gate on the first try
   harsh_reviewer: "open_pr",   // most runs approve on the first pass, not "rework"
   open_pr: "sit_resolve", sit_resolve: "sit_author", sit_author: "qa_review_gate",
   qa_review_gate: "sit_run",   // most common decision (with or without TestRail) runs SIT next

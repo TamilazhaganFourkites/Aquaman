@@ -191,6 +191,30 @@ RCA_REVIEW_AUTO = os.environ.get("OCEAN_PIPELINE_RCA_REVIEW_AUTO", "").lower() i
 # Hard cap on the Station 5 <-> Station 4 review loop (CLAUDE.md: max 2 iterations).
 MAX_REVIEW_ITERATIONS = 2
 
+# ---- Station 4.5: deterministic quality gate --------------------------------------------------
+# Zero-config static checks over the coder's CHANGED files, run in plain Python between `coder` and
+# `harsh_reviewer`. Closes the one path with no deterministic check at all: today nothing mechanical
+# looks at a diff before an LLM reviews it and a draft PR opens (the junit parse, F1, is downstream at
+# Station 6). Defaults ON — a gate shipped default-off is not shipped.
+QUALITY_GATE = os.environ.get("OCEAN_PIPELINE_QUALITY_GATE", "1").lower() in ("1", "true", "yes")
+# BOUNCES back to the coder before giving up — not gate firings. Kept at 1 deliberately: one bounce
+# costs a FULL coder station (~30 min observed), and a syntax error the coder was handed verbatim and
+# still failed to fix is a run that needs a human, not another attempt.
+#
+# The router compares `attempts > MAX`, NOT `>=`. With `>=` and this value the FIRST blocking finding
+# terminated the run: `quality_gate` increments before the router reads it, so attempts was already 1
+# on the first firing, the `rework` edge was unreachable, and the coder-prompt injection this whole
+# feature hangs on was dead code. A judge caught it — the exact inertness class this gate exists to
+# prevent, reproduced inside the gate. Read the comparison in graph.after_quality_gate before changing
+# either side.
+MAX_QUALITY_GATE_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_QUALITY_GATE_ATTEMPTS", "1"))
+QUALITY_GATE_MAX_FILES = int(os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_MAX_FILES", "200"))
+QUALITY_GATE_CMD_TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_CMD_TIMEOUT", "60"))
+# Java is OFF by default: only eta-worker declares spotless, and `mvn` there resolves offline against
+# hand-installed local JARs (install-local-deps.sh), so an on-by-default Java path would report
+# could-not-run on most runs and add minutes to the rest.
+QUALITY_GATE_JAVA = os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_JAVA", "").lower() in ("1", "true", "yes")
+
 # Optional human-approval gate before the ready-flip. Default OFF (auto-flip on green, the
 # intended terminal action). When ON, the graph interrupt()s and waits for an engineer to
 # resume with an approve/reject decision — the pipeline still never merges or deploys.
