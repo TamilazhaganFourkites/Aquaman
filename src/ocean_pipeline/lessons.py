@@ -1,13 +1,22 @@
 """lessons.py — a durable, cross-ticket lesson store for the coding-pipeline loop.
 
 Finding 3 (architecture review of PR Aquaman#4/fk-aideveloper#294): "the tooling that runs
-[compounding] isn't in the repo, so it's manual... ticket 200 is just as smart as ticket 1." The
-review's own roadmap splits this into two separate initiatives: "Mechanize Compounding Loop"
-(ship an eval harness, extend the golden set to all domain buckets, wire the bias registry's
-hard-gate proposal — a genuinely larger, separate follow-up, NOT attempted here) and "Give Pipeline
-Memory" (this file): a PostToolUseFailure-style capture that writes a structured lesson when a run
-stops without shipping, keyed by (domain_bucket, action_sig, fail_sig), recalled by a LATER ticket
-in the same domain before it starts fresh.
+[compounding] isn't in the repo, so it's manual... ticket 200 is just as smart as ticket 1." This
+file is the "Give the pipeline a memory" half: a structured lesson store keyed by
+(domain_bucket, action_sig, fail_sig), written during a run and recalled by a LATER ticket in the
+same domain before it starts fresh.
+
+TWO writers feed it, deliberately:
+  * `agents._capture_tool_failure` — the real `PostToolUseFailure` hook the review named, firing on
+    each individual TOOL failure. This is the important one: it captures failures a run RECOVERED
+    from, and failures on runs that ultimately shipped — the majority of what's worth not repeating,
+    and all invisible to a run-terminal capture.
+  * `nodes.stop_run` — one coarse record of WHY a run ended badly, keyed by station. Complements the
+    above rather than duplicating it (a run can end badly with no tool failure at all, e.g. a review
+    budget exhausted).
+Recall happens in `nodes.researcher` and is folded into `_summary`, so every downstream station sees
+it. (The separate "Mechanize the compounding loop" initiative — eval harness, golden-set coverage,
+the bias-registry hard gate — lives in fk-aideveloper's ocean-rca skill, not here.)
 
 Storage: a single JSON file under `config.ARTIFACTS_ROOT` — confirmed the only mechanism actually
 buildable today without a new MCP round-trip: Aquaman's `telemetry.py` only has INSERT-only
@@ -34,6 +43,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
+import re
 import time
 from pathlib import Path
 
@@ -53,6 +64,42 @@ def _lock_path() -> Path:
     p = config.ARTIFACTS_ROOT / "lessons.json.lock"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def normalize_fail_sig(error: str, max_len: int = 120) -> str:
+    """Collapse a raw tool error into a stable SIGNATURE that recurs across tickets.
+
+    A lesson is only useful if the SAME underlying failure produces the SAME key on a different
+    ticket, so the volatile parts must go: ids, paths, ports, hex/uuids, quoted literals and numbers
+    all differ per run while naming the same defect. Best-effort and pure — never raises.
+
+    The line CHOICE matters as much as the substitutions. Taking the first line unconditionally
+    collapsed every Python traceback to the single key `Traceback (most recent call last):` — merging
+    genuinely distinct defects into one record whose `note` was then overwritten by whichever failure
+    wrote last (found in review). For a traceback the informative line is the LAST one, so pick that.
+
+    The substitution ORDER matters too: `<hex>` before `<n>` meant `900000` -> `<n> ms` but
+    `90000000` -> `<hex> ms`, i.e. the same numeric slot keyed differently by magnitude alone. The
+    hex rule now requires an actual hex LETTER, so a pure digit run is always `<n>`."""
+    try:
+        lines = [ln.strip() for ln in (error or "").strip().splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        # A traceback header names the mechanism, not the defect — the exception on the last line does.
+        s = lines[-1] if lines[0].startswith("Traceback (most recent call last)") else lines[0]
+        s = re.sub(r"/[^\s'\"]+", "<path>", s)                       # absolute paths
+        # shas/uuids/ids — must contain a hex letter, else a long DIGIT run would key as <hex> while a
+        # shorter one keys as <n> (same slot, two keys — they could never accumulate to min_recurrence).
+        s = re.sub(r"\b(?=[0-9a-fA-F]{8,}\b)[0-9a-fA-F]*[a-fA-F][0-9a-fA-F]*\b", "<hex>", s)
+        s = re.sub(r"\b\d+(?:\.\d+)+\b", "<ver>", s)                 # 1.6.8.1 / 1.5.4 -> one token
+        s = re.sub(r"\b\d+\b", "<n>", s)                             # ports, counts, line numbers
+        s = re.sub(r"'[^']*'|\"[^\"]*\"", "<str>", s)                # quoted literals
+        # "<n> failure" vs "<n> failures" is the same defect at a different count — one key, not two.
+        s = re.sub(r"(<n> [A-Za-z]+)s\b", r"\1", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s[:max_len]
+    except Exception:  # noqa: BLE001
+        return (error or "")[:max_len]
 
 
 def _read_records(path: Path) -> list[dict]:
@@ -112,20 +159,36 @@ def record_failure(domain_bucket: str, action_sig: str, fail_sig: str, ticket_id
                         "execution_id": execution_id,
                         "note": note,
                     })
-                data_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+                # ATOMIC: write a sibling temp file, fsync, then os.replace. A plain write_text that
+                # is killed mid-flight leaves a TRUNCATED file, and `_read_records` reads that as
+                # `[]` — so the very next record_failure rewrites the store from empty and the whole
+                # history is silently gone (reproduced in review). os.replace is atomic within a
+                # directory, so a reader sees either the old file or the new one, never a torn one.
+                tmp = data_path.with_suffix(data_path.suffix + f".tmp.{os.getpid()}")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(records, fh, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, data_path)
             finally:
                 fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
     except Exception:  # noqa: BLE001 — a lesson-store hiccup must never break a real run
         pass
 
 
-def recall_lessons(domain_bucket: str, min_recurrence: int = 2, limit: int = 5) -> list[dict]:
-    """Best-effort, never raises. Returns records for `domain_bucket` with
-    `recurrence_count >= min_recurrence`, sorted by recurrence descending, capped at `limit`.
-    `min_recurrence` defaults to 2 (not 1) deliberately — a failure seen exactly once isn't yet a
-    PATTERN worth surfacing to every future ticket in the domain; recalling every one-off would
-    drown the genuinely recurring ones in noise. Empty list on a fresh/missing/corrupt store or a
-    domain with nothing qualifying yet — that's the expected steady state early on, not an error.
+def recall_lessons(domain_bucket: str, min_tickets: int = 2, limit: int = 5) -> list[dict]:
+    """Best-effort, never raises. Returns records for `domain_bucket` seen on at least `min_tickets`
+    DISTINCT tickets, most-recurrent first, capped at `limit`.
+
+    The threshold is on distinct TICKETS, not on `recurrence_count`. Gating on the raw count made the
+    "cross-ticket" claim false: the `PostToolUseFailure` hook fires on every individual tool failure,
+    and an agent retrying one failing command three times in a single run reached a count of 3 by
+    itself — so ONE flaky run permanently injected its own noise into every later ticket in the
+    domain (reproduced in review). Two distinct tickets is the weakest honest evidence that a failure
+    is a property of the DOMAIN rather than of one run.
+
+    Empty list on a fresh/missing/corrupt store or a domain with nothing qualifying yet — the
+    expected steady state early on, not an error.
 
     Read-only: no lock needed (`_read_records` tolerates a concurrent writer mid-rewrite by treating
     a transiently-invalid JSON parse as "empty" rather than raising, and a stale-but-valid read here
@@ -133,11 +196,15 @@ def recall_lessons(domain_bucket: str, min_recurrence: int = 2, limit: int = 5) 
     if not domain_bucket:
         return []
     try:
-        records = _read_records(_lessons_path())
-        matches = [r for r in records
-                   if r.get("domain_bucket") == domain_bucket
-                   and r.get("recurrence_count", 0) >= min_recurrence]
-        matches.sort(key=lambda r: r.get("recurrence_count", 0), reverse=True)
-        return matches[:limit]
+        out = []
+        for r in _read_records(_lessons_path()):
+            if r.get("domain_bucket") != domain_bucket:
+                continue
+            tickets = r.get("tickets") or []
+            if not isinstance(tickets, list) or len(set(tickets)) < min_tickets:
+                continue
+            out.append(r)
+        out.sort(key=lambda r: r.get("recurrence_count", 0), reverse=True)
+        return out[:limit]
     except Exception:  # noqa: BLE001
         return []

@@ -77,7 +77,14 @@ def _install(script: Script, tmp_path, monkeypatch):
         if node.startswith("sme_consult"):
             return schemas.SmeVerdict(summary="owner: ocean-worker", findings=["reuse helper X"])
         if node.startswith("rca_agent"):
-            return schemas.RcaVerdict(report_path=nowhere, fix_needed=script.rca_fix,
+            # Finding 3: rca_report now MECHANICALLY gates the report (all 7 Step-5 sections + an
+            # answered INDEPENDENT STATUS CHECK) and refuses to post — and rca_done/after_rca_review
+            # then treat a failed gate as a non-delivery. These are ROUTING tests, so the fake must
+            # write a genuinely complete report; pointing at a nonexistent path would make every RCA
+            # routing assertion fail for report-quality reasons instead.
+            rca_report_file = tmp_path / "rca-report.md"
+            rca_report_file.write_text(_COMPLETE_RCA_REPORT)
+            return schemas.RcaVerdict(report_path=str(rca_report_file), fix_needed=script.rca_fix,
                                       findings_for_coder=(["fix X in ocean-worker"] if script.rca_fix else []))
         if node.startswith("dep_resolver"):
             return schemas.DependencyVerdict(report_path=nowhere)
@@ -1189,25 +1196,160 @@ def test_drive_with_retry_still_retries_on_a_truncated_verdict_file(tmp_path, mo
 def test_rca_report_posts_worker_report_via_jira(tmp_path, monkeypatch):
     """A3: the RCA report is posted by the plain-code rca_report node via jira.py — NOT by the worker
     via the Atlassian MCP. rca_report reads the worker-written report file and posts exactly one
-    comment; a missing file or no token is a silent no-op."""
+    comment; a missing file or no token is a silent no-op.
+
+    Finding 3: the report must also pass the mechanical section/hard-gate check before it is posted,
+    so this fixture uses a COMPLETE 7-part report rather than a stub — a stub is now (correctly)
+    refused."""
     posted = []
     monkeypatch.setattr(jira, "comment", lambda tid, body: posted.append((tid, body)))
     monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
 
     report_file = tmp_path / "rca.md"
-    report_file.write_text("## Root cause\nX broke Y.")
+    report_file.write_text(_COMPLETE_RCA_REPORT)
     out = asyncio.run(nodes.rca_report(
         {"ticket_id": "MM-1", "execution_id": "EXE-x", "rca_report_path": str(report_file)}))
-    assert out == {}
+    # The gate must not REFUSE this report. `rca_report_unverified` is deliberately not asserted:
+    # this test's subject is "posted exactly once, by jira.py", which holds whether or not this
+    # checkout of fk-aideveloper happens to carry the checker script.
+    assert out["rca_report_gate_problems"] == []
     assert len(posted) == 1                      # exactly one comment
     assert posted[0][0] == "MM-1"
-    assert "Root cause" in posted[0][1] and posted[0][1].startswith("🤖 Aquaman Ocean RCA")
+    assert "Root Cause" in posted[0][1] and posted[0][1].startswith("🤖 Aquaman Ocean RCA")
 
     # missing report file -> no post (best-effort)
     posted.clear()
     asyncio.run(nodes.rca_report(
         {"ticket_id": "MM-1", "execution_id": "EXE-x", "rca_report_path": str(tmp_path / "nope.md")}))
     assert posted == []
+
+
+# A report that satisfies every Step-5 section AND the reporter-premise-acceptance hard gate.
+_COMPLETE_RCA_REPORT = """## Flow Analysis
+The VD callback should have fired; it did not. Divergence at the dispatcher.
+## Hypotheses Explored & Rejected
+- Carrier/JT data quality: ruled out — the JT payload carried the VD event (query returned 1 row).
+- Subscription gap: ruled out — subscription active per log line at 14:02.
+INDEPENDENT STATUS CHECK: ran `select status from loads where id=123` -> status was NULL, so the
+reporter's premise (no callback delivered) is confirmed, not assumed.
+## Root Cause
+`dispatcher.rb:88` skips VD when stop_type is transfer; PR #123's diff read and confirmed.
+## Impact
+1 customer, 14 loads, 2026-07-01..07-03.
+## Fix
+Handle VD in the transfer branch.
+## Prevention
+Add a guard-clause test covering VD + transfer.
+## Adversarial Self-Critique
+named-mechanism-bias: checked — the condition is persistent across 3 days of logs, not transient.
+adjacent-mechanism-confidence: read PR #123's actual diff; it touches this exact field, not just the
+same general topic.
+"""
+
+
+def test_failed_rca_gate_blocks_coding_and_is_reported_honestly():
+    """Finding 3 (judge follow-up): a report the gate refused to post must NOT (a) route into
+    autonomous coding, nor (b) be reported as delivered. Both were true on the first cut."""
+    # Even with fix_needed, a failed gate routes to "done" (terminal), never "fix_needed" -> coder.
+    assert graph.after_rca_review(
+        {"rca_fix_needed": True, "rca_report_gate_problems": ["missing INDEPENDENT STATUS CHECK"]}) == "done"
+    # A clean gate keeps the normal routing.
+    assert graph.after_rca_review({"rca_fix_needed": True, "rca_report_gate_problems": []}) == "fix_needed"
+    assert graph.after_rca_review({"rca_fix_needed": False}) == "done"
+
+    out = asyncio.run(nodes.rca_done(
+        {"execution_id": "E", "rca_report_gate_problems": ["missing INDEPENDENT STATUS CHECK"]}))
+    assert out["final_status"] == "failed"
+    assert "NOT_delivered" in out["final_outcome"]
+    ok = asyncio.run(nodes.rca_done({"execution_id": "E", "rca_report_gate_problems": []}))
+    assert ok["final_status"] == "rca_report" and "delivered" in ok["final_outcome"]
+
+
+def test_rca_report_gate_problems_survives_the_state_schema():
+    """The key must be DECLARED in OceanState — LangGraph silently drops an undeclared key, which is
+    how this went from a gate result to a dead field on its first cut."""
+    from ocean_pipeline.state import OceanState
+    assert "rca_report_gate_problems" in OceanState.__annotations__
+
+
+def _rca_checker_path():
+    from ocean_pipeline import config
+    return config.FK_AIDEVELOPER_DIR / "skills" / "ocean-rca" / "tools" / "check_rca_report.py"
+
+
+def test_rca_gate_that_cannot_run_fails_OPEN_and_says_so(tmp_path, monkeypatch):
+    """The gate's dependency is a script in a SIBLING repo (fk-aideveloper). When that checkout does
+    not carry it, the gate must (a) still post — a missing checker is not evidence of a bad report —
+    and (b) be LOUD, and mark the report unverified so the run's summary never claims it was gated.
+
+    Four of the five infra-failure modes used to return a bare `[]`, indistinguishable from a pass,
+    and posted junk to Jira with no output at all (judge review)."""
+    from ocean_pipeline import config
+    posted, milestones = [], []
+    monkeypatch.setattr(jira, "comment", lambda tid, body: posted.append((tid, body)))
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.ui, "milestone", lambda m, *a, **kw: milestones.append(str(m)))
+    f = tmp_path / "r.md"
+    f.write_text("## Root Cause\nnot even close to complete\n")
+
+    # (1) checker absent entirely
+    monkeypatch.setattr(config, "FK_AIDEVELOPER_DIR", tmp_path / "no-such-repo")
+    out = asyncio.run(nodes.rca_report(
+        {"ticket_id": "MM-1", "execution_id": "EXE-x", "rca_report_path": str(f)}))
+    assert len(posted) == 1, "a report must still be posted when the checker is unavailable"
+    assert out["rca_report_gate_problems"] == []
+    assert out["rca_report_unverified"], "the unverified fact must be carried forward, not swallowed"
+    assert any("DID NOT RUN" in m for m in milestones), "fail-open must be LOUD"
+
+    # (2) checker present but BROKEN (non-zero exit, no --json output) — the silent mode
+    fake = tmp_path / "repo" / "skills" / "ocean-rca" / "tools"
+    fake.mkdir(parents=True)
+    (fake / "check_rca_report.py").write_text("import sys\nsys.exit(3)\n")
+    monkeypatch.setattr(config, "FK_AIDEVELOPER_DIR", tmp_path / "repo")
+    posted.clear(); milestones.clear()
+    out = asyncio.run(nodes.rca_report(
+        {"ticket_id": "MM-1", "execution_id": "EXE-x", "rca_report_path": str(f)}))
+    assert len(posted) == 1 and out["rca_report_gate_problems"] == []
+    assert out["rca_report_unverified"] and any("DID NOT RUN" in m for m in milestones)
+
+    # ...and the terminal must ADMIT it rather than reporting a clean delivery.
+    done = asyncio.run(nodes.rca_done({"execution_id": "E", "rca_report_gate_problems": [],
+                                       "rca_report_unverified": out["rca_report_unverified"]}))
+    assert done["final_status"] == "rca_report" and "UNVERIFIED" in done["final_outcome"]
+
+
+@pytest.mark.skipif(not _rca_checker_path().is_file(),
+                    reason="fk-aideveloper checkout does not carry skills/ocean-rca/tools/ — the "
+                           "fail-open path is covered by the test above")
+def test_rca_report_refuses_to_post_a_report_missing_its_own_gates(tmp_path, monkeypatch):
+    """Finding 3 / the bias registry's hard-gate: a report that skipped its own falsification steps
+    must NOT reach Jira. Posting one is worse than posting nothing — it reads as complete."""
+    posted = []
+    monkeypatch.setattr(jira, "comment", lambda tid, body: posted.append((tid, body)))
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+
+    def _run(text):
+        posted.clear()
+        f = tmp_path / "r.md"
+        f.write_text(text)
+        return asyncio.run(nodes.rca_report(
+            {"ticket_id": "MM-1", "execution_id": "EXE-x", "rca_report_path": str(f)}))
+
+    # The old 5-part shape Finding 1 was about -> refused.
+    out = _run("## Root Cause\nX broke Y.\n## Impact\nz\n## Fix\nq\n")
+    assert posted == [] and out["rca_report_gate_problems"]
+
+    # Complete EXCEPT the reporter-premise hard gate -> still refused.
+    out = _run("\n".join(l for l in _COMPLETE_RCA_REPORT.splitlines()
+                         if not l.startswith("INDEPENDENT STATUS CHECK")))
+    assert posted == []
+    assert any("INDEPENDENT STATUS CHECK" in p for p in out["rca_report_gate_problems"])
+
+    # A justified N/A satisfies the gate -- it is a stated answer, not a silent omission.
+    out = _run(_COMPLETE_RCA_REPORT.replace(
+        "INDEPENDENT STATUS CHECK: ran `select status from loads where id=123` -> status was NULL, so the",
+        "INDEPENDENT STATUS CHECK: N/A - internal crash report, no customer-visible premise to verify. The"))
+    assert len(posted) == 1 and out["rca_report_gate_problems"] == []
 
 
 # ----------------------------------------------------------------- human-approval gate (Phase C)

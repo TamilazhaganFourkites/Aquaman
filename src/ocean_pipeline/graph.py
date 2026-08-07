@@ -50,6 +50,13 @@ def after_rca_review(state: OceanState) -> str:
     # we always stop at the report; the fix is a separate "RCA Done" run.
     if str(state.get("rca_approval_decision", "")).lower().startswith("reject"):
         return "reject"
+    # Finding 3 (judge follow-up): never start autonomous CODING off an RCA that failed its own
+    # quality gate. rca_report refused to post it (missing sections / no INDEPENDENT STATUS CHECK),
+    # so its root cause is exactly the "reads as complete but skipped its own falsification steps"
+    # artifact the gate exists to catch — routing that into dep_resolver -> coder would build on it.
+    # "done" (rca_done) then reports the non-delivery honestly rather than claiming success.
+    if state.get("rca_report_gate_problems"):
+        return "done"
     if config.RCA_ONLY:
         return "done"
     return "fix_needed" if state.get("rca_fix_needed") else "done"

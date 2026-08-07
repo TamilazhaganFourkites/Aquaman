@@ -51,6 +51,15 @@ class OceanState(TypedDict, total=False):
     rca_fix_needed: bool
     rca_findings: list               # implementation brief handed to the coder on fix_needed
     rca_report_path: str             # absolute path the rca worker wrote the 7-part report to; rca_report posts it
+    # Finding 3: problems found by the mechanical report gate (`nodes._check_rca_report`) — [] when the
+    # report passed. MUST be declared here: LangGraph silently DROPS any key a node returns that the
+    # state schema doesn't know about, which is exactly how this went from "gate result" to dead field
+    # on its first cut (a judge review caught it).
+    rca_report_gate_problems: list
+    # Non-empty when the gate could NOT run (checker missing/crashed/timed out) and the report was
+    # therefore posted UNVERIFIED. Distinct from gate_problems, which means the gate ran and refused.
+    # Declared here for the same reason as the line above — an undeclared key is silently dropped.
+    rca_report_unverified: str
     rca_approval_decision: str       # "approve" | "reject" (set on resume); "" when auto-approved
 
     # --- Station 1 / 1.5 ---

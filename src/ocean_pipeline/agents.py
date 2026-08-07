@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
-from . import config, metrics, ui
+from . import config, lessons, metrics, ui
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -682,6 +682,66 @@ def _station_mcp_config() -> dict | None:
     return result
 
 
+# Finding 3: identity of the ticket this PROCESS is driving, for keying tool-failure lessons. A
+# module-level context is correct here rather than threading four new params through ~20 call sites:
+# `ocean-pipeline` runs exactly one ticket per process (cli.py::_execute; the Monitor spawns a separate
+# subprocess per ticket), so there is only ever one live run to describe. Set by nodes.researcher once
+# the domain bucket is known — before that, `domain_bucket` is "" and the capture hook stays off,
+# because a lesson with no domain to key on is not recallable by a later ticket anyway.
+_RUN_CONTEXT: dict[str, str] = {"domain_bucket": "", "ticket_id": "", "execution_id": ""}
+
+
+def set_run_context(*, domain_bucket: str = "", ticket_id: str = "", execution_id: str = "") -> None:
+    """Record who this process is working for, so tool-failure lessons can be keyed by domain."""
+    if domain_bucket:
+        _RUN_CONTEXT["domain_bucket"] = domain_bucket
+    if ticket_id:
+        _RUN_CONTEXT["ticket_id"] = ticket_id
+    if execution_id:
+        _RUN_CONTEXT["execution_id"] = execution_id
+
+
+def _capture_tool_failure(node: str):
+    """Finding 3 (pipeline half): a `PostToolUseFailure` hook that writes a structured lesson every
+    time a worker's TOOL call fails, keyed by (domain_bucket, action_sig, fail_sig) exactly as the
+    review specified.
+
+    Why a hook and not just the run-terminal capture in stop_run: the review's diagnosis was that the
+    pipeline forgets TOOL-level failures. stop_run only ever sees the one coarse reason a run ended,
+    and only for runs that ended badly — every failure a run recovered from, and every failure on a
+    run that ultimately shipped, was invisible. This fires on each individual failure instead, so the
+    lesson store learns from recovered failures too (the ones most worth not repeating).
+
+    `action_sig` is `<node>:<tool>` (where the failure happened), `fail_sig` is a normalized first
+    line of the error (what happened). Interrupts are skipped — a user/timeout cancellation is not a
+    lesson. Never raises: a hook that throws would break the worker it is only observing."""
+    async def _hook(input_data, tool_use_id, context):  # noqa: ARG001 — SDK hook signature
+        try:
+            if input_data.get("is_interrupt"):
+                return {}
+            tool = str(input_data.get("tool_name") or "?")
+            err = str(input_data.get("error") or "").strip()
+            if not err:
+                return {}
+            # Strip the ":verdict-redrive" suffix run_agent appends when it re-drives a worker for a
+            # missing verdict: the redrive is the SAME station hitting the SAME defect, so keeping it
+            # split the key in two (`coder:Bash` vs `coder:verdict-redrive:Bash`) and moved BOTH
+            # halves further from the recurrence threshold (found in review).
+            station = node.split(":", 1)[0]
+            lessons.record_failure(
+                domain_bucket=_RUN_CONTEXT["domain_bucket"],
+                action_sig=f"{station}:{tool}",
+                fail_sig=lessons.normalize_fail_sig(err),
+                ticket_id=_RUN_CONTEXT["ticket_id"],
+                execution_id=_RUN_CONTEXT["execution_id"],
+                note=err[:300],
+            )
+        except Exception:  # noqa: BLE001 — observation must never break the observed worker
+            pass
+        return {}
+    return _hook
+
+
 async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str,
                  label: str = "station", allowed_tools: list[str] | None = None,
                  model: str | None = None) -> None:
@@ -696,6 +756,11 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     if allowed_tools is not None:
         _pre.append(_deny_outside_allowlist(allowed_tools))
     hooks = {"PreToolUse": [HookMatcher(hooks=_pre)]}
+    # Finding 3: capture every TOOL failure into the cross-ticket lesson store. Only wired when the
+    # caller passed the identity this lesson would be keyed by — without a domain_bucket a lesson is
+    # not recallable by a later ticket, so there is nothing to learn from.
+    if _RUN_CONTEXT["domain_bucket"]:
+        hooks["PostToolUseFailure"] = [HookMatcher(hooks=[_capture_tool_failure(label)])]
 
     # Signal to worker skills that they're running UNDER the control plane (inherited by the
     # spawned CLI subprocess). The ocean-qa-agent's learn-a-repo gate keys off this: under the

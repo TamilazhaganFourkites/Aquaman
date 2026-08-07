@@ -16,6 +16,8 @@ import signal
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -332,7 +334,26 @@ def _docker_preflight_reason(target_repos=None, exclude_name_substr: str = "") -
 
 
 def _summary(state: OceanState) -> str:
-    """<=300-token ticket summary pushed to each worker."""
+    """<=300-token ticket summary pushed to each worker.
+
+    Also RE-ESTABLISHES the lesson-capture run context (Finding 3). This is a side effect in a helper
+    that otherwise just formats a string, and it is deliberate: `agents._capture_tool_failure` only
+    installs its `PostToolUseFailure` hook when `_RUN_CONTEXT["domain_bucket"]` is set, and that
+    module-global lives in ONE OS process. Setting it in `researcher` alone left capture dead for the
+    entire post-interrupt half of every run — all three review gates default to pausing, and a resume
+    is a fresh process driven by `Command(resume=...)` that re-enters at the interrupted node and
+    never re-runs `researcher`. So `coder`, `harsh_reviewer`, `sit_run`, `sit_triage` and
+    `flip_ready` — the heaviest tool users — recorded nothing at all (found in review).
+
+    Every station builds its prompt through this helper, which makes it the one seam that is
+    guaranteed to run in whichever process a station actually executes in. Cheap and idempotent."""
+    try:
+        agents.set_run_context(
+            domain_bucket=str(state.get("domain_bucket") or ""),
+            ticket_id=str(state.get("ticket_id") or ""),
+            execution_id=str(state.get("execution_id") or ""))
+    except Exception:  # noqa: BLE001 — context bookkeeping must never break prompt assembly
+        pass
     s = (
         f"Ticket: {state['ticket_id']}\n"
         f"Context: {state.get('context', '(none)')}\n"
@@ -355,12 +376,19 @@ def _summary(state: OceanState) -> str:
             if not isinstance(tickets, list):
                 return "?"
             return ", ".join(str(t) for t in tickets[-3:])
-        lines = "; ".join(
-            f"{r.get('fail_sig', '?')} at {r.get('action_sig', '?')} "
-            f"(x{r.get('recurrence_count', '?')}, tickets: {_tickets_str(r)})"
-            for r in recurring[:3] if isinstance(r, dict)
-        )
-        s += f"Known recurring failure patterns in this domain: {lines}\n"
+        def _one(r: dict) -> str:
+            # The normalized fail_sig is a stable KEY, deliberately stripped of paths/numbers/quoted
+            # literals — which makes it good for matching and nearly useless to read. Judge review:
+            # "the only field with actionable detail, `note`, is written and never read", so the
+            # station saw a de-specified signature with nothing to act on. Carry a trimmed raw error
+            # alongside the key so the lesson names the ACTUAL failure, not just its fingerprint.
+            note = str(r.get("note") or "").strip().replace("\n", " ")
+            detail = f' — last seen as: "{note[:160]}"' if note else ""
+            return (f"{r.get('fail_sig', '?')} at {r.get('action_sig', '?')} "
+                    f"(x{r.get('recurrence_count', '?')}, tickets: {_tickets_str(r)}){detail}")
+        lines = "; ".join(_one(r) for r in recurring[:3] if isinstance(r, dict))
+        s += (f"Known recurring failure patterns in this domain (seen on 2+ DIFFERENT tickets — "
+              f"check for these before repeating them): {lines}\n")
     return s
 
 
@@ -539,6 +567,14 @@ def _service_slugs(state: OceanState) -> list[str]:
 async def researcher(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0, "start")
     jira.transition(state["ticket_id"], "In Progress")   # best-effort; no-op without a Jira token
+    # Finding 3: identify the run BEFORE dispatching, so this station's own tool failures are
+    # capturable too. The domain bucket isn't known until the verdict comes back (it's what the
+    # researcher produces), so the capture hook stays disarmed for this one call and is re-armed with
+    # the bucket below — a judge review flagged that Station 0, the heaviest MCP consumer, was the
+    # only station whose failures were structurally invisible. Carrying a lesson keyed by an unknown
+    # bucket would not be recallable anyway; what this buys is that ticket/exec identity is never the
+    # reason a capture is dropped.
+    agents.set_run_context(ticket_id=state["ticket_id"], execution_id=state["execution_id"])
     v: schemas.ResearchVerdict = await agents.run_agent(
         agent_md="research.md",   # ocean-coding-agent worker (fk-aideveloper single source)
         node="researcher",
@@ -562,6 +598,11 @@ async def researcher(state: OceanState) -> dict:
     # them into _summary() so every downstream station (SME, dep-resolver, qa_scenarios, coder,
     # harsh_reviewer, sit_run) sees them automatically -- without this, ticket 200 in a domain starts
     # exactly as blind as ticket 1 did, however many times the SAME failure has already recurred.
+    # Finding 3: from here on, every worker's TOOL failures are captured into the lesson store keyed
+    # by this domain (agents._capture_tool_failure, a real PostToolUseFailure hook). Must be set before
+    # any downstream station runs, and can only be set once the bucket is actually known.
+    agents.set_run_context(domain_bucket=v.domain_bucket, ticket_id=state["ticket_id"],
+                           execution_id=state["execution_id"])
     recurring = lessons.recall_lessons(v.domain_bucket) if v.domain_bucket else []
     telemetry.station_event(state["execution_id"], 0, "end", route=v.route,
                             domain_bucket=v.domain_bucket, recurring_lessons=len(recurring),
@@ -2418,7 +2459,11 @@ async def rca_agent(state: OceanState) -> dict:
             f"WRITE the completed **7-part report** as markdown to an absolute file path and return "
             f"that path as `report_path`: (1) Flow Analysis, (2) Hypotheses Explored & Rejected — every "
             f"plausible alternative mechanism + the SPECIFIC evidence that ruled it out, (3) Root Cause "
-            f"— code-, PR-, graph-, or log-verified with a specific file/function/config cited, "
+            f"— code-, PR-, graph-, or log-verified with a specific file/function/config cited, and "
+            f"containing the REQUIRED literal line `INDEPENDENT STATUS CHECK: <the query/log check you "
+            f"ran to verify the reporter's own premise + its result, or 'N/A: <why there is no "
+            f"verifiable premise>'>` — the graph mechanically checks for this and REFUSES to post a "
+            f"report without it (reporter-premise-acceptance hard gate), "
             f"(4) Impact, (5) Fix, (6) Prevention, (7) Adversarial Self-Critique — the Step 5.5 output: "
             f"every `investigator-bias` entry from skills/ocean-rca/eval/bias-registry.json, the "
             f"specific check performed against THIS hypothesis, and the verdict. Do NOT post to Jira "
@@ -2439,6 +2484,66 @@ async def rca_agent(state: OceanState) -> dict:
 
 
 # ------------------------------------------------------------------ RCA report post (plain code, one Jira comment)
+def _check_rca_report(report_text: str) -> tuple[list[str], str]:
+    """Finding 3: run fk-aideveloper's `ocean-rca/tools/check_rca_report.py` against a drafted RCA
+    report. Returns `(problems, unverified_reason)`.
+
+    Exactly one of the two is ever non-empty, and the distinction is the whole point:
+      * `problems` non-empty — the checker RAN and returned a verdict. Fail CLOSED: refuse to post.
+      * `unverified_reason` non-empty — the checker could not run (missing, crashed, wrong version,
+        timed out, unparseable output). Fail OPEN, because a broken checker must not block a
+        legitimate RCA from reaching Jira — but say so, loudly, and carry the fact forward so the
+        run's own summary admits the report went out UNVERIFIED.
+      * both empty — the checker ran and the report passed.
+
+    Returning a bare `[]` for both cases was the bug a review caught: only the missing-script branch
+    was loud, and the other four infra failure modes (non-zero exit, no stdout, an older copy without
+    `--json`, argparse exit 2, timeout) all fell into `except Exception: return []` — indistinguishable
+    from "the report passed". A junk 3-section report was posted to Jira with no output at all.
+
+    Delegates to that script rather than reimplementing the rules here, so the checker and the
+    SKILL.md section list it enforces stay in one place — the same single-source discipline the
+    control plane already follows for worker prompts."""
+    script = config.FK_AIDEVELOPER_DIR / "skills" / "ocean-rca" / "tools" / "check_rca_report.py"
+
+    def _unverified(reason: str) -> tuple[list[str], str]:
+        # LOUD, not silent. A judge review found this exact shape three times now: a gate that
+        # quietly disables itself is worse than no gate, because the run still LOOKS gated.
+        ui.milestone(f"RCA report gate DID NOT RUN — {reason}. The report will be posted UNVERIFIED. "
+                     f"(checker: {script}; is FK_AIDEVELOPER_DIR on a branch carrying "
+                     f"skills/ocean-rca/tools/?)")
+        return [], reason
+
+    if not script.exists():
+        return _unverified("checker script not found")
+    tmp = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as fh:
+            fh.write(report_text)
+            tmp = fh.name
+        proc = subprocess.run([sys.executable, str(script), tmp, "--json"],
+                              capture_output=True, text=True, timeout=30)
+        try:
+            parsed = json.loads(proc.stdout)
+        except Exception:  # noqa: BLE001
+            return _unverified(f"checker produced no parseable --json output "
+                               f"(exit {proc.returncode}): {(proc.stderr or proc.stdout or '')[:200]}")
+        if not isinstance(parsed, dict) or "problems" not in parsed:
+            return _unverified(f"checker output has no `problems` key (exit {proc.returncode}) — "
+                               f"an older copy of the script without --json support?")
+        return list(parsed.get("problems") or []), ""
+    except subprocess.TimeoutExpired:
+        return _unverified("checker timed out after 30s")
+    except Exception as e:  # noqa: BLE001 — a checker hiccup must never block a real report
+        return _unverified(f"checker could not be executed: {type(e).__name__}: {e}")
+    finally:
+        if tmp:
+            try:
+                Path(tmp).unlink()          # not unlink(missing_ok=) — keep this 3.7-safe
+            except OSError:
+                pass
+
+
 async def rca_report(state: OceanState) -> dict:
     """Post the RCA worker's 7-part report to Jira as a SINGLE comment — deterministic plain code, run
     by the graph, NOT the worker. This is the control-plane's own Jira transport (`jira.py`, the same
@@ -2453,10 +2558,35 @@ async def rca_report(state: OceanState) -> dict:
         p = Path(path)
         if p.exists():
             report_text = p.read_text(encoding="utf-8", errors="replace").strip()
+    # Finding 3 / the bias registry's hard-gate proposal: MECHANICALLY verify the report carries all
+    # seven Step-5 sections AND an answered `INDEPENDENT STATUS CHECK:` before it goes to Jira. The
+    # escalation ladder's own definition of a hard-gate is "a structural requirement the report format
+    # mechanically enforces (a required field, section, or refusal condition), not an instruction to
+    # remember" — so this REFUSES rather than warns. A report that fails is left unposted with the
+    # reasons surfaced, because posting an investigation that skipped its own falsification steps is
+    # worse than posting nothing: it reads as complete.
     if report_text:
+        gate, unverified = _check_rca_report(report_text)
+    else:
+        gate, unverified = ["no report file was produced"], ""
+    if report_text and not gate:
         jira.comment(tid, f"🤖 Aquaman Ocean RCA:\n\n{report_text}")
-    telemetry.station_event(state["execution_id"], 0.12, "end", posted=bool(report_text))
-    return {}
+    elif gate:
+        for problem in gate[:4]:
+            ui.milestone(f"RCA report gate: {problem}")
+        telemetry.station_event(state["execution_id"], 0.12, "report_gate_failed",
+                                problems="; ".join(gate)[:300])
+    if unverified:
+        telemetry.station_event(state["execution_id"], 0.12, "report_gate_unverified",
+                                reason=unverified[:300])
+    telemetry.station_event(state["execution_id"], 0.12, "end",
+                            posted=bool(report_text and not gate), gate_problems=len(gate),
+                            unverified=bool(unverified))
+    # `rca_report_unverified` rides alongside the problems list rather than folding into it: folding
+    # would fail the run closed on an INFRA fault, and a missing checker is not evidence of a bad
+    # report. It must still reach the terminal summary — a report posted with its gate skipped should
+    # never read as a gated one.
+    return {"rca_report_gate_problems": gate, "rca_report_unverified": unverified}
 
 
 # ------------------------------------------------------------------ RCA review gate (human, before acting on the RCA)
@@ -2472,13 +2602,31 @@ async def rca_review_gate(state: OceanState) -> dict:
         telemetry.station_event(exec_id, 0.15, "auto", decision="approve")
         return {"rca_approval_decision": "approve"}
     from langgraph.types import interrupt
+    # The prompt must describe what ACTUALLY happened. It used to say "just posted as a Jira comment"
+    # unconditionally — including on the path where the gate refused to post, which sent the reviewer
+    # to Jira to read a comment that was never written (judge review).
+    gate = state.get("rca_report_gate_problems") or []
+    unverified = state.get("rca_report_unverified") or ""
+    if gate:
+        prompt = (f"The RCA report was NOT posted — it failed its own quality gate "
+                  f"({'; '.join(str(g) for g in gate[:3])}). The draft is at "
+                  f"{state.get('rca_report_path') or '(no file)'}. Resume with --approve to end the "
+                  f"run as a reported failure, or --reject to stop here. Approving will NOT proceed "
+                  f"to coding: the graph never acts autonomously on a report that failed its gate.")
+    else:
+        posted = "just posted as a Jira comment"
+        if unverified:
+            posted += f" — but posted UNVERIFIED, its gate did not run ({unverified})"
+        prompt = (f"Review the RCA report {posted}, then resume with --approve to proceed "
+                  f"(report-only if no fix was needed, or on to coding if one was) or --reject to "
+                  f"stop here without acting on it.")
     decision = interrupt({
         "action": "rca_review",
         "ticket_id": state["ticket_id"],
         "fix_needed": state.get("rca_fix_needed", False),
-        "prompt": ("Review the RCA report just posted as a Jira comment, then resume with "
-                   "--approve to proceed (report-only if no fix was needed, or on to coding if "
-                   "one was) or --reject to stop here without acting on it."),
+        "report_posted": not gate,
+        "gate_problems": [str(g) for g in gate],
+        "prompt": prompt,
     })
     telemetry.station_event(exec_id, 0.15, "decision", decision=str(decision))
     return {"rca_approval_decision": str(decision)}
@@ -2496,5 +2644,23 @@ async def unsupported_route(state: OceanState) -> dict:
 
 # ------------------------------------------------------------------ RCA Done (terminal, no fix)
 async def rca_done(state: OceanState) -> dict:
-    telemetry.station_event(state["execution_id"], 0.1, "done", fix_needed=False)
+    # Finding 3 (judge follow-up): do NOT report a report as delivered when the gate refused to post
+    # it. rca_report leaves `rca_report_gate_problems` non-empty in exactly that case, and saying
+    # "delivered" there is the same class of false-completeness the RCA guardrails exist to prevent.
+    gate = state.get("rca_report_gate_problems") or []
+    if gate:
+        telemetry.station_event(state["execution_id"], 0.1, "done", fix_needed=False,
+                                report_posted=False, gate_problems=len(gate))
+        return {"final_status": "failed",
+                "final_outcome": (f"rca_report_NOT_delivered: the report failed its own quality gate "
+                                  f"and was not posted ({gate[0]}); needs an engineer")}
+    # Posted, but the gate never ran (checker missing/broken). Say so — "delivered" alone would imply
+    # it cleared a verification it never faced.
+    unverified = state.get("rca_report_unverified") or ""
+    telemetry.station_event(state["execution_id"], 0.1, "done", fix_needed=False, report_posted=True,
+                            unverified=bool(unverified))
+    if unverified:
+        return {"final_status": "rca_report",
+                "final_outcome": (f"rca_report_delivered_UNVERIFIED (no code fix needed) — the report "
+                                  f"gate did not run: {unverified}")}
     return {"final_status": "rca_report", "final_outcome": "rca_report_delivered (no code fix needed)"}
