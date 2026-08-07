@@ -62,6 +62,14 @@ class Script:
 
 def _install(script: Script, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    # Run the RCA report gate as "ran, and passed". These graph tests are about ROUTING, and the real
+    # gate shells out to a checker in the SIBLING fk-aideveloper checkout — so without this they
+    # quietly measure whether that repo happens to carry skills/ocean-rca/tools/ on the current
+    # branch. It is not a cosmetic stub: an absent checker now yields `rca_report_unverified`, which
+    # (by design) routes an unverified RCA to `done` instead of into autonomous coding, so these
+    # tests would fail on every other machine for a reason that has nothing to do with what they
+    # assert. The gate's own behaviour is covered directly by the dedicated tests further down.
+    monkeypatch.setattr(nodes, "_check_rca_report", lambda text: ([], ""))
     vdir = tmp_path / "verdicts"
     vdir.mkdir()
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")
@@ -396,9 +404,15 @@ def test_after_review():
     assert graph.after_review({"review_verdict": "APPROVE", "review_iteration": 1}) == "approve"
     assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 1}) == "rework"
     # Budget exhausted WITH a real diff to approve -> proceed to open_pr, SIT is the next gate.
-    # (Mirrors open_pr's own guard, which checks just `branch`, not `files_changed`.)
+    # Mirrors open_pr's FULL guard (`not slugs or not branch`), not `files_changed` — so the fixture
+    # carries the repo the coder pushed to, exactly as a real coder verdict does.
     assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 2,
-                                "branch": "MM-1/fix"}) == "approve"
+                                "branch": "MM-1/fix",
+                                "service_repo": "cloudqwest/ocean-worker"}) == "approve"
+    # ...and the other half of that guard: a branch with NO resolvable repo slug used to return
+    # "approve" and then crash in open_pr with a GitOpError. Stop cleanly instead (judge review).
+    assert graph.after_review({"review_verdict": "CHANGES_REQUIRED", "review_iteration": 2,
+                                "branch": "MM-1/fix"}) == "stop"
     # Budget exhausted with NO diff (coder refused/failed to write code, branch left blank --
     # EXE-342a6243/MM-14475) -> stop cleanly instead of routing to open_pr, which would crash
     # with a GitOpError (open_pr raises on an empty branch).
@@ -2611,3 +2625,205 @@ def test_format_message_result_message_still_shows_result_text_not_swallowed_by_
     lines = agents._format_message(msg)
     assert lines == ["✔ the coder pushed branch MM-1/fix"]
     assert not any("system[success]" in l for l in lines)
+
+
+# ----------------------------------------------------------------- F1: deterministic junit grading
+def _write(tmp_path, name, xml):
+    p = tmp_path / name
+    p.write_text(xml)
+    return p
+
+
+def test_unreadable_junit_is_could_not_verify_never_the_llms_word(tmp_path):
+    """F1's whole point is that the junit outranks the triage agent's self-report. Returning None on
+    XML it couldn't aggregate made the caller FALL BACK to that self-report, so a malformed junit plus
+    a self-reported 'passed' flipped the PR ready — silently, with no override telemetry. Verified in
+    review against the real sit_triage on all three shapes below."""
+    ok = _write(tmp_path, "ok.xml", '<testsuites><testsuite name="s" tests="2" failures="0" '
+                                    'errors="0" skipped="0"><testcase name="a"/><testcase name="b"/>'
+                                    '</testsuite></testsuites>')
+    assert nodes._junit_pass_fail(ok)[0] == "passed"
+
+    for name, xml in (
+            ("truncated.xml", '<testsuites><testsuite name="s" tests="2" fail'),   # unparseable
+            ("no_suite.xml", '<root><nothing/></root>'),                           # parses, no suite
+            ("junk.xml", 'ALL TESTS PASSED')):                                     # non-empty junk
+        res, detail = nodes._junit_pass_fail(_write(tmp_path, name, xml))
+        assert res == "could_not_verify", f"{name} graded {res!r} — the LLM fallback is back"
+        assert detail
+    # ...and it must never be None: None is what re-enables the fallback branch in the caller.
+    assert nodes._junit_pass_fail(_write(tmp_path, "x.xml", "junk"))[0] is not None
+
+
+def test_incomplete_merged_junit_is_could_not_verify_not_passed(tmp_path):
+    """SIT green-by-omission: a batch killed by its wrapper timeout writes NO junit, so the merge
+    presents the SURVIVORS' totals as the run's totals and a killed test file grades PASSED
+    (reproduced end-to-end in review). merge_junit.py stamps completeness on the root; anything other
+    than 'complete' is absence of evidence, not evidence of a pass."""
+    body = ('<testsuite name="merged" tests="2" failures="0" errors="0" skipped="0">'
+            '<testcase name="a"/><testcase name="b"/></testsuite>')
+    passing = f'<testsuites completeness="complete" merged_batches="2" expected_batches="2">{body}</testsuites>'
+    assert nodes._junit_pass_fail(_write(tmp_path, "c.xml", passing))[0] == "passed"
+
+    for comp, got, exp in (("incomplete", "1", "2"), ("unverified", "1", "")):
+        xml = (f'<testsuites completeness="{comp}" merged_batches="{got}" '
+               f'expected_batches="{exp}">{body}</testsuites>')
+        res, detail = nodes._junit_pass_fail(_write(tmp_path, f"{comp}.xml", xml))
+        assert res == "could_not_verify", f"completeness={comp} graded {res!r}"
+        assert comp in detail
+
+    # A merged junit with NO completeness attribute predates the marker — treat as unverified, not
+    # complete. (A plain single-pytest junit, name != "merged", carries no completeness claim and is
+    # graded normally; that path must not regress.)
+    old = f'<testsuites>{body}</testsuites>'
+    assert nodes._junit_pass_fail(_write(tmp_path, "old.xml", old))[0] == "could_not_verify"
+    plain = ('<testsuites><testsuite name="tests.test_ocean" tests="2" failures="0" errors="0" '
+             'skipped="0"><testcase name="a"/><testcase name="b"/></testsuite></testsuites>')
+    assert nodes._junit_pass_fail(_write(tmp_path, "plain.xml", plain))[0] == "passed"
+
+
+def test_unverifiable_junit_routes_away_from_flip_ready():
+    """could_not_verify must reach `stop` (left in draft, needs a human), never `pass` -> flip_ready."""
+    base = {"fidelity_rung": 2, "coding_attempts": 0, "env_retry_attempts": 0}
+    assert graph.after_sit_triage({**base, "automation_result": "could_not_verify",
+                                   "failure_class": "could_not_verify"}) == "stop"
+    assert graph.after_sit_triage({**base, "automation_result": "passed", "failure_class": ""}) == "pass"
+    assert graph.after_sit_triage({**base, "automation_result": "failed",
+                                   "failure_class": "code_fault"}) == "code_fault"
+
+
+# --------------------------------------------------------- F2/F3 share ONE severity canonicalizer
+def test_malformed_severity_cannot_defeat_F2_and_F3_in_lockstep():
+    """F2 (downgrade APPROVE) and F3 (refuse to ship on budget exhaustion) are supposed to be
+    INDEPENDENT gates. A review found both compared `str(f.get("severity","")).upper()` against a
+    literal tuple — duplicated in two files — so one malformed LLM-authored string defeated both at
+    once instead of them backstopping each other. They now share `schemas.is_blocking_finding`."""
+    # NOTE: an UNMAPPED string is deliberately NOT in this list — see
+    # test_severity_canonicalizer_never_blocks_on_benign_vocabulary for why blocking on unknown
+    # words was the wrong direction and wedged the whole review loop.
+    for sev in (" CRITICAL ", "MAJOR ", "critical", "**CRITICAL**", "CRITICAL_BUG",
+                "blocker", "P0", "HIGH"):
+        v = schemas.ReviewVerdict(verdict="APPROVE", findings=[{"severity": sev, "title": "t"}])
+        assert v.verdict == "CHANGES_REQUIRED", f"F2 let {sev!r} through"
+        assert graph._has_blocking_findings({"review_findings": [{"severity": sev}]}), \
+            f"F3 let {sev!r} through"
+    # A non-canonical KEY and a single-element list are both real shapes in LLM-authored JSON.
+    assert schemas.ReviewVerdict(verdict="APPROVE",
+                                 findings=[{"Severity": "CRITICAL"}]).verdict == "CHANGES_REQUIRED"
+    assert schemas.ReviewVerdict(verdict="APPROVE",
+                                 findings=[{"severity": ["CRITICAL"]}]).verdict == "CHANGES_REQUIRED"
+
+    # Must NOT over-block: a MINOR-only or severity-less review still approves, and the gate stays
+    # downgrade-only. Treating an absent severity as blocking would wedge every review, not gate it.
+    for findings in ([], [{"severity": "MINOR"}], [{"severity": "nit"}], [{"title": "no severity"}]):
+        assert schemas.ReviewVerdict(verdict="APPROVE", findings=findings).verdict == "APPROVE"
+        assert not graph._has_blocking_findings({"review_findings": findings})
+    assert schemas.ReviewVerdict(verdict="CHANGES_REQUIRED", findings=[]).verdict == "CHANGES_REQUIRED"
+
+    # And the F3 routing consequence: budget exhausted + a diff + a blocking finding -> stop, not ship.
+    exhausted = {"review_verdict": "CHANGES_REQUIRED", "review_iteration": 99, "branch": "MM-1/x",
+                 "service_repo": "cloudqwest/ocean-worker"}
+    assert graph.after_review({**exhausted, "review_findings": [{"severity": "P0"}]}) == "stop"
+    assert graph.after_review({**exhausted, "review_findings": [{"severity": "MINOR"}]}) == "approve"
+
+
+# ------------------------------------------------- Finding 2 (②-a): corroborate a Rung-2 claim
+def test_rung2_claim_requires_positive_sut_activity(tmp_path, monkeypatch):
+    """The unmocked-path audit is ABSENCE-blind: a SUT that errors before touching anything makes no
+    mock call, so nothing is recorded and its cap cannot fire. The test then reads back its own seed,
+    passes, and a self-reported `fidelity_rung: 2` flips the PR ready (reproduced in review).
+
+    The mock's SUT-vs-setup write count is the missing PRESENCE signal. Note the three states must stay
+    distinct: SUT-idle, SUT-active, and "no audit written" (could not check)."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+
+    def _audit(exec_id, payload):
+        d = tmp_path / exec_id
+        d.mkdir(parents=True, exist_ok=True)
+        if payload is not None:
+            (d / "sut_activity.json").write_text(json.dumps(payload))
+
+    _audit("E-idle", {"sut": 0, "setup": 2})
+    _audit("E-live", {"sut": 3, "setup": 2})
+    _audit("E-none", None)
+    assert nodes._sut_write_activity("E-idle") == (0, 2, True)
+    assert nodes._sut_write_activity("E-live") == (3, 2, True)
+    assert nodes._sut_write_activity("E-none") == (0, 0, False)   # could NOT check != checked-and-idle
+    # A corrupt audit must degrade to "could not check", never to a false all-clear.
+    (tmp_path / "E-bad").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "E-bad" / "sut_activity.json").write_text("{ not json")
+    assert nodes._sut_write_activity("E-bad") == (0, 0, False)
+
+    # A Rung-0 cap must route to a human, not to flip_ready — that is what makes the cap worth having.
+    assert graph.after_sit_triage({"automation_result": "passed", "fidelity_rung": 0}) == "stop"
+    assert graph.after_sit_triage({"automation_result": "passed", "fidelity_rung": 2}) == "pass"
+
+
+def test_rung_corroboration_survives_the_state_schema():
+    from ocean_pipeline.state import OceanState
+    assert "rung_corroboration" in OceanState.__annotations__
+
+
+def test_unverified_rca_never_feeds_autonomous_coding():
+    """A report the gate could not CHECK is not a checked report. rca_report fails OPEN when the
+    checker is unavailable (correct — a broken checker must not block a legitimate RCA from Jira),
+    but that leaves gate_problems empty, which used to read exactly like a clean pass here and routed
+    an UNVERIFIED root cause into autonomous coding whenever RCA_REVIEW_AUTO was on — headless, so no
+    human ever sees it (judge review). Posting unverified is a defensible risk; coding off it is not."""
+    approve = {"rca_approval_decision": "approve", "rca_fix_needed": True}
+    assert graph.after_rca_review({**approve, "rca_report_unverified": "checker not found"}) == "done"
+    assert graph.after_rca_review({**approve, "rca_report_gate_problems": ["missing section"]}) == "done"
+    # The verified path must be untouched — otherwise this "fix" just disables the fix route.
+    assert graph.after_rca_review({**approve, "rca_report_unverified": ""}) == "fix_needed"
+    assert graph.after_rca_review({**approve, "rca_fix_needed": False}) == "done"
+
+    # ...and the terminal names the withheld fix instead of implying none was needed.
+    out = asyncio.run(nodes.rca_done({"execution_id": "E", "rca_report_gate_problems": [],
+                                      "rca_report_unverified": "checker not found",
+                                      "rca_fix_needed": True}))
+    assert out["final_status"] == "rca_report"
+    assert "UNVERIFIED" in out["final_outcome"] and "fix was NOT started" in out["final_outcome"]
+
+
+def test_severity_canonicalizer_never_blocks_on_benign_vocabulary():
+    """The unmapped fallback returned CRITICAL at first, which made 48 of 55 plausible strings block
+    an APPROVE — including ones meaning the OPPOSITE (`none`, `resolved`, `FIXED`, `non-blocking`).
+    Because F2 and F3 share this predicate, one such string wedged BOTH gates and killed the run with
+    no PR (judge review). Unmapped is now non-blocking: exactly what the old inline comparison did."""
+    for benign in ("none", "NONE", "N/A", "resolved", "FIXED", "non-blocking", "cosmetic",
+                   "optional", "FYI", "Moderate", "WARNING", "tech-debt", "unknown-word", ""):
+        assert not schemas.is_blocking_finding({"severity": benign}), benign
+        assert schemas.ReviewVerdict(verdict="APPROVE",
+                                     findings=[{"severity": benign}]).verdict == "APPROVE", benign
+    # An alias as the FIRST word of a longer string still blocks.
+    for blocking in ("P0 - data loss", "blocker: nil deref", "SEV1", "HIGH"):
+        assert schemas.is_blocking_finding({"severity": blocking}), blocking
+
+
+def test_stop_run_labels_a_review_stop_consistently_with_the_gate(tmp_path, monkeypatch):
+    """The THIRD copy of the severity comparison lived here, in stop_run's labelling. It gates
+    nothing — after_review has already decided to stop — but when it DISAGREED with the gate that
+    just fired (a non-canonical severity like "P0" or " CRITICAL "), everything downstream inherited
+    the disagreement: the run was labelled against Station 6 (SIT), which never ran; the PR note
+    named the wrong stage; and lessons.record_failure wrote that wrong stage into the CROSS-TICKET
+    store, so the bad signature is recalled into every future ticket in the domain. All three copies
+    now share schemas.is_blocking_finding."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(nodes.jira, "comment", lambda *a, **kw: None)
+
+    def _outcome(sev):
+        st = {"execution_id": "E", "ticket_id": "MM-1", "review_verdict": "CHANGES_REQUIRED",
+              "review_iteration": 99, "branch": "MM-1/x", "service_repo": "cloudqwest/ocean-worker",
+              "review_findings": [{"severity": sev}]}
+        return graph.after_review(st), str(asyncio.run(nodes.stop_run(st)).get("final_outcome", ""))
+
+    for sev in ("CRITICAL", " CRITICAL ", "P0", "blocker", "**MAJOR**"):
+        gate, outcome = _outcome(sev)
+        assert gate == "stop", f"{sev!r} did not reach the review stop"
+        assert "review" in outcome.lower(), \
+            f"{sev!r} stopped at REVIEW but was labelled {outcome!r} — the label disagrees with the gate"
+        assert "sit_failed" not in outcome, f"{sev!r} mislabelled against a SIT stage that never ran"
+
+    # A MINOR-only residual is NOT a review stop — it proceeds, so this must not over-trigger.
+    assert _outcome("MINOR")[0] == "approve"

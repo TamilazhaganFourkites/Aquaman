@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
-from . import config, nodes
+from . import config, nodes, schemas
 from .state import OceanState
 
 
@@ -57,18 +57,28 @@ def after_rca_review(state: OceanState) -> str:
     # "done" (rca_done) then reports the non-delivery honestly rather than claiming success.
     if state.get("rca_report_gate_problems"):
         return "done"
+    # Same reasoning, one step further out (judge review): a report the gate could not CHECK is not a
+    # checked report. When FK_AIDEVELOPER_DIR lacks the checker, rca_report fails OPEN — correct, a
+    # broken checker must not block a legitimate RCA from reaching Jira — but that leaves
+    # gate_problems empty, which used to read exactly like a clean pass here and routed an UNVERIFIED
+    # root cause straight into autonomous coding whenever RCA_REVIEW_AUTO was on (headless: no human
+    # ever sees it). Posting unverified is a defensible risk; CODING off unverified is not, so the
+    # fail-open stops at the Jira comment. rca_done then says so explicitly.
+    if state.get("rca_report_unverified"):
+        return "done"
     if config.RCA_ONLY:
         return "done"
     return "fix_needed" if state.get("rca_fix_needed") else "done"
 
 
 def _has_blocking_findings(state: OceanState) -> bool:
-    """F3 (architecture review): any UNRESOLVED CRITICAL/MAJOR in the last review. Severity is the
-    single source of truth (same convention ReviewVerdict's F2 gate uses)."""
-    for f in state.get("review_findings") or []:
-        if isinstance(f, dict) and str(f.get("severity", "")).upper() in ("CRITICAL", "MAJOR"):
-            return True
-    return False
+    """F3 (architecture review): any UNRESOLVED CRITICAL/MAJOR in the last review.
+
+    Uses schemas.is_blocking_finding — the SAME predicate ReviewVerdict's F2 gate uses, imported
+    rather than re-implemented. It used to be a second copy of the same inline string comparison, and
+    a review proved that made the two gates fail together on one malformed severity string instead of
+    backstopping each other (see the canonicalizer's own comment in schemas.py)."""
+    return any(schemas.is_blocking_finding(f) for f in (state.get("review_findings") or []))
 
 
 def after_review(state: OceanState) -> str:
@@ -94,6 +104,13 @@ def after_review(state: OceanState) -> str:
             # the PR when the residual is at most MINOR. (Composes with F2: the last verdict is already
             # CHANGES_REQUIRED whenever CRITICAL/MAJOR exist, so this never contradicts an honest APPROVE.)
             if _has_blocking_findings(state):
+                return "stop"
+            # Mirror open_pr's FULL guard, not half of it. open_pr raises GitOpError on
+            # `not slugs or not branch`, but this only checked `branch` — so a branch-set/slugs-empty
+            # state routed to "approve" and crashed there instead of stopping cleanly. Near-unreachable
+            # today (the coder reports repo and branch together), but the asymmetry is the kind that
+            # becomes reachable the moment either side is edited (judge review).
+            if not nodes._service_slugs(state):
                 return "stop"
             return "approve"
         return "stop"

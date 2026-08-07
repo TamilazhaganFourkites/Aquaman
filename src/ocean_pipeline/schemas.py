@@ -8,6 +8,8 @@ contract exactly so the node can read the skill's own file, not re-impose a sche
 """
 from __future__ import annotations
 
+import re
+
 from typing import Literal
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
@@ -83,6 +85,91 @@ class CoderVerdict(BaseModel):
     pr_body: str = ""         # PR body the open_pr code node will use
 
 
+# --------------------------------------------------------------- severity, canonicalized ONCE
+# F2 and F3 are supposed to be independent gates: F2 downgrades an APPROVE that still carries
+# CRITICAL/MAJOR findings, F3 refuses to stop-with-approval while blocking findings are open. A review
+# found they were not independent at all — both compared `str(f.get("severity","")).upper()` against a
+# literal tuple, duplicated in two files, so ONE malformed severity string defeated BOTH in lockstep:
+#     {'severity': ' CRITICAL '}   -> not blocking, verdict stays APPROVE
+#     {'severity': 'blocker'}      -> not blocking, verdict stays APPROVE
+#     {'severity': 'P0'}           -> not blocking, verdict stays APPROVE
+#     {'Severity': 'CRITICAL'}     -> not blocking, verdict stays APPROVE
+# These are LLM-authored strings; a trailing space or a vocabulary slip is not an exotic input. One
+# canonicalizer, imported by both, is the actual fix — the duplication WAS the defect.
+BLOCKING_SEVERITIES = frozenset({"CRITICAL", "MAJOR"})
+
+# Vocabulary a reviewer might reasonably reach for instead of the canonical three.
+_SEVERITY_ALIASES = {
+    "BLOCKER": "CRITICAL", "BLOCKING": "CRITICAL", "FATAL": "CRITICAL", "SEVERE": "CRITICAL",
+    "P0": "CRITICAL", "S0": "CRITICAL", "SEV0": "CRITICAL",
+    # "SEV" alone: the first-word split below turns "SEV-0"/"SEV 1" into "SEV", and an unqualified
+    # severity marker is the reviewer flagging something serious, not a nit.
+    "SEV": "CRITICAL",
+    "HIGH": "MAJOR", "P1": "MAJOR", "S1": "MAJOR", "SEV1": "MAJOR", "IMPORTANT": "MAJOR",
+    "MEDIUM": "MINOR", "LOW": "MINOR", "MINOR/NIT": "MINOR", "NIT": "MINOR", "NITPICK": "MINOR",
+    "INFO": "MINOR", "INFORMATIONAL": "MINOR", "TRIVIAL": "MINOR", "SUGGESTION": "MINOR",
+    "P2": "MINOR", "P3": "MINOR", "S2": "MINOR", "S3": "MINOR",
+}
+
+
+def normalize_severity(finding) -> str:
+    """A finding's severity as one of CRITICAL / MAJOR / MINOR / "" (absent).
+
+    Tolerates what LLM-authored JSON actually contains: surrounding whitespace, markdown emphasis
+    (`**CRITICAL**`), a trailing colon, any capitalization, a non-canonical key (`Severity`), a
+    single-element list, and the alias vocabulary above.
+
+    UNRECOGNIZED severities return "" and do NOT block. Defaulting them to CRITICAL was tried and was
+    the wrong direction: a judge probe found 48 of 55 plausible strings then blocked an APPROVE,
+    including ones meaning the OPPOSITE — `none`, `N/A`, `resolved`, `FIXED`, `non-blocking`,
+    `cosmetic`, `FYI`. And because F2 and F3 now share this predicate, a single such string wedged
+    BOTH: round 1 `rework`, budget exhausted, `stop`, no PR — the exact lockstep coupling this
+    function exists to remove. review.md tells the reviewer to re-verify prior findings on round 2+,
+    which is precisely where `resolved`/`FIXED` appear.
+
+    The value here is the CANONICALIZATION — whitespace, markdown emphasis, case, a `Severity` key, a
+    one-element list, and the alias vocabulary — not a guess about unknown words. On an unmapped
+    string this returns exactly what the old inline comparison did (non-blocking), so the fix is
+    strictly an improvement over the previous behaviour and never a new way to block."""
+    if not isinstance(finding, dict):
+        return ""
+    raw = None
+    for k, v in finding.items():
+        if isinstance(k, str) and k.strip().lower() == "severity":
+            raw = v
+            break
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if len(raw) == 1 else None
+    if raw is None:
+        return ""
+    s = str(raw).strip().strip("*_`#:.-").strip().upper()
+    s = " ".join(s.split())
+    # Some reviewers write the label into the value ("Severity: CRITICAL"); drop it so the
+    # canonical match below sees the actual level.
+    if s.startswith("SEVERITY") and len(s) > 8:
+        s = s[8:].lstrip(": -").strip()
+    if not s:
+        return ""
+    if s in ("CRITICAL", "MAJOR", "MINOR"):
+        return s
+    if s in _SEVERITY_ALIASES:
+        return _SEVERITY_ALIASES[s]
+    # A prefix match catches "CRITICAL_BUG" / "MAJOR - correctness" / "critical (data loss)".
+    for canon in ("CRITICAL", "MAJOR", "MINOR"):
+        if s.startswith(canon):
+            return canon
+    # An alias appearing as the FIRST word ("P0 - data loss", "blocker: nil deref").
+    head = re.split(r"[\s:_\-/(]", s, maxsplit=1)[0]
+    if head in _SEVERITY_ALIASES:
+        return _SEVERITY_ALIASES[head]
+    return ""   # unmapped -> non-blocking; see the docstring for why CRITICAL was wrong here
+
+
+def is_blocking_finding(finding) -> bool:
+    """True when this finding must block an APPROVE. The single predicate F2 and F3 both use."""
+    return normalize_severity(finding) in BLOCKING_SEVERITIES
+
+
 class ReviewVerdict(BaseModel):
     verdict: Literal["APPROVE", "CHANGES_REQUIRED"]
     findings: list[dict] = Field(default_factory=list)   # [{severity, file, summary}]
@@ -107,8 +194,7 @@ class ReviewVerdict(BaseModel):
     # Derive them here from findings[] (the single source of truth) so they are ALWAYS populated
     # and can never disagree with the findings list — whatever the worker emitted is ignored.
     def _sev_count(self, sev: str) -> int:
-        return sum(1 for f in self.findings
-                   if isinstance(f, dict) and str(f.get("severity", "")).upper() == sev)
+        return sum(1 for f in self.findings if normalize_severity(f) == sev)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

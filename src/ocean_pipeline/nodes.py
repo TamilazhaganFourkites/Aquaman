@@ -1620,22 +1620,83 @@ def _read_unmocked_paths(exec_id: str) -> list[str]:
         return []
 
 
+def _sut_write_activity(exec_id: str) -> tuple:
+    """Finding 2 (②-a): the mock's own count of provenance-tagged writes, as (sut, setup, available).
+
+    `_read_unmocked_paths` above is ABSENCE-BLIND, and a review made that concrete: a SUT that errors
+    before ever touching the receiving service makes no mock call at all, so the unmocked audit stays
+    empty and its cap is structurally incapable of firing. The test then reads back the value its own
+    setup seeded, passes honestly, and a self-reported `fidelity_rung: 2` + `ran_on: "local"` clears
+    `_real_service_gap` on the agent's word alone and flips the PR ready.
+
+    A COUNT of SUT-origin writes is the missing presence signal for exactly that case: in
+    local-mock-first mode the SUT's outbound writes land in the mock, so zero of them means the SUT
+    produced no observable effect this run. `available` is False when the mock wrote no audit (older
+    mock, or launched without the path) — that is "we could not check", which must stay distinct from
+    "we checked and the SUT was idle"."""
+    try:
+        p = config.artifacts_dir(exec_id) / "sut_activity.json"
+        if not p.exists():
+            return 0, 0, False
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return 0, 0, False
+        # `unknown` counts mutating requests that carried no ?origin= marker — most mock routes don't
+        # take one. They are folded into the SUT side ON PURPOSE: an untagged write may or may not be
+        # the SUT's, and the only conclusion drawn from this number is the negative one ("nothing but
+        # setup happened"), so an ambiguous write must PREVENT that conclusion, never support it.
+        sut = int(data.get("sut") or 0) + int(data.get("unknown") or 0)
+        return sut, int(data.get("setup") or 0), True
+    except Exception:  # noqa: BLE001 — an audit-file hiccup must never break triage
+        return 0, 0, False
+
+
 def _junit_pass_fail(junit_path) -> tuple:
     """F1 (Aquaman architecture review): the SIT pass/fail is MACHINE-READABLE (junit XML) — parse it
     DETERMINISTICALLY here instead of trusting the LLM triage to read it as prose. Returns
-    (result, detail) where result is 'passed' | 'failed' | None. 'passed' iff at least one test
-    actually EXECUTED (tests minus skipped > 0) and there are zero failures and zero errors. None means
-    the file couldn't be parsed/aggregated — the caller then keeps the LLM verdict as a fallback (the
-    EVIDENCE GUARD upstream already proved a non-empty junit exists, so None here means malformed XML,
-    not a missing run). Aggregates across both the <testsuites> wrapper and bare <testsuite> shapes."""
+    (result, detail) where result is 'passed' | 'failed' | 'could_not_verify' — NEVER None.
+    'passed' iff the run is verifiably COMPLETE, at least one test actually EXECUTED (tests minus
+    skipped > 0), and there are zero failures and zero errors.
+
+    It used to return None on any XML it couldn't aggregate, and the caller then fell back to the
+    LLM's self-reported `automation_result` — which defeated the entire point of F1. Reproduced in
+    review against the real sit_triage, LLM self-reporting "passed":
+        malformed (truncated) XML  -> 'passed', routed to flip_ready
+        well-formed, no <testsuite> -> 'passed', routed to flip_ready
+        junk text "ALL TESTS PASSED" -> 'passed', routed to flip_ready
+    ...and silently: no override telemetry, no milestone. The EVIDENCE GUARD upstream only checks the
+    file is non-empty, never that it parses, so unreadable evidence WAS treated as good evidence.
+    Unreadable evidence is now `could_not_verify`, which is what "we did not verify this" means.
+
+    COMPLETENESS: a junit merged from per-file batches can be missing whole batches — a batch killed
+    by its wrapper timeout writes no file at all, so the merge silently presents the survivors' totals
+    as the run's totals and a killed test file grades PASSED (the green-by-omission hole; reproduced
+    end-to-end). merge_junit.py now stamps `completeness` on the root, and anything other than
+    "complete" is could_not_verify here — absence of evidence is not evidence of a pass.
+
+    Aggregates across both the <testsuites> wrapper and bare <testsuite> shapes."""
     import xml.etree.ElementTree as ET
     try:
         root = ET.parse(str(junit_path)).getroot()
-    except Exception as e:  # noqa: BLE001 — malformed XML: fall back to the LLM verdict, never crash triage
-        return None, f"junit unparseable: {type(e).__name__}: {e}"[:160]
+    except Exception as e:  # noqa: BLE001 — never crash triage; unreadable evidence is not a pass
+        return "could_not_verify", f"junit unparseable: {type(e).__name__}: {e}"[:160]
     suites = [root] if root.tag == "testsuite" else root.findall(".//testsuite")
     if not suites:
-        return None, "no <testsuite> element found"
+        return "could_not_verify", "no <testsuite> element found"
+
+    # Completeness, before anything is counted. Absent attribute on a NON-merged junit is the normal
+    # single-pytest shape and carries no completeness claim to check. Absent on a merged one means it
+    # came from a merge_junit predating this marker — treat that as unverified rather than complete.
+    completeness = root.get("completeness") or ""
+    if not completeness and any((s.get("name") or "") == "merged" for s in suites):
+        completeness = "unverified"
+    if completeness and completeness != "complete":
+        got, exp = root.get("merged_batches") or "?", root.get("expected_batches") or "?"
+        return "could_not_verify", (
+            f"junit completeness={completeness} ({got} of {exp} batches merged) — batches that were "
+            f"killed before writing a junit are ABSENT, not failing, so the totals here describe only "
+            f"the survivors")
+
     tests = failures = errors = skipped = 0
     for s in suites:
         def _i(attr):
@@ -2000,7 +2061,10 @@ async def sit_triage(state: OceanState) -> dict:
     #   det=passed  -> passed, no failure_class (the tests objectively passed; any LLM "failure" is a false negative)
     #   det=failed  -> failed, KEEP the LLM's failure_class (its job: code_fault vs test_fault vs env); if the
     #                  LLM thought it PASSED and gave no class, we can't classify a failure it misread -> could_not_verify
-    #   det=None    -> junit malformed (not missing — evidence guard ran); fall back to the LLM verdict as before
+    #   det=could_not_verify -> the junit is unreadable or incomplete. NEVER falls back to the LLM: that
+    #                  fallback (the old det=None path) let a malformed junit plus a self-reported
+    #                  "passed" flip the PR ready with no human touch, silently, which is precisely the
+    #                  reward-hacking surface F1 exists to close.
     # F4 (architecture review): sit_run executes under bypassPermissions in a writable worktree, so the
     # grading junit is a reward-hacking surface. Deterministic grading (F1) already reads it from the
     # run's artifacts dir (outside the worktree) AFTER sit_run's turn ends — but also FINGERPRINT the
@@ -2017,9 +2081,19 @@ async def sit_triage(state: OceanState) -> dict:
         automation_result = det_result
         if det_result == "passed":
             failure_class = ""
+        elif det_result == "could_not_verify":
+            # Unreadable/incomplete evidence. Do NOT keep an LLM failure_class here: classifying a
+            # fault (code_fault/test_fault) from evidence we could not read would send the code_fault
+            # loop chasing a defect nobody has established exists.
+            failure_class = "could_not_verify"
+            ui.milestone(f"F1: junit could not be verified ({det_detail}) -- grading could_not_verify, "
+                         f"NOT falling back to the triage agent's self-report "
+                         f"('{v.automation_result}'). Re-run the SIT to produce readable evidence.")
+            telemetry.station_event(exec_id, 6.4, "det_unverifiable",
+                                    llm_result=v.automation_result, detail=det_detail)
         else:  # det says failed
             failure_class = v.failure_class or "could_not_verify"
-        if det_result != v.automation_result:
+        if det_result != v.automation_result and det_result != "could_not_verify":
             ui.milestone(f"F1: junit is authoritative -> {det_result} ({det_detail}); LLM triage said "
                          f"'{v.automation_result}' -> trusting the deterministic junit parse")
             telemetry.station_event(exec_id, 6.4, "det_override",
@@ -2047,6 +2121,35 @@ async def sit_triage(state: OceanState) -> dict:
             telemetry.station_event(exec_id, 6.4, "unmocked_selfreport_gap",
                                     disk=len(unmocked_paths), reported=0)
         fidelity_rung = 1
+    # Finding 2 (②-a): the unmocked audit above can only cap on PRESENCE of a degraded call, so the
+    # "SUT never ran at all" case slipped through it entirely. Require POSITIVE corroboration for a
+    # Rung-2 claim in mock-first mode: the mock must have observed at least one SUT-origin write. Zero
+    # observed writes means the assertions held against the test's own seed, which is Rung 0 by
+    # definition (trivial green) — and after_sit_triage routes Rung 0 to stop_run, so this needs a
+    # human instead of flipping the PR.
+    sut_writes, setup_writes, activity_known = _sut_write_activity(exec_id)
+    rung_corroboration = ""
+    if v.execution_mode == "local-mock-first" and fidelity_rung >= 2:
+        if not activity_known:
+            # Could not check — NOT the same as checked-and-idle. This changes NO routing and is read
+            # by no consumer today: it is a ui.milestone + a telemetry event, with the state key kept
+            # so a future consumer (report line, gate reason) has it without re-plumbing. Making it
+            # block would halt every run whose mock predates the audit, on no evidence of a defect.
+            # Two earlier versions of this comment overclaimed (human_gate surfaces it; the final
+            # report carries it) — neither is true, so it is stated plainly here.
+            rung_corroboration = ("the mock wrote no SUT-activity audit, so this run's Rung-2 claim "
+                                  "rests on the triage agent's own word")
+            ui.milestone(f"Finding 2: Rung {fidelity_rung} is UNCORROBORATED — {rung_corroboration}. "
+                         f"(An older mock, or one launched without --sut-activity-log.)")
+            telemetry.station_event(exec_id, 6.4, "rung_uncorroborated", reason="no sut_activity.json")
+        elif sut_writes == 0:
+            ui.milestone(f"Finding 2: the triage claims fidelity Rung {fidelity_rung}, but the mock "
+                         f"observed ZERO SUT-origin writes ({setup_writes} setup write(s)) — the "
+                         f"assertions held against the test's own seed. Capping to Rung 0 "
+                         f"(trivial green); this needs a human, not a ready-flip.")
+            telemetry.station_event(exec_id, 6.4, "rung_capped_no_sut_activity",
+                                    claimed=fidelity_rung, setup_writes=setup_writes)
+            fidelity_rung = 0
     telemetry.station_event(exec_id, 6.4, "end", automation_result=automation_result,
                             failure_class=failure_class, execution_mode=v.execution_mode,
                             needs_onboarding=v.needs_onboarding, graded_junit_sha=_junit_sha,  # F4: audit fingerprint
@@ -2057,6 +2160,7 @@ async def sit_triage(state: OceanState) -> dict:
         "failure_class": failure_class,
         "execution_mode": v.execution_mode,
         "fidelity_rung": fidelity_rung,
+        "rung_corroboration": rung_corroboration,
         "ref_load_used": v.ref_load_used,
         "test_automation_pr_url": v.test_automation_pr_url,
         "sit_findings": v.findings_for_coder,
@@ -2380,9 +2484,16 @@ async def stop_run(state: OceanState) -> dict:
     #     -- a real branch the reviewer rejected. A `sit_failed` label (station 6) here would misdirect
     #     the human triaging the run to a SIT stage that didn't run; record the review-stage truth.
     review_rejected = state.get("review_verdict") not in (None, "", "APPROVE")
-    has_blocking = any(
-        isinstance(f, dict) and str(f.get("severity", "")).upper() in ("CRITICAL", "MAJOR")
-        for f in (state.get("review_findings") or []))
+    # THIRD copy of the severity comparison, now routed through the one canonicalizer F2 and F3 share.
+    # It gates nothing (after_review already decided to stop by the time we get here), but a
+    # non-canonical severity — "P0", " CRITICAL " — made it disagree with the gate that just fired,
+    # and everything downstream inherited that disagreement: the run was labelled `sit_failed`
+    # against Station 6 (which never ran), the PR note named the wrong stage, and
+    # `lessons.record_failure` wrote the wrong action_sig into the cross-ticket store, so the bad
+    # signature is recalled into every future ticket in the domain. Duplication of this exact
+    # comparison is the defect class this batch set out to remove; leaving one copy behind would have
+    # kept it alive in the failure MEMORY rather than the gate.
+    has_blocking = any(schemas.is_blocking_finding(f) for f in (state.get("review_findings") or []))
     review_stop_no_diff = review_rejected and not branch_set
     review_stop_blocking = review_rejected and branch_set and not pr_opened and has_blocking
     # Finding 2c (architecture review): after_sit_triage routes a Rung-0 "trivial green" PASS here
@@ -2657,10 +2768,16 @@ async def rca_done(state: OceanState) -> dict:
     # Posted, but the gate never ran (checker missing/broken). Say so — "delivered" alone would imply
     # it cleared a verification it never faced.
     unverified = state.get("rca_report_unverified") or ""
-    telemetry.station_event(state["execution_id"], 0.1, "done", fix_needed=False, report_posted=True,
-                            unverified=bool(unverified))
+    fix_needed = bool(state.get("rca_fix_needed"))
+    telemetry.station_event(state["execution_id"], 0.1, "done", fix_needed=fix_needed,
+                            report_posted=True, unverified=bool(unverified))
     if unverified:
+        # Do NOT say "no code fix needed" when a fix WAS needed and was deliberately withheld —
+        # after_rca_review stops an unverified RCA short of autonomous coding, and the summary has to
+        # name that as a withheld fix rather than imply the RCA concluded no fix was required.
+        tail = ("the fix was NOT started: coding off an unverified root cause needs an engineer"
+                if fix_needed else "no code fix needed")
         return {"final_status": "rca_report",
-                "final_outcome": (f"rca_report_delivered_UNVERIFIED (no code fix needed) — the report "
-                                  f"gate did not run: {unverified}")}
+                "final_outcome": (f"rca_report_delivered_UNVERIFIED — the report gate did not run "
+                                  f"({unverified}); {tail}")}
     return {"final_status": "rca_report", "final_outcome": "rca_report_delivered (no code fix needed)"}

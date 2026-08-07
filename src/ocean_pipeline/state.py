@@ -116,6 +116,10 @@ class OceanState(TypedDict, total=False):
     # an older run's state (recorded before this field existed) is treated as unverified, never as a
     # silent full-fidelity pass.
     fidelity_rung: int
+    # Finding 2 (②-a): non-empty when a Rung-2 claim could NOT be corroborated against the
+    # mock's SUT-activity audit (older mock / no audit path). Declared here because LangGraph
+    # silently drops any key a node returns that the schema does not know about.
+    rung_corroboration: str
     ref_load_used: bool              # true iff the SIT used --ref-load real reference data
     sit_report: dict                 # tests[] / changed_repos[] / dependencies / evidence
     test_automation_pr_url: str      # opened by the skill on pass
