@@ -2031,12 +2031,30 @@ def test_run_evidence_does_not_live_somewhere_the_os_purges():
 
     The slot dirs are asserted too because each re-implemented the env lookup with its own /tmp
     default — moving only config would have split the cross-process LOCKS away from the evidence
-    they coordinate, and left the locks in the purged directory."""
+    they coordinate, and left the locks in the purged directory.
+
+    This test is about the DEFAULT, so it must evaluate it with the overrides cleared. tests/
+    conftest.py sets `OCEAN_PIPELINE_ARTIFACTS`/`_TIMINGS_LOG` session-wide to keep the suite from
+    writing into the operator's real `~/.ocean-pipeline` state (1026 of 1084 records there came from
+    one unit test). Popping-and-reloading here is the same pattern test_gate_marker.py already uses
+    for its own env contract; the earlier `assert "..." not in os.environ` guard asserted the ABSENCE
+    of isolation, so it and the isolation could never both hold."""
+    import importlib
     import os as _os
-    assert "OCEAN_PIPELINE_ARTIFACTS" not in _os.environ, "test env overrides the default under test"
-    assert not str(config.ARTIFACTS_ROOT).startswith("/tmp/"), (
-        f"ARTIFACTS_ROOT is under /tmp ({config.ARTIFACTS_ROOT}) — a daily cleaner empties it")
-    assert not str(config.TIMINGS_LOG).startswith("/tmp/"), config.TIMINGS_LOG
+
+    saved = dict(_os.environ)
+    try:
+        _os.environ.pop("OCEAN_PIPELINE_ARTIFACTS", None)
+        _os.environ.pop("OCEAN_PIPELINE_TIMINGS_LOG", None)
+        fresh = importlib.reload(config)
+        assert not str(fresh.ARTIFACTS_ROOT).startswith("/tmp/"), (
+            f"ARTIFACTS_ROOT is under /tmp ({fresh.ARTIFACTS_ROOT}) — a daily cleaner empties it")
+        assert not str(fresh.TIMINGS_LOG).startswith("/tmp/"), fresh.TIMINGS_LOG
+        assert str(fresh.ARTIFACTS_ROOT).endswith("/.ocean-pipeline/artifacts"), fresh.ARTIFACTS_ROOT
+    finally:
+        _os.environ.clear()
+        _os.environ.update(saved)
+        importlib.reload(config)
 
     # Match the CODE pattern, not the string — the explanatory comment in nodes.py names the old
     # default on purpose, and a test that banned any mention would forbid documenting the defect.
