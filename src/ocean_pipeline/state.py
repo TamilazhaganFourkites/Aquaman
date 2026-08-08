@@ -192,6 +192,11 @@ class OceanState(TypedDict, total=False):
                                       # -- always [] while Step 2e is disabled in ocean-qa-agent/SKILL.md (MM-14738)
 
     # --- QA review gate (human 3-way: approve+TestRail / approve / changes) ---
+    # qat-handoff Phase 1.2 / 2.1 — the 9b verdict, corroborated rather than believed.
+    qa_judge_rounds_observed: int     # sentinel-matched dispatches THIS pass, from the station log
+    qa_genuine_passed: bool           # verdict PASSED AND judge ran AND 0 CANNOT-VERIFY AND floor met
+    qa_genuine_passed_why: str        # why it is not genuine —  when it is
+    qa_method_census: dict            # AST counts from the FILE, never the agent-written JSON
     qa_test_path: str                # drafted SIT file, shown to the reviewer
     # Finding 2e: sha256[:16] of qa_test_path as sit_author left it. sit_triage re-hashes before its
     # own TCNOTADDED substitution; a mismatch proves sit_run rewrote the test mid-run and forces a

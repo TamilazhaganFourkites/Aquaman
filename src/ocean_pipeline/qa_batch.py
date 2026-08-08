@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -114,6 +115,16 @@ async def run_one(ticket_id: str) -> dict:
     "never resumed mid-run" above), silently defeating the entire unattended-sweep purpose."""
     config.QA_REVIEW_AUTO = True
     execution_id = telemetry.new_execution_id()
+    # qat-handoff Phase 2.2 prerequisite. `agents._station_logfile` returns None when
+    # OCEAN_PIPELINE_EXEC_ID is unset, and it was stamped in exactly ONE place -- cli.py. run_one
+    # minted its own execution_id and never exported it, so EVERY qa_batch run wrote no station log
+    # at all and would therefore corroborate `judge_rounds_observed = 0`.
+    #
+    # That matters more than it looks: qa_batch is precisely the unattended sweep one reaches for to
+    # accumulate runs at week-scale, which is exactly what Phase 2's measurement needs. Left unfixed,
+    # Phase 2 fails 5 of 5 for a PLUMBING reason and the wrong conclusion gets drawn -- "the judge
+    # never runs" when in fact the evidence was never written down.
+    os.environ["OCEAN_PIPELINE_EXEC_ID"] = execution_id
     # 0.05, not 6: a bare `6` is `6.0` as a dict key, which is `sit_resolve` — so every batch marker
     # used to file itself under a real station it has nothing to do with. See telemetry's entry for
     # why the replacement sorts BELOW the pipeline rather than above it (judge review).

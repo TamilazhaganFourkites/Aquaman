@@ -604,6 +604,43 @@ def _corroborated_judge_rounds(raw: int) -> int:
     return raw if 0 <= raw <= _MAX_9B_ROUNDS else 0
 
 
+def _genuine_passed(review: dict, judge_rounds: int, census: dict) -> tuple[bool, str]:
+    """qat-handoff Phase 2.1's pre-registered composite. Returns (ok, reason-if-not).
+
+    genuine PASSED = verdict == PASSED
+                   AND judge_rounds_observed >= 1   (current-pass, sentinel-matched, raw <= 2)
+                   AND zero CANNOT-VERIFY among assertion-bearing methods, CROSS-CHECKED FROM THE FILE
+                   AND the coverage floor is met
+
+    Every conjunct after the first exists because the first is agent-written. `cannot_verify_methods`
+    is read from the JSON, but an agent that simply OMITS entries makes that conjunct true -- a
+    self-report RAISING trust, which is exactly what Phase 1.2 forbids. So the file's own
+    `@pytest.mark.needs_env` count (which SKILL.md mandates precisely so the classification survives
+    past the skill's run) may only ever RAISE the JSON's count, never lower it. That is the standing
+    rule's fifth instance.
+
+    Fails closed on an unparsed census: "could not count" is not "counted zero".
+    """
+    if not isinstance(review, dict):
+        return False, "no review verdict on disk"
+    if str(review.get("qa_authoring_review_verdict") or "").strip().upper() != "PASSED":
+        return False, f"verdict is {review.get('qa_authoring_review_verdict') or 'absent'}"
+    if judge_rounds < 1:
+        return False, "no Step-9b judge dispatch corroborated from the station log this pass"
+    if not census.get("parsed"):
+        return False, "the authored test file could not be parsed, so its methods were not counted"
+    claimed_cv = len(review.get("cannot_verify_methods") or [])
+    observed_cv = census.get("needs_env_on_assertion_bearing", 0)
+    # max(), never the JSON alone: the file may raise, never lower.
+    if max(claimed_cv, observed_cv) > 0:
+        return False, (f"{max(claimed_cv, observed_cv)} assertion-bearing method(s) are CANNOT-VERIFY "
+                       f"(claimed {claimed_cv}, observed {observed_cv} via @pytest.mark.needs_env)")
+    if not quality.coverage_floor_met(census):
+        return False, (f"coverage floor: {census['skip_guarded']} of {census['total']} test method(s) "
+                       f"are skip-guarded (> 1/3)")
+    return True, ""
+
+
 def _log_offset(exec_id: str, label: str) -> int:
     """Byte length of a station log right now, or 0. Never raises.
 
@@ -1967,6 +2004,19 @@ async def sit_author(state: OceanState) -> dict:
     # depends entirely on the agent volunteering `test_edited`, and the automatic latch cannot fire on
     # a PASS (failure_class is "" on a pass by contract, so there is no `test_fault` to latch from).
     authored_sha = _file_sha(authored_path)
+    # Phase 2.1: the census, computed from the FILE -- never from the review JSON, whose counts AND
+    # whose `test_file` path are both agent-written (pointing it at a cleaner file would pass the
+    # floor on something that is not the authored test).
+    try:
+        census = quality.sit_method_census(Path(authored_path).read_text(errors="replace")) \
+            if authored_path else {"parsed": False, "total": 0, "skip_guarded": 0}
+    except OSError:
+        census = {"parsed": False, "total": 0, "skip_guarded": 0}
+    genuine, genuine_why = _genuine_passed(review, judge_rounds, census)
+    if not genuine and str(review.get("qa_authoring_review_verdict") or "").upper() == "PASSED":
+        ui.milestone(f"Step 9b says PASSED but it is NOT a genuine pass — {genuine_why}")
+    telemetry.station_event(exec_id, 6.1, "9b_genuine", genuine=genuine, why=genuine_why[:200],
+                            methods=census.get("total"), skip_guarded=census.get("skip_guarded"))
     if authored_sha:
         _snapshot_authored_test(exec_id, authored_path)   # content, so a later diff is real
     if not authored_sha:
@@ -1979,6 +2029,10 @@ async def sit_author(state: OceanState) -> dict:
         telemetry.station_event(exec_id, 6.1, "test_sha_unavailable", raw_path=(authored_path or "")[:120])
     return {"qa_test_path": authored_path,
             "qa_test_sha": authored_sha,
+            "qa_judge_rounds_observed": judge_rounds,
+            "qa_genuine_passed": genuine,
+            "qa_genuine_passed_why": genuine_why,
+            "qa_method_census": census,
             "qa_review_iteration": it + 1, "qa_note": ""}
 
 

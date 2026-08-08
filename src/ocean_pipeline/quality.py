@@ -40,6 +40,7 @@ DESIGN NOTES that are load-bearing rather than stylistic:
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
@@ -823,3 +824,103 @@ def secret_scan(dirs: list[Path], timeout: float) -> tuple[list[dict], str, int]
                 line=leak.get("StartLine") or None,
                 fix="remove the credential, rotate it, and move it into the FK config system"))
     return findings, "; ".join(reasons), scanned
+
+
+# ---- qat-handoff Phase 2.1: the SIT method census (pre-registered, deterministic) --------------
+# Computed from the FILE Aquaman recorded, NEVER from the review JSON. Both the counts AND the path
+# in that JSON are agent-written, so reading either would rest the one check that stops an
+# MM-14475-class file entirely on the authoring agent's word -- the asymmetry Phase 1.2 exists to
+# reject. Callers pass `state["qa_test_path"]` cross-checked against `state["qa_test_sha"]`.
+#
+# PRE-REGISTERED so it cannot be tuned to fit results:
+#   assertion-bearing := has a bare `ast.Assert` AND no @pytest.mark.skip AND no leading
+#                        unconditional pytest.skip(...)
+#   skip-guarded      := every other test method
+#   coverage floor    := skip_guarded <= 1/3 of all test methods
+#
+# Validated against the real corpus (414 files, 1,577 methods): the discriminating power is almost
+# entirely the ASSERT clause -- 226 methods (14%) have no bare assert, while leading-unconditional
+# pytest.skip is 0 and @pytest.mark.skip is 7 (0.4%). `ast.Assert` is the right primitive because
+# INV-16 mandates bare `assert` over `pytest.fail()`, and unittest-style self.assertX appears once in
+# 1,577 methods. Do not over-trust the skip detection.
+#
+# HONEST LIMIT, measured and accepted: "always-false constructibility guard" is undecidable
+# statically and stays agent judgment. The blind spot -- a method with a may-skip guard AND an
+# assert, which this calls assertion-bearing -- is 182/1,577 = 11.5%. Bounded, not zero. Do NOT
+# attempt the undecidable clause in code.
+SKIP_GUARD_FLOOR = 1.0 / 3.0
+
+
+def _is_unconditional_skip(stmt) -> bool:
+    """A LEADING bare `pytest.skip(...)` / `skip(...)` expression statement."""
+    if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+        return False
+    fn = stmt.value.func
+    name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+    return name == "skip"
+
+
+def sit_method_census(source: str) -> dict:
+    """Counts over `def test_*` in one authored SIT file. Never raises.
+
+    Returns {total, assertion_bearing, skip_guarded, needs_env_on_assertion_bearing, parsed}.
+    `parsed` False means the file did not parse -- the caller must treat that as FAIL-CLOSED, not as
+    a clean census, because "could not count" and "counted zero" are opposite facts.
+    """
+    out = {"total": 0, "assertion_bearing": 0, "skip_guarded": 0,
+           "needs_env_on_assertion_bearing": 0, "parsed": False}
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return out
+    out["parsed"] = True
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        out["total"] += 1
+        decs = {_dotted_name(d) for d in node.decorator_list}
+        marked_skip = any(d.endswith("mark.skip") for d in decs)
+        leading_skip = bool(node.body) and _is_unconditional_skip(node.body[0])
+        has_assert = any(isinstance(n, ast.Assert) for n in ast.walk(node))
+        if has_assert and not marked_skip and not leading_skip:
+            out["assertion_bearing"] += 1
+            # SKILL.md Step 9b mandates tagging every CANNOT-VERIFY method @pytest.mark.needs_env
+            # "in the authored file itself ... so the classification survives past this skill's own
+            # run". That tag is the DISK ANALOGUE of cannot_verify_methods, which is otherwise an
+            # agent self-report that an agent can make true by simply OMITTING entries.
+            if any(d.endswith("mark.needs_env") for d in decs):
+                out["needs_env_on_assertion_bearing"] += 1
+        else:
+            out["skip_guarded"] += 1
+    return out
+
+
+def _dotted_name(node) -> str:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Call):
+        return _dotted_name(node.func)
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def coverage_floor_met(census: dict) -> bool:
+    """skip_guarded <= 1/3 of all test methods.
+
+    1/3 is a PRE-REGISTERED judgment call, fixed in writing before the first run precisely so it
+    cannot be tuned to fit results -- it is NOT derived from data. Motivating case: MM-14475's file
+    had 14 of 17 scenarios skip-guarded (82%, per its own blocking_findings[0]); any floor below 82%
+    excludes it, and 1/3 is chosen as a defensible bar rather than because that number implies it.
+    Without a floor such a file could score PASSED on its 3 remaining methods and send a human to
+    QAT to verify 3/17 of the ticket.
+
+    An unparsed census fails closed.
+    """
+    if not census.get("parsed") or not census.get("total"):
+        return False
+    return census["skip_guarded"] <= census["total"] * SKIP_GUARD_FLOOR
