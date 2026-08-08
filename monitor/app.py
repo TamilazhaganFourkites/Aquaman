@@ -260,6 +260,12 @@ _RUN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TICKETS)
 # auto-queue at once. A plain dict[str, Process] silently corrupts under that overlap — the
 # second start overwrites the first's entry, and whichever process finishes first then pops the
 # OTHER's still-live entry out from under it, permanently breaking Kill for it. A list per ticket
+# Per-line cap on the child's stdout. asyncio's default is 64 KiB and a line over it raises
+# ValueError out of readline(); the observed maximum across 53 logs / 25,209 lines is 1,428
+# bytes (agents.py::_format_message truncates every content branch to ~200 chars), so this is
+# ~700x headroom rather than a guess. Belt and braces: the read loop also survives the raise.
+STREAM_LINE_LIMIT = 1024 * 1024
+
 # means every concurrently-live process for that ticket stays tracked and killable regardless.
 _RUNNING_PROCS: dict[str, list[asyncio.subprocess.Process]] = {}
 
@@ -343,6 +349,8 @@ async def _drive_process(run: TicketRun, args: list[str],
             AQUAMAN_BIN, *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             cwd=AQUAMAN_DIR, env=child_env,
+            limit=STREAM_LINE_LIMIT,   # see the constant — asyncio's 64 KiB default makes an
+                                       # over-long line raise ValueError out of readline()
             start_new_session=True,   # own process group — a Ctrl+C on uvicorn's terminal
                                        # sends SIGINT to the whole foreground group; without
                                        # this, that would ALSO interrupt the real, possibly
@@ -359,7 +367,18 @@ async def _drive_process(run: TicketRun, args: list[str],
         current_label: str | None = None
         assert proc.stdout is not None
         while True:
-            raw = await proc.stdout.readline()
+            try:
+                raw = await proc.stdout.readline()
+            except (ValueError, asyncio.LimitOverrunError):
+                # A line longer than the buffer. `limit=` above makes this very unlikely, but the
+                # CONSEQUENCE is what matters: this exception used to escape the read loop, and the
+                # `finally` below removes the process from _RUNNING_PROCS BEFORE awaiting
+                # `proc.wait()` — so the run's slot was never released, the UI Kill button 404'd
+                # (the proc was already untracked), and only restarting uvicorn recovered it. Losing
+                # one absurd log line is not worth that; skip it and keep reading.
+                print(f"[{run.ticket}] <<line exceeded {STREAM_LINE_LIMIT} bytes — skipped>>",
+                      flush=True)
+                continue
             if not raw:
                 break
             line = raw.decode("utf-8", errors="replace").rstrip("\n")
