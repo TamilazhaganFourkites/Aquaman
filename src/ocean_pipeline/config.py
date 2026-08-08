@@ -229,6 +229,22 @@ QUALITY_GATE_CMD_TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_CMD
 # could-not-run on most runs and add minutes to the rest.
 QUALITY_GATE_JAVA = os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_JAVA", "").lower() in ("1", "true", "yes")
 
+# ---- B1: multi-repo review coverage gate ------------------------------------------------------
+# `harsh_reviewer` runs with ONE cwd (nodes.py, cwd=Path(state["worktree_dir"])) while `open_pr` and
+# `flip_ready` act on EVERY slug in `_service_slugs(state)`. Nothing in between notices a repo that
+# gets a PR without ever being reviewed.
+#
+# Default ON with an env escape, per the agreed decision in
+# important-notes/MM-14816-multi-repo-review-gate-plan.md. READ THAT PLAN'S "Known costs" BEFORE
+# CHANGING THIS: with the gate on, a genuine multi-repo ticket halts with ZERO PRs, because one
+# review cwd cannot cover two repos and the coder cannot make it. That is a TRUE positive and the
+# intended behaviour, not a defect -- but it is unrecoverable until the deferred per-repo review loop
+# lands. Knob OFF still RECORDS the gap; it only declines to act on it.
+MULTI_REPO_REVIEW_GATE = os.environ.get(
+    "OCEAN_PIPELINE_MULTI_REPO_REVIEW_GATE", "1").lower() in ("1", "true", "yes")
+# Bounces before giving up. Same `attempts > MAX` comparison as MAX_QUALITY_GATE_ATTEMPTS.
+MAX_COVERAGE_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_COVERAGE_ATTEMPTS", "1"))
+
 # ---- D4: mechanical secret scan before the ready-flip -----------------------------------------
 # Default ON. Unlike NODE_EVAL above this is free (one `gitleaks stdin` per changed repo over the
 # diff, measured at ~23ms), it is deterministic rather than a judgment, and "a gate shipped

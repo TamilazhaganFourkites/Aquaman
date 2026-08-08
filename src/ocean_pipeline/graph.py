@@ -127,6 +127,21 @@ def after_quality_gate(state: OceanState) -> str:
 
 
 def after_review(state: OceanState) -> str:
+    # B1 FIRST — before the plain-approve return below, and dominating the budget-exhausted path
+    # further down. `harsh_reviewer` runs in ONE cwd while `open_pr`/`flip_ready` act on every slug
+    # in `_service_slugs`, so an APPROVE can otherwise ship a repo nothing adversarial ever read.
+    #
+    # Keyed on `review_coverage_stopped`, NEVER on the gap alone: the node writes `stopped` only when
+    # the knob is ON and the bounce budget is spent, so a knob-off run records the gap and routes
+    # exactly as it did before B1 (see test_gate_off_still_records_the_gap).
+    #
+    # This is the ONLY bound on the coverage loop: the check sits above the MAX_REVIEW_ITERATIONS
+    # test below, and "rework" maps straight to `coder` (graph.py's edge map deliberately skips
+    # prep_rework), so without the cap it would cycle harsh_reviewer -> coder to the recursion limit.
+    if state.get("review_coverage_stopped"):
+        return "stop"
+    if state.get("review_coverage_gap") and config.MULTI_REPO_REVIEW_GATE:
+        return "rework"
     if state.get("review_verdict") == "APPROVE":
         return "approve"
     if state.get("review_iteration", 0) >= config.MAX_REVIEW_ITERATIONS:

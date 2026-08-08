@@ -569,6 +569,158 @@ def _service_slugs(state: OceanState) -> list[str]:
     return slugs
 
 
+# ------------------------------------------------------------------ B1: multi-repo review coverage
+def _origin_slug(repo_dir: Path) -> str:
+    """`<org>/<name>` for a checkout's `origin`, or "" on any doubt. NEVER the raw URL.
+
+    SECURITY INVARIANT: a real origin can carry credentials in the URL. This returns only a
+    canonicalized slug, enforced at the source so it dominates every sink -- milestone, telemetry
+    `output_summary` (which folds all **extra), run-report.json/.md, and monitor/app.py -> monitor.db
+    and the web UI. Returning "" rather than guessing is deliberate: an empty slug is dropped by both
+    callers below, whereas a half-parsed URL would become a permanent gap no bounce could clear.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo_dir), "remote", "get-url", "origin"],
+                              capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    url = (proc.stdout or "").strip()
+    if not url:
+        return ""
+    # ssh (git@host:org/name.git), scp-ish (user@host:org/name), and https://host/org/name.git
+    tail = url.split(":", 1)[-1] if "@" in url and "://" not in url else url
+    tail = tail.rstrip("/")
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    parts = [x for x in tail.replace("\\", "/").split("/") if x]
+    if len(parts) < 2:
+        return ""
+    slug = f"{parts[-2]}/{parts[-1]}"
+    # Route through the same canonicalizer `_service_slugs` uses, so the two sides of the comparison
+    # cannot normalize differently.
+    return gitops.repo_slug(slug)
+
+
+def _branch_repos(state: OceanState) -> list[Path]:
+    """Every checkout on disk that carries THIS ticket's branch.
+
+    Scans `quality.repo_dirs(...)` plus the run dir's own siblings. The sibling step is load-bearing
+    and measured: on EXE-90865766 `repo_dirs` alone returned just `[workspace]` because the coder
+    cloned AS the workspace root, and the other clones were reachable only as siblings.
+
+    `workspace.parent` is pinned LITERALLY to this run's own directory -- `config.workspace_dir` is
+    `ARTIFACTS_ROOT/<exec_id>/workspace`, so the parent is `ARTIFACTS_ROOT/<exec_id>`, never
+    ARTIFACTS_ROOT itself. That is the only thing separating this from a cross-run scan, which would
+    pull other tickets' clones into this ticket's coverage set.
+
+    `show-ref --verify refs/heads/<branch>`, NOT `rev-parse --verify <branch>`: executed, `rev-parse`
+    also matches a TAG of the same name (rc=0) while `show-ref` excludes it (rc=1). Both correctly
+    exclude remote-tracking-only refs. Both DO match a stale local branch, which is accepted --
+    over-inclusion produces a loud stop, while the alternative (does HEAD carry the branch) would
+    miss a repo the coder pushed and then checked out elsewhere.
+    """
+    branch = (state.get("branch") or "").strip()
+    if not branch:
+        return []
+    workspace = config.workspace_dir(state["execution_id"])
+    candidates = list(quality.repo_dirs(state.get("worktree_dir", ""), workspace))
+    try:
+        # `.git` filter first: the run dir holds ~46 entries of which ~6 are repos, so this saves
+        # ~40 subprocesses. Same filter quality.repo_dirs._add applies.
+        candidates += [d for d in sorted(workspace.parent.iterdir())
+                       if d.is_dir() and (d / ".git").exists()]
+    except OSError:
+        pass
+    out: list[Path] = []
+    seen: set[str] = set()
+    for d in candidates:
+        key = str(d.resolve()) if d.exists() else str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            rc = subprocess.run(
+                ["git", "-C", str(d), "show-ref", "--verify", "--quiet",
+                 f"refs/heads/{branch}"], capture_output=True, timeout=15).returncode
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if rc == 0:
+            out.append(d)
+    return out
+
+
+def _review_coverage(state: OceanState,
+                     reviewed_dirs: list[Path]) -> tuple[list[str], list[str], list[str], str]:
+    """(branch_repos, covered, gap, unverified) — ONE disk read, four values.
+
+    `required` is the DISK-derived branch carriers UNIONED with `_service_slugs(state)` -- the exact
+    list `open_pr` acts on. Anything less breaks the invariant this gate exists for ("every repo that
+    gets a PR was reviewed"): executed, with the coder omitting `repo`, `open_pr` still opens PRs on
+    both slugs while a `service_repo`-only `required` is empty, so BOTH would ship unreviewed.
+
+    NO BRANCH => gap is EMPTY, unconditionally. On a failed first coder pass (branch="", repo="")
+    `_service_slugs` falls through to the over-scoped `target_repos`, so a non-empty gap here would
+    both mislabel the run (the real reason is review_budget_exhausted_no_diff) and shrink the coder's
+    retry budget from MAX_REVIEW_ITERATIONS to this gate's cap of 1. With no branch nothing can ship,
+    so the gate has nothing to protect -- the same reasoning as open_pr's own guard.
+
+    COULD-NOT-RUN FAILS OPEN, LOUDLY: if the reviewed dir yields no slug (no origin, git missing),
+    `unverified` is set and the gap is forced empty. Sibling precedent, stated at graph.py:330:
+    "clean, or could-not-run (fails OPEN, loudly)". Failing closed would turn a broken git into a
+    zero-PR halt on every run -- an infra fault wearing the costume of an unreviewed repo.
+    """
+    branch_slugs: list[str] = []
+    for d in _branch_repos(state):
+        slug = _origin_slug(d)
+        if slug and slug not in branch_slugs:
+            branch_slugs.append(slug)
+
+    covered: list[str] = []
+    for d in reviewed_dirs:
+        slug = _origin_slug(d)
+        if slug and slug not in covered:
+            covered.append(slug)
+
+    if not (state.get("branch") or "").strip():
+        return branch_slugs, covered, [], "no branch recorded — coverage not derived"
+    if not covered:
+        return (branch_slugs, covered, [],
+                "the reviewed checkout reported no origin slug — coverage not derived")
+
+    # Case-insensitive: gitops.repo_slug does not lowercase, so an origin/report case mismatch would
+    # otherwise be a permanent gap no bounce could clear.
+    required = {s.lower(): s for s in branch_slugs}
+    for s in _service_slugs(state):
+        if s:
+            required.setdefault(s.lower(), s)
+    covered_lc = {s.lower() for s in covered}
+    gap = [orig for lc, orig in sorted(required.items()) if lc not in covered_lc]
+    return branch_slugs, covered, gap, ""
+
+
+def _coverage_budget(state: OceanState, gap: list) -> tuple[int, bool]:
+    """(attempts, stopped) for a coverage pass. Pure, so the budget is testable without a graph.
+
+    Extracted rather than inlined in `harsh_reviewer` because a mutation sweep showed the inline
+    version was unreachable from any test: every routing test set `review_coverage_stopped` by hand,
+    so reverting the cap (`stopped = False`) and dropping the knob check BOTH left the suite green.
+    A budget nothing exercises is the inertness class this gate exists to prevent, reproduced inside
+    the gate. Same shape as `_real_service_gap` / `_eval_gate` above.
+
+    `>` not `>=`: MAX counts BOUNCES and `attempts` has already been incremented for this pass, so
+    `>=` would make the first gap a stop and the rework edge unreachable -- the defect
+    MAX_QUALITY_GATE_ATTEMPTS' own comment records.
+
+    The knob is read HERE as well as in the router so that knob-off records the gap without either
+    stopping or bouncing.
+    """
+    attempts = state.get("review_coverage_attempts", 0) + (1 if gap else 0)
+    stopped = bool(gap) and attempts > config.MAX_COVERAGE_ATTEMPTS and config.MULTI_REPO_REVIEW_GATE
+    return attempts, stopped
+
+
 # ------------------------------------------------------------------ Station 0
 async def researcher(state: OceanState) -> dict:
     telemetry.station_event(state["execution_id"], 0, "start")
@@ -1152,6 +1304,18 @@ async def coder(state: OceanState) -> dict:
             f"redesign or re-implement anything. Fix EXACTLY these files, re-run the same command "
             f"yourself to confirm it now passes, commit, push, and STOP. Entries marked MINOR are "
             f"advisory and do not block:\n{json.dumps(quality_findings, indent=2)}\n")
+    # B1. A coverage bounce without this is a blind re-run. Names the mismatch concretely, because
+    # the usual cause is the coder reporting one repo while its branch lives in another.
+    if state.get("review_coverage_gap"):
+        rework += (
+            f"\nMULTI-REPO REVIEW COVERAGE GAP. Your branch exists in "
+            f"{state.get('review_branch_repos')}, but the adversarial review only ran in "
+            f"{state.get('review_repos_covered')}, so {state.get('review_coverage_gap')} would "
+            f"receive a pull request that nothing ever reviewed. Either your reported `repo_dir` is "
+            f"not the repo your branch is on, or you changed more repos than you reported. Report "
+            f"EVERY repo you pushed to in `repo`, comma-separated, and set `repo_dir` to the tree "
+            f"you actually changed.\n")
+
     # D6. Same load-bearing role as the quality-gate block above: an ENFORCED accuracy failure
     # bounces the run back here, and without the judge's own issues[] the coder re-runs blind and
     # burns the attempt budget reproducing the same diff. Injected only when `eval_gap` is set, which
@@ -1406,8 +1570,27 @@ async def harsh_reviewer(state: OceanState) -> dict:
         if own_build_slot:
             _release_build_slot(state["execution_id"])
     telemetry.station_event(state["execution_id"], 5, "end", verdict=v.verdict)
+    # B1: multi-repo review coverage. `harsh_reviewer` has ONE cwd, so `covered` is ALWAYS a
+    # singleton -- do NOT pass repo_dirs() here or the gate over-claims coverage and never fires.
+    wt = state.get("worktree_dir") or ""
+    reviewed_dirs = [Path(wt)] if wt else [config.FK_AIDEVELOPER_DIR]
+    branch_repos, covered, gap, unverified = _review_coverage(state, reviewed_dirs)
+    attempts, stopped = _coverage_budget(state, gap)
+    if unverified:
+        ui.milestone(f"REVIEW COVERAGE NOT DERIVED — {unverified}. Proceeding (fails OPEN).")
+        telemetry.station_event(state["execution_id"], 5, "skip", reason=unverified[:300])
+    elif gap:
+        ui.milestone(f"REVIEW COVERAGE GAP — reviewed {covered}, but {gap} carry this branch "
+                     f"and would receive a PR unreviewed.")
+        telemetry.station_event(state["execution_id"], 5, "coverage_gap", gap=",".join(gap),
+                                covered=",".join(covered), attempt=attempts)
+    # ALL six keys on EVERY pass (quality_gate's discipline): a "write only what changed" shape
+    # re-injects a stale gap into every later router decision and coder prompt.
     return {"review_verdict": v.verdict, "review_findings": v.findings,
-            "review_iteration": iteration + 1}
+            "review_iteration": iteration + 1,
+            "review_branch_repos": branch_repos, "review_repos_covered": covered,
+            "review_coverage_gap": gap, "review_coverage_unverified": unverified,
+            "review_coverage_attempts": attempts, "review_coverage_stopped": stopped}
 
 
 # ------------------------------------------------------------------ 3.87 open PR (plain code, idempotent)
@@ -2470,7 +2653,11 @@ async def prep_rework(state: OceanState) -> dict:
             "env_retry_attempts": 0, "quality_gate_attempts": 0,
             "quality_gate_findings": [], "quality_gate_stopped": False,
             "qa_review_iteration": 0,
-            "eval_attempts": 0, "eval_gap": "", "eval_stopped": False}
+            "eval_attempts": 0, "eval_gap": "", "eval_stopped": False,
+            # B1: three of six. `review_coverage_unverified` deliberately does NOT reset, matching
+            # quality_gate_unverified — an infra fault that survives a rework stays visible at the end.
+            "review_coverage_attempts": 0, "review_coverage_gap": [],
+            "review_coverage_stopped": False}
 
 
 # ------------------------------------------------------------------ environment_failure retry prep
@@ -2861,6 +3048,10 @@ async def stop_run(state: OceanState) -> dict:
         # quality_gate arm above documents. Sits directly below it because the deterministic
         # gate outranks the LLM judge when both fired (see graph.after_quality_gate).
         reason, station = "eval_accuracy_failed", 4.6
+    elif state.get("review_coverage_stopped"):
+        # B1. Keyed on `review_coverage_stopped`, never on `review_coverage_gap` — a gap from a
+        # BOUNCED pass persists in state and would mislabel a later, unrelated stop.
+        reason, station = "review_coverage_gap", 5
     elif state.get("needs_onboarding"):
         reason, station = "repo_onboarding_exhausted", 6   # still unsupported after MAX_ONBOARD_ATTEMPTS
     elif trivial_green:
@@ -2903,6 +3094,10 @@ async def stop_run(state: OceanState) -> dict:
     elif state.get("quality_gate_stopped"):
         pr_note = (f"no PR opened -- the deterministic quality gate still rejects the changed files "
                    f"on branch {state.get('branch')!r}; needs an engineer")
+    elif state.get("review_coverage_stopped"):
+        pr_note = (f"no PR opened -- {state.get('review_coverage_gap')} carry branch "
+                   f"{state.get('branch')!r} but were never adversarially reviewed; reviewing only "
+                   f"{state.get('review_repos_covered')} would have shipped the rest unreviewed")
     elif state.get("eval_stopped"):
         pr_note = (f"no PR opened -- the independent accuracy evaluator FAILED the diff on branch "
                    f"{state.get('branch')!r}; needs an engineer")
@@ -2914,6 +3109,7 @@ async def stop_run(state: OceanState) -> dict:
     # Don't prefix review-stage stops with "sit_failed:" -- they never reached SIT. Don't prefix a
     # trivial-green stop with it either -- the SIT genuinely passed, it just didn't prove anything.
     outcome_prefix = ("quality_gate_stopped" if state.get("quality_gate_stopped")
+                       else "review_coverage_stopped" if state.get("review_coverage_stopped")
                        else "eval_accuracy_stopped" if state.get("eval_stopped")
                        else "review_stopped" if (review_stop_blocking or review_stop_no_diff)
                        else "sit_unverified" if trivial_green

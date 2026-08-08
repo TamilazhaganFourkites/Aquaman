@@ -101,6 +101,16 @@ class OceanState(TypedDict, total=False):
                                      # keying on `attempts >= MAX` (which stays true for the rest of
                                      # the run and would mislabel any LATER, unrelated stop)
 
+    # --- B1: multi-repo review coverage (harsh_reviewer has ONE cwd; open_pr acts on N) ---
+    review_branch_repos: list        # DISK-derived slugs alone — the honest instrument. `covered ∪ gap`
+                                     # is contaminated by service_repo, so it cannot answer "what did
+                                     # the disk actually show?" on its own.
+    review_repos_covered: list       # slugs a review actually ran in (always a singleton today)
+    review_coverage_gap: list        # required - covered; non-empty == a repo would ship unreviewed
+    review_coverage_unverified: str  # non-empty when coverage COULD NOT be derived (fails OPEN, loudly)
+    review_coverage_attempts: int    # capped by MAX_COVERAGE_ATTEMPTS; reset ONLY by prep_rework
+    review_coverage_stopped: bool    # set only on the stop branch — see quality_gate_stopped
+
     # --- D4: mechanical secret scan at the ready-flip ---
     secret_findings: list        # [{severity,file,summary,line?,fix_direction?}] — CRITICAL, blocks the flip
     secret_scan_unverified: str  # non-empty when a repo could NOT be scanned (fails OPEN, loudly)

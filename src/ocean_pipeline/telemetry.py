@@ -72,6 +72,8 @@ _STATUS = {
     # path it takes -- and on the third path (NODE_EVAL off, or the node not in EVAL_NODES) it
     # emits nothing at all and the station correctly never appears. So there is no path where 4.6
     # opens a lifecycle it does not close, which is what would make these annotations instead.
+    # B1: an annotation. Station 5 (harsh_review) emits its own start/end around this.
+    "coverage_gap": "note",
     "eval": "completed",
     # "failed" describes the EVALUATOR, not the run: the judge did not produce a judgment. The
     # pipeline continues regardless (the evaluation is advisory), but recording this as "skipped"

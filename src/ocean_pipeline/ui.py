@@ -162,6 +162,16 @@ def _details(node: str, upd: dict) -> list[str]:
         if upd.get("quality_gate_unverified"):
             d.append(f"  NOT fully checked: {str(upd['quality_gate_unverified'])[:120]}")
     elif node == "harsh_reviewer":
+        # B1 first: a coverage gap outranks the finding counts, because it means a repo was never
+        # read AT ALL — "0 findings" on an unreviewed repo is not good news.
+        if upd.get("review_coverage_gap"):
+            d.append(f"COVERAGE GAP: reviewed {upd.get('review_repos_covered')}, "
+                     f"but {upd['review_coverage_gap']} also carry this branch")
+        elif upd.get("review_branch_repos"):
+            d.append(f"{len(upd['review_branch_repos'])} repo(s) carry this branch; "
+                     f"reviewed {upd.get('review_repos_covered')}")
+        if upd.get("review_coverage_unverified"):
+            d.append(f"  coverage NOT derived: {str(upd['review_coverage_unverified'])[:120]}")
         findings = upd.get("review_findings") or []
         if findings:
             counts: dict[str, int] = {}
@@ -250,6 +260,10 @@ def _highlight(node: str, upd: dict) -> str:
             return (f"branch pushed; accuracy {ev.get('verdict') or 'UNREADABLE'}"
                     f"{'' if acc is None else f' ({acc}/100)'}")
         return "branch pushed"
+    if node == "harsh_reviewer" and upd.get("review_coverage_stopped"):
+        return "review coverage gap — stopping"
+    if node == "harsh_reviewer" and upd.get("review_coverage_gap"):
+        return f"{len(upd['review_coverage_gap'])} repo(s) unreviewed — back to Coding"
     if node == "harsh_reviewer":
         return str(upd.get("review_verdict") or "")
     if node == "open_pr" and upd.get("pr_number"):

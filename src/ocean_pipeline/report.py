@@ -61,6 +61,15 @@ def finish(final: dict, out_dir: Path) -> Path | None:
         # run-report)" — this is the surfacing half, so an advisory evaluation is not write-only.
         # `finish` selects explicit keys rather than dumping state, so an undeclared key here is
         # invisible no matter how correctly the node computed it.
+        # B1: the disk-derived instrument and both sides of the comparison. `review_branch_repos`
+        # is recorded as its own key rather than reconstructed from covered+gap, which is
+        # contaminated by service_repo and cannot answer "what did the disk actually show?".
+        "service_repo": final.get("service_repo", ""),
+        "pr_numbers": final.get("pr_numbers") or {},
+        "review_branch_repos": final.get("review_branch_repos") or [],
+        "review_repos_covered": final.get("review_repos_covered") or [],
+        "review_coverage_gap": final.get("review_coverage_gap") or [],
+        "review_coverage_unverified": final.get("review_coverage_unverified", ""),
         "node_evaluations": final.get("node_evaluations") or [],
         # Kept separate from the list above so "the judge could not be run / returned nothing
         # readable" can never be read as "no evaluation found anything wrong".
