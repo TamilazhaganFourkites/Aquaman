@@ -57,6 +57,14 @@ def finish(final: dict, out_dir: Path) -> Path | None:
         "pr_number": final.get("pr_number"),
         "test_automation_pr_url": final.get("test_automation_pr_url"),
         "ready_flipped": final.get("ready_flipped", False),
+        # D5: node-evaluator.md's policy is "ADVISORY by default (logged + surfaced in the
+        # run-report)" — this is the surfacing half, so an advisory evaluation is not write-only.
+        # `finish` selects explicit keys rather than dumping state, so an undeclared key here is
+        # invisible no matter how correctly the node computed it.
+        "node_evaluations": final.get("node_evaluations") or [],
+        # Kept separate from the list above so "the judge could not be run / returned nothing
+        # readable" can never be read as "no evaluation found anything wrong".
+        "eval_unverified": final.get("eval_unverified", ""),
         "usage": {
             "input_tokens": t["input"], "output_tokens": t["output"],
             "tool_calls": t["tools"], "station_runs": t["stations"],

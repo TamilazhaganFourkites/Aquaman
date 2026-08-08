@@ -1152,6 +1152,21 @@ async def coder(state: OceanState) -> dict:
             f"redesign or re-implement anything. Fix EXACTLY these files, re-run the same command "
             f"yourself to confirm it now passes, commit, push, and STOP. Entries marked MINOR are "
             f"advisory and do not block:\n{json.dumps(quality_findings, indent=2)}\n")
+    # D6. Same load-bearing role as the quality-gate block above: an ENFORCED accuracy failure
+    # bounces the run back here, and without the judge's own issues[] the coder re-runs blind and
+    # burns the attempt budget reproducing the same diff. Injected only when `eval_gap` is set, which
+    # `_eval_gate` populates only under EVAL_ENFORCE — so with the knob off this is never added.
+    if state.get("eval_gap"):
+        failed = [e for e in (state.get("node_evaluations") or [])
+                  if isinstance(e, dict) and schemas.eval_verdict(e.get("verdict")) == "FAIL"]
+        rework += (
+            f"\nINDEPENDENT ACCURACY EVALUATION — FAILED. A separate judge (a different model, which "
+            f"did not write this code) scored your output against the ticket's acceptance criteria "
+            f"and the binding reachability report, and found it materially wrong or incomplete. "
+            f"{state['eval_gap']}. Address each issue below concretely — do NOT argue with the "
+            f"judgment and do NOT redesign beyond what the issues name. If you believe an issue is "
+            f"mistaken, say so explicitly in your verdict notes rather than silently ignoring "
+            f"it:\n{json.dumps(failed, indent=2)}\n")
 
     # The graph owns the clone location: the coder clones into a per-run workspace and works
     # there, so the reviewer and any rework pass run against the SAME tree (reuse on re-entry).
@@ -1226,12 +1241,26 @@ async def coder(state: OceanState) -> dict:
     # Persist WHICH repo the coder pushed to + WHERE the clone lives + the PR title/body it
     # proposed, so the reviewer/rework run in the same tree and open_pr opens deterministically
     # (preserve prior values if a rework pass leaves them blank).
-    return {"branch": v.branch,
-            "files_changed": v.files_changed, "sit_findings": [],
-            "service_repo": v.repo or state.get("service_repo", ""),
-            "worktree_dir": v.repo_dir or state.get("worktree_dir", ""),
-            "pr_title": v.pr_title or state.get("pr_title", ""),
-            "pr_body": v.pr_body or state.get("pr_body", "")}
+    out = {"branch": v.branch,
+           "files_changed": v.files_changed, "sit_findings": [],
+           "service_repo": v.repo or state.get("service_repo", ""),
+           "worktree_dir": v.repo_dir or state.get("worktree_dir", ""),
+           "pr_title": v.pr_title or state.get("pr_title", ""),
+           "pr_body": v.pr_body or state.get("pr_body", "")}
+    # D5: independent accuracy evaluation. node-evaluator.md calls the coder rubric "the
+    # highest-value check", and this is the only node wired to it today. No-ops entirely unless
+    # NODE_EVAL is on, and routes nothing unless EVAL_ENFORCE is also on. Runs on `{**state, **out}`
+    # so the judge sees the tree THIS pass just wrote (`worktree_dir` is set in `out`, and on a
+    # first pass the pre-call state has none) -- otherwise the judge would be pointed at the control
+    # plane's own checkout and could not read the diff it is scoring.
+    out.update(await _eval_node(
+        {**state, **out}, "coder",
+        job=(f"Implement {state['ticket_id']} per FK North Star: honor the binding reachability "
+             f"report, reuse the intended mechanism, commit and push the branch. No PR."),
+        output=(f"branch={v.branch} repo={v.repo} repo_dir={v.repo_dir} "
+                f"files_changed={v.files_changed}\npr_title={v.pr_title}\npr_body={v.pr_body}"),
+    ))
+    return out
 
 
 # ------------------------------------------------------------------ Station 4.5 (plain code, no agent)
@@ -2431,10 +2460,17 @@ async def prep_rework(state: OceanState) -> dict:
     # faults exhausted MAX_QA_REVIEW_ITERATIONS, and after that a human clicking "request changes"
     # was IGNORED: `after_qa_review` (graph.py:189) falls through to `return "sit_run"` and executes
     # the draft the human just rejected. Silently — no telemetry marks the fall-through.
+    # `eval_attempts` resets here for exactly the reason `quality_gate_attempts` does, one line up: a
+    # Station-6 code fault is a FRESH coding attempt and deserves its own accuracy budget. Do NOT
+    # also reset it on after_quality_gate's rework edge — that edge goes DIRECTLY to `coder`, so
+    # resetting there makes the coder <-> eval cycle unbounded. `eval_unverified` deliberately does
+    # NOT reset (matching quality_gate_unverified): an infra fault that survives a rework should
+    # still be visible at the end of the run.
     return {"coding_attempts": attempt, "review_iteration": 0, "review_findings": [],
             "env_retry_attempts": 0, "quality_gate_attempts": 0,
             "quality_gate_findings": [], "quality_gate_stopped": False,
-            "qa_review_iteration": 0}
+            "qa_review_iteration": 0,
+            "eval_attempts": 0, "eval_gap": "", "eval_stopped": False}
 
 
 # ------------------------------------------------------------------ environment_failure retry prep
@@ -2452,6 +2488,98 @@ async def prep_env_retry(state: OceanState) -> dict:
 
 
 # ------------------------------------------------------------------ human approval gate (optional)
+# ------------------------------------------------------------------ D5/D6: node accuracy evaluation
+async def _eval_node(state: OceanState, node: str, job: str, output: str) -> dict:
+    """Score one node's output with the independent evaluator, and return the state keys.
+
+    ADVISORY BY CONSTRUCTION. This never raises and never routes: it returns state, and only
+    `_eval_gate` (below) turns a FAIL into anything, and only when EVAL_ENFORCE is on. An accuracy
+    judge that can break a run it was added to observe is worse than no judge -- and this one spends
+    a full SDK session, which is exactly the kind of thing that fails for transport reasons.
+
+    Skips silently when NODE_EVAL is off or `node` is not in EVAL_NODES, returning {} so callers can
+    `state.update(...)` unconditionally without a second flag check at every call site.
+
+    Runs SYNCHRONOUSLY inside the calling station, before that station prints its own outcome line.
+    monitor/app.py:411-425 depends on that ordering: it skips the `eval_<node>` header outright and
+    deliberately does not touch `current_label`, so the enclosing station's header stays
+    authoritative for any [PAUSED] line that follows.
+    """
+    if not config.NODE_EVAL or node not in config.EVAL_NODES:
+        return {}
+    exec_id = state["execution_id"]
+    try:
+        ev = await agents.evaluate_node(
+            node=node,
+            ticket_id=state["ticket_id"],
+            execution_id=exec_id,
+            node_job=job,
+            node_output=output,
+            cwd=Path(state["worktree_dir"]) if state.get("worktree_dir") else None,
+        )
+    except Exception as e:  # noqa: BLE001 -- advisory: a judge failure must never fail the station
+        telemetry.station_event(exec_id, 4.6, "eval_could_not_run", eval_node=node,
+                                error=f"{type(e).__name__}: {e}")
+        ui.milestone(f"[eval] {node}: could not run ({type(e).__name__}) -- advisory, continuing")
+        return {"eval_unverified": f"{node}: evaluator could not run ({type(e).__name__})"}
+
+    record = {"node": node, "accuracy": ev.accuracy, "verdict": ev.verdict,
+              "dimensions": ev.dimensions.model_dump(), "issues": ev.issues,
+              "rationale": ev.rationale}
+    # A judge that ran but returned an unreadable verdict is NOT a pass. Recorded separately so
+    # `_eval_gate` can tell "could not measure" from "measured and failed" -- these must never share
+    # a value, which is why `accuracy` and the three dimensions default to None rather than 0.
+    unverified = "" if ev.verdict else f"{node}: evaluator returned no readable verdict"
+    score = "not reported" if ev.accuracy is None else str(ev.accuracy)
+    ui.milestone(f"[eval] {node}: accuracy={score} verdict={ev.verdict or 'UNREADABLE'}")
+    telemetry.station_event(exec_id, 4.6, "eval", eval_node=node,
+                            accuracy=ev.accuracy, verdict=ev.verdict, issues=len(ev.issues or []))
+
+    evaluations = (state.get("node_evaluations") or []) + [record]
+    # The budget is computed HERE, not in the router: LangGraph routers return a string and cannot
+    # write state, so a router-side counter would never persist. `_eval_gate` reads the accumulated
+    # list, so it must be given the list that includes THIS pass.
+    gap = _eval_gate({**state, "node_evaluations": evaluations})
+    attempts = state.get("eval_attempts", 0) + (1 if gap else 0)
+    stopped = bool(gap) and attempts > config.MAX_EVAL_ATTEMPTS
+    # ALL five keys on EVERY pass. `quality_gate` (nodes.py:1315-1317) learned this the hard way: a
+    # "write only what changed" shape leaves a stale gap from an earlier pass in state, which then
+    # re-injects itself into every later router decision and coder prompt.
+    return {"node_evaluations": evaluations, "eval_unverified": unverified,
+            "eval_gap": gap, "eval_attempts": attempts, "eval_stopped": stopped}
+
+
+def _eval_gate(state: OceanState) -> str:
+    """Returns "" when nothing should be gated on accuracy, else a short human-readable reason.
+
+    Same shape as `_real_service_gap` above: a pure function of state, so the routing decision is
+    testable without running a graph.
+
+    Gates ONLY on an explicit FAIL, and ONLY when EVAL_ENFORCE is on -- node-evaluator.md's own
+    policy line. Three cases deliberately do NOT gate:
+
+      * EVAL_ENFORCE off -- the evaluation is still recorded and surfaced, it just routes nothing.
+        This is what makes NODE_EVAL safe to switch on: it cannot, by itself, change where a run goes.
+      * WARN -- the spec defines it as "minor gaps, usable". Gating on WARN would collapse the
+        three-value enum into a two-value one and make the middle rung unreachable.
+      * an UNREADABLE verdict ("") -- fails OPEN, matching the sibling precedent at graph.py:330
+        ("clean, or could-not-run (fails OPEN, loudly)"). A transport failure or a malformed judge
+        reply is an infra fault, and failing closed on it would convert every judge outage into a
+        halted pipeline. `eval_unverified` carries it so it reads as unmeasured, never as clean.
+    """
+    if not config.EVAL_ENFORCE:
+        return ""
+    for ev in state.get("node_evaluations") or []:
+        if not isinstance(ev, dict):
+            continue
+        if schemas.eval_verdict(ev.get("verdict")) == "FAIL":
+            score = ev.get("accuracy")
+            got = "not reported" if score is None else score
+            return (f"the independent accuracy evaluator FAILED the `{ev.get('node')}` node "
+                    f"(accuracy={got}) — see its issues[] for the specific defects")
+    return ""
+
+
 def _real_service_gap(state: OceanState) -> str:
     """Finding 2d: "require a real-service run before a PR goes to review". Returns "" when this run
     genuinely verified the change against real services, else a short human-readable reason why it
@@ -2687,6 +2815,12 @@ async def stop_run(state: OceanState) -> dict:
         # were added to fix, inverted. It sits here, after the early-RETURN branches above
         # (blocked_open_questions / rejected_by_engineer) so it can never preempt those.
         reason, station = "quality_gate_exhausted", 4.5
+    elif state.get("eval_stopped"):
+        # D6. Keyed on `eval_stopped`, never on `eval_gap`: a gap from a BOUNCED pass stays in
+        # state, so keying on it would mislabel a later, unrelated stop -- the exact class the
+        # quality_gate arm above documents. Sits directly below it because the deterministic
+        # gate outranks the LLM judge when both fired (see graph.after_quality_gate).
+        reason, station = "eval_accuracy_failed", 4.6
     elif state.get("needs_onboarding"):
         reason, station = "repo_onboarding_exhausted", 6   # still unsupported after MAX_ONBOARD_ATTEMPTS
     elif trivial_green:
@@ -2729,6 +2863,9 @@ async def stop_run(state: OceanState) -> dict:
     elif state.get("quality_gate_stopped"):
         pr_note = (f"no PR opened -- the deterministic quality gate still rejects the changed files "
                    f"on branch {state.get('branch')!r}; needs an engineer")
+    elif state.get("eval_stopped"):
+        pr_note = (f"no PR opened -- the independent accuracy evaluator FAILED the diff on branch "
+                   f"{state.get('branch')!r}; needs an engineer")
     elif review_stop_blocking:
         pr_note = (f"a REJECTED diff exists on branch {state.get('branch')!r} -- unresolved "
                    f"CRITICAL/MAJOR at review-budget exhaustion; no PR opened, needs a human")
@@ -2737,6 +2874,7 @@ async def stop_run(state: OceanState) -> dict:
     # Don't prefix review-stage stops with "sit_failed:" -- they never reached SIT. Don't prefix a
     # trivial-green stop with it either -- the SIT genuinely passed, it just didn't prove anything.
     outcome_prefix = ("quality_gate_stopped" if state.get("quality_gate_stopped")
+                       else "eval_accuracy_stopped" if state.get("eval_stopped")
                        else "review_stopped" if (review_stop_blocking or review_stop_no_diff)
                        else "sit_unverified" if trivial_green
                        else "sit_failed")

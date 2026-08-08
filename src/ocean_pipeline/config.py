@@ -229,6 +229,32 @@ QUALITY_GATE_CMD_TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_CMD
 # could-not-run on most runs and add minutes to the rest.
 QUALITY_GATE_JAVA = os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_JAVA", "").lower() in ("1", "true", "yes")
 
+# ---- D5/D6: independent per-node accuracy evaluation ------------------------------------------
+# An LLM judge scores one node's output against the rubrics in the ocean-coding-agent worker
+# `node-evaluator.md`. The worker was specced end to end and monitor/app.py already handles its
+# output; only the driver was missing.
+#
+# Default OFF, unlike QUALITY_GATE next door, and the difference is deliberate rather than timid.
+# QUALITY_GATE is free (plain Python over changed files); this spends a FULL extra SDK session per
+# evaluated node, on every run, forever. Turning that on by default as part of first implementing it
+# would change the cost of every run in the same commit that makes it possible to measure that cost,
+# leaving no baseline to compare against. Turn it on, measure the spend telemetry it already emits
+# (station "eval_<node>"), then choose the default from data.
+NODE_EVAL = os.environ.get("OCEAN_PIPELINE_NODE_EVAL", "").lower() in ("1", "true", "yes")
+# Which nodes get evaluated. Only nodes with a `_eval_node(...)` call site can actually be scored --
+# naming one here that has no call site is silently inert, which is why `test_eval_nodes_all_have_a_
+# call_site` asserts this list against the source rather than trusting it.
+EVAL_NODES = tuple(n.strip() for n in os.environ.get("OCEAN_PIPELINE_EVAL_NODES", "coder").split(",")
+                   if n.strip())
+# node-evaluator.md's own policy line: "ADVISORY by default; a coder FAIL can gate a rework only
+# when OCEAN_PIPELINE_EVAL_ENFORCE is on." OFF means every evaluation is recorded and surfaced but
+# routes nothing -- so turning NODE_EVAL on can never, by itself, change where a run goes.
+EVAL_ENFORCE = os.environ.get("OCEAN_PIPELINE_EVAL_ENFORCE", "").lower() in ("1", "true", "yes")
+# Bounces back to the coder on an enforced FAIL before giving up. Same reasoning and the same
+# `attempts > MAX` comparison as MAX_QUALITY_GATE_ATTEMPTS above -- read that comment before
+# changing either side.
+MAX_EVAL_ATTEMPTS = int(os.environ.get("OCEAN_PIPELINE_MAX_EVAL_ATTEMPTS", "1"))
+
 # Optional human-approval gate before the ready-flip. Default OFF (auto-flip on green, the
 # intended terminal action). When ON, the graph interrupt()s and waits for an engineer to
 # resume with an approve/reject decision — the pipeline still never merges or deploys.

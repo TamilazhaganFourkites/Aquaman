@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
-from . import config, lessons, metrics, telemetry, ui
+from . import config, lessons, metrics, schemas, telemetry, ui
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -1152,3 +1152,51 @@ async def run_skill(
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}",
                             quota_exhausted=_is_quota_error(e)) from e
+
+
+async def evaluate_node(
+    *,
+    node: str,
+    ticket_id: str,
+    execution_id: str,
+    node_job: str,
+    node_output: str,
+    cwd: Path | None = None,
+) -> schemas.NodeEvaluation:
+    """D5: run the independent accuracy evaluator over ONE node's output.
+
+    This is the driver monitor/app.py:411 already describes by name and nodes.py::_eval_node calls.
+    The worker prompt, its three scored dimensions, its PASS/WARN/FAIL enum and its per-node rubrics
+    for 8 named nodes all already existed (`node-evaluator.md`); the middle was never written.
+
+    Label: `eval_<node>`, passed straight through as both the run_agent `node` and therefore the
+    ui.station_start() label -- which is exactly what monitor/app.py:424 skips. Do NOT add a
+    LABEL_TO_NODE entry for it: this is an advisory internal check, not a pipeline stage, and the
+    monitor's own comment explains that an event created for it could never resolve out of "running".
+
+    Model: JUDGE_MODEL, not STATION_MODEL. config.py:166-169 already states the reason for
+    harsh_reviewer -- a generator grading its own work has self-preference bias -- and an accuracy
+    judge is the same situation in a purer form.
+
+    cwd: the node's own working tree when there is one, so the judge can do what its prompt DEMANDS
+    ("read the real artifacts and grep the repo before you score"). A judge pointed at the control
+    plane's own checkout could not read the diff it is scoring, and would grade on the prose it was
+    handed -- which the worker explicitly calls not judging.
+    """
+    return await run_agent(
+        agent_md="node-evaluator.md",   # ocean-coding-agent worker (fk-aideveloper single source)
+        node=f"eval_{node}",
+        ticket_id=ticket_id,
+        execution_id=execution_id,
+        cwd=cwd,
+        model=config.JUDGE_MODEL,
+        task_prompt=(
+            f"Evaluate the accuracy of the `{node}` node's output for {ticket_id}.\n\n"
+            f"THE NODE'S JOB:\n{node_job}\n\n"
+            f"THE NODE'S OUTPUT (what you are judging):\n{node_output}\n\n"
+            f"Score it against the `{node}` rubric in your instructions. Verify before you score: "
+            f"read the real artifacts and grep the repo. A plausible-but-wrong output must FAIL. "
+            f"You judge only -- do not edit code, fix the output, or re-run the node."
+        ),
+        verdict_model=schemas.NodeEvaluation,
+    )

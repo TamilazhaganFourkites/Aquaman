@@ -101,6 +101,17 @@ class OceanState(TypedDict, total=False):
                                      # keying on `attempts >= MAX` (which stays true for the rest of
                                      # the run and would mislabel any LATER, unrelated stop)
 
+    # --- D5/D6: independent per-node accuracy evaluation (advisory unless EVAL_ENFORCE) ---
+    # Declared for the same reason as the quality_gate block above: LangGraph silently DROPS any key
+    # a node returns that the schema doesn't know about, so an undeclared key here would make the
+    # whole evaluator inert while every unit test on the node itself still passed.
+    node_evaluations: list      # append-only [{node, accuracy, verdict, dimensions, issues}] — one per eval
+    eval_gap: str               # non-empty == an ENFORCED failing evaluation; the reason, human-readable
+    eval_unverified: str        # non-empty when the judge could not be run or its verdict was unreadable
+    eval_attempts: int          # capped by MAX_EVAL_ATTEMPTS; reset ONLY by prep_rework
+    eval_stopped: bool          # set only on the stop branch, so stop_run can label it without keying
+                                # on `attempts >= MAX` (true for the rest of the run — see quality_gate)
+
     # --- Station 5: review loop (gated at MAX_REVIEW_ITERATIONS) ---
     review_verdict: ReviewVerdict
     review_iteration: int

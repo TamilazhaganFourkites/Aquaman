@@ -133,6 +133,19 @@ def _details(node: str, upd: dict) -> list[str]:
         d.append(f"{fc} file(s) changed" if fc else "changes committed")
         if upd.get("branch"):
             d.append(f"pushed branch {upd['branch']}")
+        # D5: the accuracy evaluation rides on the coder's own update, because `_eval_node` runs
+        # inside that station rather than as a node of its own (monitor/app.py:411-425 depends on it
+        # NOT being a node). Advisory: shown, never styled as a failure unless it actually gated.
+        for e in (upd.get("node_evaluations") or []):
+            if not isinstance(e, dict) or e.get("node") != "coder":
+                continue
+            acc = e.get("accuracy")
+            d.append(f"  accuracy eval: {e.get('verdict') or 'UNREADABLE'} "
+                     f"({'not reported' if acc is None else acc}/100)")
+            for issue in (e.get("issues") or [])[:3]:
+                d.append(f"    - {str(issue)[:120]}")
+        if upd.get("eval_unverified"):
+            d.append(f"  accuracy NOT measured: {str(upd['eval_unverified'])[:120]}")
     elif node == "quality_gate":
         checked = upd.get("quality_gate_checked_files")
         if checked is not None:
@@ -224,6 +237,18 @@ def _highlight(node: str, upd: dict) -> str:
             return f"DID NOT fully run — {checked} file(s) checked"
         return f"{checked} file(s) clean"
     if node == "coder":
+        # Only ever mention the evaluation when it actually ran -- with NODE_EVAL off (the default)
+        # this is unchanged from before D5.
+        ev = next((e for e in (upd.get("node_evaluations") or [])
+                   if isinstance(e, dict) and e.get("node") == "coder"), None)
+        if upd.get("eval_stopped"):
+            return "accuracy eval FAILED — stopping"
+        if upd.get("eval_gap"):
+            return "accuracy eval FAILED — back to Coding"
+        if ev:
+            acc = ev.get("accuracy")
+            return (f"branch pushed; accuracy {ev.get('verdict') or 'UNREADABLE'}"
+                    f"{'' if acc is None else f' ({acc}/100)'}")
         return "branch pushed"
     if node == "harsh_reviewer":
         return str(upd.get("review_verdict") or "")

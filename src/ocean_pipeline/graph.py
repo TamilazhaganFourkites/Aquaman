@@ -97,20 +97,33 @@ def after_quality_gate(state: OceanState) -> str:
     is what makes that true — NOT "a could-not-run gate produces no findings", which an earlier
     version of this docstring claimed and which is false: the gate is multi-language, so partial
     coverage is normal and a run can carry findings AND a could-not-run reason at once (see
-    quality.run_all's own docstring, which is the correct statement)."""
+    quality.run_all's own docstring, which is the correct statement).
+
+    D6 also routes here. This is the router immediately downstream of `coder`, and it already maps
+    rework/stop, so the accuracy evaluator needs no new node and no new edge. The deterministic
+    checks are read FIRST and win: a file that does not parse is a certain defect, while the
+    evaluator is an LLM judgment, and the certain evidence should decide the route when both fire.
+    The judge's reason is not lost either way — it stays on `eval_gap` for stop_run to label."""
     blocking = [f for f in (state.get("quality_gate_findings") or [])
                 if schemas.is_blocking_finding(f)]
-    if not blocking:
-        return "proceed"
-    # `>` not `>=`: MAX counts BOUNCES, and `quality_gate` has already incremented by the time this
-    # runs. With `>=` the first blocking finding stopped the run outright — the rework edge below was
-    # unreachable and the coder-prompt injection never executed (judge review).
-    if state.get("quality_gate_attempts", 0) > config.MAX_QUALITY_GATE_ATTEMPTS:
-        # Budget spent. Route to stop_run, NOT onward — "budget exhaustion converts to approve" is the
-        # escape class F3 already fixed, and letting a file that does not parse reach the reviewer
-        # (running on a different model) is exactly that mistake in a new place.
+    if blocking:
+        # `>` not `>=`: MAX counts BOUNCES, and `quality_gate` has already incremented by the time
+        # this runs. With `>=` the first blocking finding stopped the run outright — the rework edge
+        # below was unreachable and the coder-prompt injection never executed (judge review).
+        if state.get("quality_gate_attempts", 0) > config.MAX_QUALITY_GATE_ATTEMPTS:
+            # Budget spent. Route to stop_run, NOT onward — "budget exhaustion converts to approve" is
+            # the escape class F3 already fixed, and letting a file that does not parse reach the
+            # reviewer (running on a different model) is exactly that mistake in a new place.
+            return "stop"
+        return "rework"
+    # Syntax-clean. Now the advisory accuracy evaluator (D5/D6). Both keys are written ONLY when
+    # EVAL_ENFORCE is on (`_eval_gate` returns "" otherwise), so with the knob off — the default —
+    # these are always falsy and this router behaves exactly as it did before D6 existed.
+    if state.get("eval_stopped"):
         return "stop"
-    return "rework"
+    if state.get("eval_gap"):
+        return "rework"
+    return "proceed"
 
 
 def after_review(state: OceanState) -> str:

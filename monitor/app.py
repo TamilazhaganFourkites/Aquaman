@@ -414,8 +414,9 @@ async def _drive_process(run: TicketRun, args: list[str],
                 # passes label=node=f"eval_{node}" straight through, no LABEL_TO_NODE entry exists
                 # or should exist for it). It's an advisory internal accuracy check, not a pipeline
                 # stage the user needs to see as its own row — worse, its completion is printed as
-                # a plain "[eval] <node>: accuracy=..." line (nodes.py::_eval_node) that matches
-                # NEITHER _parse_step_line NOR this header pattern, so an event created for it here
+                # a "· [eval] <node>: accuracy=..." milestone line (nodes.py::_eval_node) that matches
+                # NEITHER _parse_step_line (which requires ✓/✗ at column 2) NOR this header pattern,
+                # so an event created for it here
                 # would never resolve out of "running": duplicate phantom steps stuck pulsing
                 # forever, one per eval'd node. Skip entirely — don't create an event, and don't
                 # update current_label (a real station's own header stays authoritative for any

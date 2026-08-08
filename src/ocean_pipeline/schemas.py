@@ -548,3 +548,72 @@ class AutomationVerdict(BaseModel):
         if self.needs_ref_load and self.fidelity_rung == 2 and not self.ref_load_used:
             self.fidelity_rung = 1
         return self
+
+
+# ---- D5/D6: the node-accuracy evaluator's contract ----------------------
+# The worker prompt (fk-aideveloper skills/ocean-coding-agent/workers/node-evaluator.md) ends with
+# "Return your judgment in the NodeEvaluation contract appended below" -- `run_agent` is what
+# appends it, by injecting this model's JSON schema via VERDICT_INSTRUCTION. The spec was written
+# end to end (3 scored dimensions, a PASS/WARN/FAIL enum, per-node rubrics for 8 named nodes) and
+# monitor/app.py already carries handling for its output; only this contract and its driver were
+# missing.
+EVAL_VERDICTS: tuple[str, ...] = ("PASS", "WARN", "FAIL")
+
+
+def eval_verdict(raw) -> str:
+    """One of EVAL_VERDICTS, or "" when the judge did not return a recognizable one.
+
+    Deliberately NOT a `Literal`: a Literal makes ONE typo fail-parse the ENTIRE evaluation, so a
+    judge that scored all three dimensions and wrote "Pass." would yield no evaluation at all rather
+    than a usable one. Same reasoning as `gate_decision` and `normalize_severity` above -- one
+    canonicalizer, imported by every consumer, because the duplication IS the defect.
+
+    "" is meaningful and is NOT a PASS: it means the judge ran but its verdict could not be read,
+    which `_eval_gate` must treat as "could not measure" rather than "measured and passed"."""
+    if isinstance(raw, dict):
+        raw = raw.get("verdict", "")
+    if isinstance(raw, list) and len(raw) == 1:
+        raw = raw[0]
+    token = str(raw or "").strip().strip("*_ .:").upper()
+    return token if token in EVAL_VERDICTS else ""
+
+
+class EvalDimensions(BaseModel):
+    """The three dimensions node-evaluator.md scores 0-100.
+
+    `None` is the default, not 0. "The judge did not report this dimension" and "the judge scored it
+    zero" are opposite facts, and a 0 default would silently convert the first into the second --
+    the recurring defect this codebase keeps paying for ("could not measure" and "measured and
+    failed" must never share a number)."""
+    correctness: int | None = None
+    completeness: int | None = None
+    grounding: int | None = None
+
+
+class NodeEvaluation(BaseModel):
+    """One independent accuracy judgment of one node's output. ADVISORY unless EVAL_ENFORCE is on."""
+    node: str = ""
+    accuracy: int | None = None          # 0-100; None == not reported (see EvalDimensions)
+    verdict: str = ""                    # canonicalized to PASS/WARN/FAIL, or "" if unreadable
+    dimensions: EvalDimensions = Field(default_factory=EvalDimensions)
+    issues: list = Field(default_factory=list)
+    rationale: str = ""
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def _canonical_verdict(cls, v):
+        return eval_verdict(v)
+
+    @field_validator("accuracy", mode="before")
+    @classmethod
+    def _sane_accuracy(cls, v):
+        """Out-of-range or non-numeric becomes None ("not reported"), never a clamped number: a
+        judge that emits 150 or "high" has not given a score on this scale, and inventing 100 from
+        it would manufacture a pass."""
+        if v is None or isinstance(v, bool):
+            return None
+        try:
+            n = int(float(v))
+        except (TypeError, ValueError):
+            return None
+        return n if 0 <= n <= 100 else None

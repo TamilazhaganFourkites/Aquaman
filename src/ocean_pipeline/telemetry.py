@@ -42,7 +42,7 @@ _STATION_NAMES = {
     1: "dependency_resolver", 1.5: "reachability_gate", 1.55: "blocked_review_gate",
     1.6: "qa_scenarios",
     3.5: "prep_container", 3.6: "teardown_container",
-    3.87: "open_pr", 4: "coder", 4.5: "quality_gate",
+    3.87: "open_pr", 4: "coder", 4.5: "quality_gate", 4.6: "node_eval",
     5: "harsh_review", 5.9: "code_fault_rework",
     5.95: "learn_repo", 6.0: "sit_resolve", 6.1: "sit_author", 6.15: "qa_review_gate",
     6.2: "sit_run", 6.3: "sit_testrail", 6.4: "sit_triage", 6.45: "environment_failure_rework",
@@ -67,6 +67,16 @@ _STATUS = {
     # rule as `gate_refused` below — telemetry status must agree with the node's own final_status.
     "unsupported_route": "failed",
     "gate_refused": "failed",           # rca_done's gate-refused branch; it returns final_status=failed
+    # D5/D6 node accuracy evaluation (station 4.6). Both are TERMINAL, per the rule stated below:
+    # decide from the CALL SITE, not the name. `_eval_node` emits exactly one of these on every
+    # path it takes -- and on the third path (NODE_EVAL off, or the node not in EVAL_NODES) it
+    # emits nothing at all and the station correctly never appears. So there is no path where 4.6
+    # opens a lifecycle it does not close, which is what would make these annotations instead.
+    "eval": "completed",
+    # "failed" describes the EVALUATOR, not the run: the judge did not produce a judgment. The
+    # pipeline continues regardless (the evaluation is advisory), but recording this as "skipped"
+    # would read as "we chose not to evaluate" when in fact we tried and could not.
+    "eval_could_not_run": "failed",
     "blocked_short_circuit": "blocked",
     # qa_batch.py wraps the QA-only subgraph and emits its own pair. `qa_batch_end` is that batch
     # item's REAL terminal event, so it must not fall through to the annotation default — a judge
