@@ -32,7 +32,7 @@ from pathlib import Path
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from . import config, metrics, report, telemetry, tracing, ui
+from . import config, gate_marker, metrics, report, telemetry, tracing, ui
 from .graph import build_graph, compile_app
 from .nodes import _SME_BY_BUCKET, _release_build_slot, _release_gan_slot, _release_sit_slot
 from .state import OceanState
@@ -335,8 +335,15 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             # resume (a bare `--approve` on a paused qa_review_gate falls through
             # after_qa_review's default branch instead of erroring) rather than failing loudly,
             # so getting this right matters more than it looks.
+            # E2: durable, out-of-process record that this run is waiting, and for WHAT. The
+            # [PAUSED] line above only reaches whoever is attached to this stdout; the marker is
+            # readable by anyone, later, without touching the run or the checkpoint DB.
+            gate_marker.write(execution_id, ticket_id,
+                              next((g for g in paused_on if g in _GATE_FLAGS), ", ".join(paused_on)),
+                              _pause_message(execution_id, paused_on))
             print(f"\n[PAUSED] {_pause_message(execution_id, paused_on)}")
         else:
+            gate_marker.clear(execution_id)   # E2: reached a terminal state — no longer waiting
             _report(execution_id, final, total)
             # Machine-readable completion line for headless runners (oas-autodev's
             # reconcile matches `pr=#<n>` / a PR URL in the log tail). Emitting the PR
@@ -363,6 +370,9 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
         # run-monitoring-findings.md's I2 asked this be classified distinctly rather than
         # collapsing into the same generic "failed" every other exception produces, so a human
         # (or the monitor) doesn't chase it as a phantom pipeline defect.
+        # E2: a crashed run is not waiting on a human — clear the marker, or it advertises a gate
+        # nobody can answer and every later `waiting()` shows a run that died hours ago.
+        gate_marker.clear(execution_id)
         quota_exhausted = getattr(e, "quota_exhausted", False)
         final_status = "quota_exhausted" if quota_exhausted else "failed"
         telemetry.execution_end(execution_id, ticket_id, final_status, "unknown",
