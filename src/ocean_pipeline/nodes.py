@@ -2233,6 +2233,50 @@ def _file_sha(path: str) -> str:
         return ""
 
 
+def _read_topology(exec_id: str) -> tuple[list[str], list[str], str]:
+    """sit-topology #3: (required_real_services, services_up, unverified_reason) from topology.json.
+
+    The skill writes it (it already runs `docker ps` and `local_callback_subsystem.py status`);
+    Aquaman only compares two sets. That boundary is deliberate and is the document's own: topology
+    INTELLIGENCE stays in ocean-qa-agent where the ocean conventions live, because re-implementing it
+    here would create a second source of truth that drifts -- the exact defect just removed from
+    nodes.py, where three copies of one severity check left the un-migrated copy silently poisoning
+    the failure memory. The control plane gets EVIDENCE CHECKING only, never domain logic.
+
+    Same shape as the two precedents beside it (`_read_unmocked_paths`, `_sut_write_activity`) and as
+    the junit gate: the control plane does not understand pytest either -- it parses the XML and
+    refuses to take the model's word.
+
+    A missing file returns a reason, NOT an empty pass: absence of evidence is the thing this gate
+    exists to catch. It is the difference between "no services were required" and "nobody wrote down
+    which were".
+    """
+    try:
+        p = config.artifacts_dir(exec_id) / "topology.json"
+        if not p.exists():
+            return [], [], "no topology.json was written for this run"
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError) as e:
+        return [], [], f"topology.json unreadable ({type(e).__name__})"
+    if not isinstance(doc, dict):
+        return [], [], "topology.json is not an object"
+    req = [str(x) for x in (doc.get("required_real_services") or []) if str(x).strip()]
+    up = [str(x) for x in (doc.get("services_up") or []) if str(x).strip()]
+    # An explicit unknown-topology declaration (#2) is louder than a missing key: the classifier saw
+    # something infra-shaped it could not name, and guessing LOW is what produces the 65-minute
+    # mystery timeout.
+    if str(doc.get("class") or "").strip().lower() == "unknown_topology":
+        return req, up, "the skill classified this run's topology as unknown_topology"
+    return req, up, ""
+
+
+def topology_gap(required: list[str], up: list[str]) -> list[str]:
+    """Required services that are NOT up. Case- and whitespace-insensitive; pure, so the set
+    comparison is testable without a graph."""
+    up_lc = {str(s).strip().lower() for s in up}
+    return sorted({str(s).strip() for s in required if str(s).strip().lower() not in up_lc})
+
+
 def _read_unmocked_paths(exec_id: str) -> list[str]:
     """Finding 2a: read the mock's OWN deterministic audit of every catch-all (unmocked) path it
     served, written by ocean_mock_helper.py's `_record_unmocked` to
@@ -2597,6 +2641,46 @@ async def sit_triage(state: OceanState) -> dict:
                                "evidence": f"current-run junit absent: {junit_path}", "ac_coverage": []},
                 "final_outcome": (f"SIT_JUNIT_MISSING: this run produced no junit at {junit_path}; refused "
                                   f"to score a prior run's evidence")}
+    # sit-topology #3: ONE dumb evidence gate. `required_real_services` vs `services_up`, both
+    # written by the skill, compared here as a set. Placed immediately after the junit gate because
+    # it is the same class of check and the same refusal: the control plane declines to score a run
+    # whose preconditions it cannot see were met.
+    #
+    # could_not_verify, NEVER passed, and deliberately NOT `failed`: a missing service is a
+    # PROVISIONING gap, not a code fault, and calling it failed would send the coder to fix a diff
+    # that was never exercised. This closes the Gap A / I6 class -- a chain that was never up, found
+    # by polling to a 65-minute timeout, though the information was available at second zero.
+    topo_required, topo_up, topo_unverified = _read_topology(exec_id)
+    topo_gap = topology_gap(topo_required, topo_up)
+    if topo_gap or (topo_unverified and topo_required):
+        why = (f"required service(s) not up: {topo_gap}" if topo_gap else topo_unverified)
+        telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
+                                failure_class="could_not_verify", topology_gap=",".join(topo_gap),
+                                topology_unverified=topo_unverified)
+        # #7: feed the miss into the cross-ticket memory, so the NEXT ticket of this shape recalls
+        # "this shape needs the delivery chain" before it boots. The mechanism already shipped; this
+        # is the failure class that costs the most wall-clock, so it is the one worth remembering.
+        # KEYWORDS, matching the signature exactly. A positional call here would raise TypeError,
+        # the `except` below would swallow it, and the memory would silently never record -- the
+        # inertness pattern, inside the fix meant to remember this failure class.
+        try:
+            lessons.record_failure(
+                domain_bucket=state.get("domain_bucket") or "",
+                action_sig="sit_topology",
+                fail_sig=why,
+                ticket_id=state["ticket_id"],
+                execution_id=exec_id,
+                note="provision the required services before the SIT runs",
+            )
+        except Exception:  # noqa: BLE001 -- memory must never fail a station
+            pass
+        return {"automation_result": "failed", "failure_class": "could_not_verify",
+                "needs_onboarding": False, "sit_findings": [],
+                "sit_report": {"tests": [], "changed_repos": [], "dependencies": [],
+                               "evidence": f"topology gate: {why}", "ac_coverage": []},
+                "final_outcome": (f"SIT_TOPOLOGY_GAP: {why} — the SIT could not have exercised the "
+                                  f"change, so this run is could_not_verify, not a code fault")}
+
     if verdict_path.exists():
         # Fresh Station-3 attempt, right before the one call that's actually about to run: this
         # node's own contract fully OVERWRITES the file with the final AutomationVerdict schema
