@@ -5,8 +5,12 @@ passed `tmp_path` for the artifacts directory while `report.finish` ALSO appends
 `config.TIMINGS_LOG` — which nothing redirected. Measured 2026-08-08: **1026 of 1084 records in
 `~/.ocean-pipeline/timings.jsonl` are `EXE-report-test`**, and the count grew by 31 during a single
 session's test runs. That file is not scratch data: the SIT-duration figures used to weigh the
-multi-repo gate design (0.03-2.97h, median 0.55h) were measured from it, over the ~5% of records
-that are real.
+multi-repo gate design were measured from it, over the ~5% of records that are real (re-derived
+2026-08-08 from `station_seconds["sit_run"]`: 0.07-1.82h, median 0.58h, n=16 across 15 runs).
+
+Those 1026 records were purged on 2026-08-08, after this isolation landed, with the pre-purge file
+kept at `~/.ocean-pipeline/timings.jsonl.pre-purge-2026-08-08`. The purge cost zero `sit_run`
+observations -- 16 before, 16 after.
 
 Fixing only the one test would leave the class open — three sibling durable paths are equally
 reachable (`ARTIFACTS_ROOT`, `gate_marker.GATES_DIR`, `kill_switch.KILL_SWITCH_PATH`), and each new
