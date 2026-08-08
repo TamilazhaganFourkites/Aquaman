@@ -58,7 +58,11 @@ _SIT_SLOT_FDS: dict = {}
 
 
 def _sit_slot_dir() -> Path:
-    d = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline")) / "sit-slots"
+    # config.ARTIFACTS_ROOT, not a second `os.environ.get(..., "/tmp/ocean-pipeline")`. These three
+    # slot dirs each re-implemented that lookup, so moving the artifacts root off /tmp would have
+    # split the cross-process LOCKS away from the run evidence they coordinate — and left the locks
+    # in the directory a daily cleaner empties. One definition, in config.
+    d = config.ARTIFACTS_ROOT / "sit-slots"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -121,7 +125,8 @@ _GAN_SLOT_FDS: dict = {}
 
 
 def _gan_slot_dir() -> Path:
-    d = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline")) / "gan-slots"
+    # See _sit_slot_dir: one definition of the artifacts root, in config.
+    d = config.ARTIFACTS_ROOT / "gan-slots"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -194,7 +199,8 @@ _BUILD_SLOT_FDS: dict = {}
 
 
 def _build_slot_dir() -> Path:
-    d = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline")) / "build-slots"
+    # See _sit_slot_dir: one definition of the artifacts root, in config.
+    d = config.ARTIFACTS_ROOT / "build-slots"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -1556,9 +1562,18 @@ async def qa_review_gate(state: OceanState) -> dict:
         "qa_gan_verdict": gan_verdict,      # APPROVE | APPROVE WITH FIXES | REJECT (Step 5d)
         "qa_gan_phase0_gaps": phase0_gaps,  # HIGH spec gaps from Step 2e -- always [] while Step 2e
                                             # is disabled in ocean-qa-agent/SKILL.md (MM-14738)
+        # The REMAINING budget, stated. Without it the human cannot tell that "request changes" is
+        # about to be ignored: at 0 remaining, after_qa_review (graph.py:189) silently falls through
+        # to `return "sit_run"` and runs the draft anyway. Asking for a decision while concealing
+        # that the decision may not be honoured is the part that made this dangerous.
+        "changes_remaining": max(0, config.MAX_QA_REVIEW_ITERATIONS - state.get("qa_review_iteration", 0)),
         "prompt": ("Review the drafted SIT scenarios + sample test, then resume with ONE of: "
                    "`--qa approve-testrail` | `--qa approve-no-testrail` | "
-                   "`--qa changes --note '<feedback>'`."),
+                   "`--qa changes --note '<feedback>'`."
+                   + ("" if config.MAX_QA_REVIEW_ITERATIONS - state.get("qa_review_iteration", 0) > 0
+                      else "  !! The `changes` budget is EXHAUSTED: requesting changes will NOT "
+                           "re-author the test — the run proceeds to sit_run with the current draft. "
+                           "Stop the run instead if that is not what you want.")),
     })
     decision = raw.get("decision") if isinstance(raw, dict) else str(raw)
     note = raw.get("note", "") if isinstance(raw, dict) else ""
@@ -2377,9 +2392,15 @@ async def prep_rework(state: OceanState) -> dict:
     # above. Do NOT also reset it in `coder` or on after_review's rework edge: `harsh_reviewer
     # --rework--> coder` goes DIRECTLY (prep_rework serves only the code_fault loop), so resetting on
     # that path makes the coder <-> quality_gate cycle genuinely unbounded.
+    # `qa_review_iteration` resets here for the same reason. It is written in exactly ONE place
+    # (qa_review_gate) and was reset NOWHERE, making it monotonic for the whole run — so two code
+    # faults exhausted MAX_QA_REVIEW_ITERATIONS, and after that a human clicking "request changes"
+    # was IGNORED: `after_qa_review` (graph.py:189) falls through to `return "sit_run"` and executes
+    # the draft the human just rejected. Silently — no telemetry marks the fall-through.
     return {"coding_attempts": attempt, "review_iteration": 0, "review_findings": [],
             "env_retry_attempts": 0, "quality_gate_attempts": 0,
-            "quality_gate_findings": [], "quality_gate_stopped": False}
+            "quality_gate_findings": [], "quality_gate_stopped": False,
+            "qa_review_iteration": 0}
 
 
 # ------------------------------------------------------------------ environment_failure retry prep

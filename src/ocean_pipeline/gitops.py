@@ -137,16 +137,26 @@ def cross_link_and_ready(slug: str, pr_number: int, test_pr_url: str = "") -> No
         body = _gh(["api", f"repos/{slug}/pulls/{pr_number}", "--jq", ".body"])
         if test_pr_url not in body:
             new_body = body + f"\n\n---\nTest-automation PR: {test_pr_url}\n"
-            # Written via a temp file + `@path`, not inline `-f body=<text>`: gh's field values
-            # treat a leading `@` as "read from this file", so passing arbitrary PR-body text
-            # inline would misfire if the body ever happened to start with `@`. A file also
+            # Written via a temp file + `@path`, not inline `body=<text>`: passing arbitrary PR-body
+            # text inline would misfire if the body ever happened to start with `@`, and a file also
             # sidesteps any command-line length limit for an unusually long body.
+            #
+            # `-F`, NOT `-f`. The `@file` form is documented ONLY under `-F/--field`; `-f/--raw-field`
+            # sends the value LITERALLY. With `-f` this PATCH replaced the entire PR body with the
+            # ~50-char string "@/var/folders/…/tmpXXXX.md" — and did it SILENTLY, because the API
+            # returns 200 OK for a body that is merely wrong. It never converged either: each re-run
+            # PATCHed a NEW tempfile path over the last one. Verified against gh 2.68.1.
+            #
+            # The three lines above were already the correct rationale for a file + `@path`; the flag
+            # underneath them just didn't implement it. Fired zero times so far — gated by
+            # `if test_pr_url` and `if test_pr_url not in body`, and the one run that has ever reached
+            # flip_ready (EXE-0087f45b/MM-14312) had no test PR. Armed, not triggered.
             with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
                 f.write(new_body)
                 body_path = f.name
             try:
                 _gh(["api", f"repos/{slug}/pulls/{pr_number}", "-X", "PATCH",
-                     "-f", f"body=@{body_path}"])
+                     "-F", f"body=@{body_path}"])
             finally:
                 os.unlink(body_path)
     _gh(["pr", "ready", str(pr_number), "--repo", slug])  # safe no-op if already ready

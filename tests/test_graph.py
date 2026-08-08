@@ -1682,12 +1682,17 @@ def _preflight_ready_dirs(tmp_path, monkeypatch):
     """Make the non-gh preflight checks pass so a test can isolate the gh-specific behavior."""
     agents_dir = tmp_path / "fk-aideveloper" / "agents" / "pipeline"
     agents_dir.mkdir(parents=True)
-    # G1 version-pin guard: preflight now requires the 4 ocean SME files (under ocean-coding-agent/
-    # agents) AND the 6 ocean-coding-agent workers to exist on the checked-out branch — seed both.
+    # G1 version-pin guard: preflight requires EVERY ocean SME file the runtime map dispatches to
+    # (under ocean-coding-agent/agents) AND the 6 ocean-coding-agent workers — seed both.
+    #
+    # Seeded FROM `nodes._SME_BY_BUCKET`, the same map preflight reads. This fixture used to list
+    # four names by hand, and preflight checked the same four by hand — so the fixture, the test and
+    # the defect all agreed with each other, and a checkout missing sme-jt-data-quality.md or
+    # sme-event-processing-failure.md passed preflight and then died at sme_consult. Two hardcoded
+    # copies of one map cannot disagree with the map if neither is hardcoded.
     oca = tmp_path / "fk-aideveloper" / "skills" / "ocean-coding-agent"
     agents_home = oca / "agents"; agents_home.mkdir(parents=True)
-    for f in ("sme-callback-notification.md", "sme-load-creation.md",
-              "sme-ocean-milestones.md", "sme-ocean-data-quality.md"):
+    for f in sorted(set(nodes._SME_BY_BUCKET.values())):
         (agents_home / f).write_text("# stub SME\n")
     workers_dir = oca / "workers"; workers_dir.mkdir(parents=True)
     for f in ("research.md", "dep-resolve.md", "reachability.md", "code.md", "review.md", "rca-research.md"):
@@ -1714,6 +1719,106 @@ def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
     with pytest.raises(SystemExit, match="sme-load-creation.md"):
         cli._preflight()
+
+
+def test_a_code_fault_rework_restores_the_qa_changes_budget():
+    """`qa_review_iteration` is written in ONE place and was reset in none, so it was monotonic for
+    the whole run. Two code faults exhausted MAX_QA_REVIEW_ITERATIONS, and from then on a human
+    clicking "request changes" was IGNORED — `after_qa_review` falls through to `sit_run` and
+    executes the draft the human just rejected, with no telemetry marking it.
+
+    A Station-6 code fault is a fresh coding attempt, so it earns a fresh QA budget exactly like
+    `review_iteration` and `quality_gate_attempts` beside it."""
+    out = asyncio.run(nodes.prep_rework({"execution_id": "EXE-x", "coding_attempts": 1,
+                                         "qa_review_iteration": config.MAX_QA_REVIEW_ITERATIONS}))
+    assert out["qa_review_iteration"] == 0, "a code-fault rework must restore the QA changes budget"
+
+    # …and the router honours "changes" again afterwards.
+    assert graph.after_qa_review({**out, "qa_decision": "changes"}) == "sit_author"
+    # The exhausted state still falls through (that behaviour is unchanged) — which is exactly why
+    # the gate now has to SAY so; see the payload assertion below.
+    assert graph.after_qa_review({"qa_decision": "changes",
+                                  "qa_review_iteration": config.MAX_QA_REVIEW_ITERATIONS}) == "sit_run"
+
+
+def test_the_qa_gate_tells_the_human_when_changes_will_be_ignored(monkeypatch):
+    """Asking for a decision while concealing that it may not be honoured is the dangerous half.
+    The interrupt payload carried no budget at all, so a human at 0 remaining could not tell that
+    `--qa changes` was about to run the draft they were rejecting."""
+    monkeypatch.setattr(config, "QA_REVIEW_AUTO", False)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    seen = {}
+
+    def _fake_interrupt(payload):
+        seen.update(payload)
+        return {"decision": "approve_no_testrail", "note": ""}
+
+    import langgraph.types
+    monkeypatch.setattr(langgraph.types, "interrupt", _fake_interrupt)
+
+    base = {"execution_id": "EXE-x", "ticket_id": "MM-1", "qa_test_path": "/x/t.py"}
+    asyncio.run(nodes.qa_review_gate({**base, "qa_review_iteration": 0}))
+    assert seen["changes_remaining"] == config.MAX_QA_REVIEW_ITERATIONS
+    assert "EXHAUSTED" not in seen["prompt"]
+
+    seen.clear()
+    asyncio.run(nodes.qa_review_gate({**base, "qa_review_iteration": config.MAX_QA_REVIEW_ITERATIONS}))
+    assert seen["changes_remaining"] == 0
+    assert "EXHAUSTED" in seen["prompt"], "the human was not told their `changes` request is a no-op"
+
+
+def test_run_evidence_does_not_live_somewhere_the_os_purges():
+    """ARTIFACTS_ROOT must not default under /tmp, and the slot dirs must follow it.
+
+    macOS's com.apple.tmp_cleaner runs daily and deletes /tmp entries older than 3 days: 38 unique
+    execution_ids were recorded in timings.jsonl and exactly 2 EXE directories survived on disk.
+    `lessons.py:21-28` justifies cross-ticket memory on those artifacts "surviving across runs on
+    this machine", so the cleaner defeats it outright.
+
+    The slot dirs are asserted too because each re-implemented the env lookup with its own /tmp
+    default — moving only config would have split the cross-process LOCKS away from the evidence
+    they coordinate, and left the locks in the purged directory."""
+    import os as _os
+    assert "OCEAN_PIPELINE_ARTIFACTS" not in _os.environ, "test env overrides the default under test"
+    assert not str(config.ARTIFACTS_ROOT).startswith("/tmp/"), (
+        f"ARTIFACTS_ROOT is under /tmp ({config.ARTIFACTS_ROOT}) — a daily cleaner empties it")
+    assert not str(config.TIMINGS_LOG).startswith("/tmp/"), config.TIMINGS_LOG
+
+    # Match the CODE pattern, not the string — the explanatory comment in nodes.py names the old
+    # default on purpose, and a test that banned any mention would forbid documenting the defect.
+    src = Path(nodes.__file__).read_text()
+    assert 'os.environ.get("OCEAN_PIPELINE_ARTIFACTS"' not in src, (
+        "nodes.py re-derives the artifacts root from the environment — read config.ARTIFACTS_ROOT, "
+        "or the slot locks drift away from the evidence they coordinate")
+    for kind in ("sit", "gan", "build"):
+        assert f'config.ARTIFACTS_ROOT / "{kind}-slots"' in src, f"{kind}-slots is not rooted in config"
+
+
+def test_preflight_checks_every_sme_file_the_runtime_dispatches_to(tmp_path, monkeypatch):
+    """EACH SME file, individually — the guard must cover the whole runtime map, not a subset.
+
+    Preflight and this file's fixture both hardcoded FOUR of the six names, so the two most recently
+    added buckets (jt_data_quality, event_processing_failure) were unguarded: a checkout carrying
+    only the older four PASSED preflight and then failed deep at sme_consult, the 3rd-hottest station
+    (28 fires), with exactly the opaque error the guard exists to prevent. Looping the real map means
+    adding a bucket cannot outrun its own preflight check again."""
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    class _Ok:
+        returncode = 0; stdout = "Logged in"; stderr = ""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _Ok())
+    assert len(set(nodes._SME_BY_BUCKET.values())) >= 6, "the SME map shrank — is that intended?"
+
+    for missing in sorted(set(nodes._SME_BY_BUCKET.values())):
+        root = tmp_path / missing.replace(".md", "")
+        _preflight_ready_dirs(root, monkeypatch)
+        (config.OCEAN_AGENTS_DIR / missing).unlink()
+        with pytest.raises(SystemExit) as e:
+            cli._preflight()
+        assert missing in str(e.value), (
+            f"preflight did not notice {missing} was absent — it is in the runtime map "
+            f"(nodes._SME_BY_BUCKET) so sme_consult will try to read it")
 
 
 def test_preflight_fails_when_ocean_workers_missing(tmp_path, monkeypatch):
@@ -2159,8 +2264,13 @@ def test_cross_link_and_ready_adds_link_when_missing(monkeypatch):
     """Body read/write goes through `gh api` (REST), not `gh pr view`/`gh pr edit` -- those
     subcommands request the deprecated `projectCards` GraphQL field, which GitHub rejects outright
     on repos where "Projects (classic)" has been sunset (the actual EXE-342a6243/MM-14060 bug).
-    The write is `-f body=@<tempfile>`, not inline text, so the link is verified by reading that
-    file's content INSIDE the fake, before cross_link_and_ready's own `finally` deletes it."""
+
+    ASSERTS ON THE TRANSMITTED FLAG, not merely on the tempfile. The previous oracle did
+    `cmd[cmd.index("-f") + 1]` — it located the payload by assuming the buggy flag, so it passed
+    against `-f body=@<path>`, which gh sends LITERALLY: the PATCH replaced the whole PR body with
+    a ~50-char /var/folders path, silently (200 OK) and non-convergently (each re-run PATCHes a new
+    path). A test that reads the file gh was never going to open cannot see that. `@file` is
+    documented only under `-F/--field`, so the flag IS the behaviour under test."""
     calls = []
     written = {}
     link = "https://github.com/x/test-automation/pull/1"
@@ -2168,8 +2278,11 @@ def test_cross_link_and_ready_adds_link_when_missing(monkeypatch):
     def fake_run(cmd, **kw):
         calls.append(cmd)
         if "PATCH" in cmd:
-            path = cmd[cmd.index("-f") + 1].split("=@", 1)[1]
-            written["body"] = Path(path).read_text()
+            # Locate the body field by its VALUE, so this fake cannot silently start passing
+            # against a flag change the way an index("-f") lookup did.
+            field = next(a for a in cmd if a.startswith("body=@"))
+            written["flag"] = cmd[cmd.index(field) - 1]
+            written["body"] = Path(field.split("=@", 1)[1]).read_text()
             return _FakeGhProc(stdout="")
         if "api" in cmd:
             return _FakeGhProc(stdout="original body")
@@ -2179,6 +2292,10 @@ def test_cross_link_and_ready_adds_link_when_missing(monkeypatch):
     gitops.cross_link_and_ready("org/repo", 5, link)
     patch_calls = [c for c in calls if "PATCH" in c]
     assert len(patch_calls) == 1
+    assert written["flag"] == "-F", (
+        f"body=@<file> was sent with {written['flag']!r}; only -F/--field expands @file. "
+        f"-f/--raw-field transmits the literal path and wipes the PR body.")
+    assert "-f" not in patch_calls[0], "-f must not appear on the PATCH at all"
     assert link in written["body"]
     assert any("ready" in c for c in calls)
 

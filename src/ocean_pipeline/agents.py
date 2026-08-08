@@ -266,7 +266,7 @@ _WRAPPER_CMDS = {"sudo", "time", "nice", "ionice", "xargs", "env", "command", "n
 def _is_dangerous_root(path: str) -> bool:
     """True if `path` names a filesystem TOP-LEVEL root to recursively scan — including the `/*`, `/*/`,
     `/System/*` top-level-glob forms (the shell expands `/*` to every top-level dir = a whole-disk scan).
-    An absolute path INTO the run's worktree (`/tmp/ocean-pipeline/<EXE>/…`) is NOT dangerous."""
+    An absolute path INTO the run's worktree (`~/.ocean-pipeline/artifacts/<EXE>/…`) is NOT dangerous."""
     if path in _DANGEROUS_SEARCH_ROOTS:
         return True
     if (path.rstrip("/") or "/") in _DANGEROUS_SEARCH_ROOTS:

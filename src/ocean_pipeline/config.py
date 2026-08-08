@@ -36,12 +36,26 @@ OCEAN_WORKERS_DIR = FK_AIDEVELOPER_DIR / "skills" / "ocean-coding-agent" / "work
 # node dispatches them; _agent_path resolves them here.
 OCEAN_AGENTS_DIR = FK_AIDEVELOPER_DIR / "skills" / "ocean-coding-agent" / "agents"
 
-# Per-run artifact root (reachability-report.json, per-station verdict.json, etc.)
-ARTIFACTS_ROOT = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS", "/tmp/ocean-pipeline"))
+# Per-run artifact root (reachability-report.json, per-station verdict.json, etc.).
+#
+# NOT /tmp. macOS runs /System/Library/LaunchDaemons/com.apple.tmp_cleaner.plist daily at 00:00,
+# deleting /tmp files whose atime+mtime+ctime all exceed 3 days and then the emptied directories —
+# so a run's evidence disappears between one ticket and the next. Measured: 38 unique execution_ids
+# in timings.jsonl, exactly 2 EXE directories still on disk.
+#
+# This is not a hypothetical tidiness point. `lessons.py:21-28` justifies the whole cross-ticket
+# memory design on the artifacts "surviving across runs on this machine" — a 3-day cleaner defeats
+# "ticket 200 is just as smart as ticket 1" outright. (The loss is prospective: lessons.py landed
+# 2026-08-07, after the last real run, so nothing has been lost yet.) It also gates every measurement
+# item in the queue, since the evidence they compute on is what gets purged.
+#
+# The diagnosis already existed one line down — TIMINGS_LOG was moved to ~/.ocean-pipeline for
+# exactly this reason and says so. It was fixed for one file and left for everything else.
+ARTIFACTS_ROOT = Path(os.environ.get("OCEAN_PIPELINE_ARTIFACTS",
+                                     str(Path.home() / ".ocean-pipeline" / "artifacts")))
 
-# Durable per-run station-timing log (one JSON line per finished run). ARTIFACTS_ROOT lives under
-# /tmp and gets cleaned, losing the run-report timings; this log persists them so before/after
-# latency comparisons survive. Out of any git repo by default.
+# Durable per-run station-timing log (one JSON line per finished run). Kept out of ARTIFACTS_ROOT
+# and out of any git repo; both now live under ~/.ocean-pipeline for the reason given above.
 TIMINGS_LOG = Path(os.environ.get("OCEAN_PIPELINE_TIMINGS_LOG",
                                   str(Path.home() / ".ocean-pipeline" / "timings.jsonl")))
 

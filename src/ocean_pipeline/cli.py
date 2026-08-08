@@ -34,7 +34,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from . import config, metrics, report, telemetry, tracing, ui
 from .graph import build_graph, compile_app
-from .nodes import _release_build_slot, _release_gan_slot, _release_sit_slot
+from .nodes import _SME_BY_BUCKET, _release_build_slot, _release_gan_slot, _release_sit_slot
 from .state import OceanState
 
 # Loops (review x code_fault) can chain well past LangGraph's default of 25 node
@@ -64,9 +64,15 @@ def _preflight() -> None:
         # fk-aideveloper artifacts the graph reaches into at run time, and origin/main does NOT carry
         # them yet — so a checkout on the wrong branch fails deep at sme_consult with an opaque error.
         # Check them upfront and surface the same #fk-aideveloper Slack-branch hint the README gives.
-        missing_smes = [f for f in ("sme-callback-notification.md", "sme-load-creation.md",
-                                    "sme-ocean-milestones.md", "sme-ocean-data-quality.md")
-                        if not (config.OCEAN_AGENTS_DIR / f).exists()]
+        # DERIVED from the runtime map, never a second hand-written copy. This list was hardcoded
+        # with FOUR of the six names, so a checkout carrying only the older four PASSED preflight and
+        # then failed deep at sme_consult — the 3rd-hottest station (28 fires) — with exactly the
+        # opaque error this guard exists to prevent. The two it omitted (jt_data_quality,
+        # event_processing_failure) are the two most recently added, which is the tell: a duplicate
+        # of a live map drifts the moment the map grows. Import it instead, and the guard cannot fall
+        # behind again.
+        missing_smes = sorted(f for f in set(_SME_BY_BUCKET.values())
+                              if not (config.OCEAN_AGENTS_DIR / f).exists())
         if missing_smes:
             problems.append(
                 f"ocean SME file(s) missing from {config.OCEAN_AGENTS_DIR}: {', '.join(missing_smes)} — "
