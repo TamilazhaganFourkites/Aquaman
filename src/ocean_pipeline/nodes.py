@@ -1192,6 +1192,80 @@ def _gan_verdict(partial: dict) -> str:
     return nested.get("qa_gan_verdict", "") if isinstance(nested, dict) else ""
 
 
+# D1 STEP 1 (gan-decision.md, judge-approved v5). The GAN's residual HIGH gaps never reached the
+# coder, though nodes.py calls the scenarios "the fixed target coder must satisfy" -- confirmed by
+# four independent traces. `_gan_verdict` above aliases the verdict STRING only, so a gap reader is
+# a PREREQUISITE for that wiring, not a later step.
+#
+# SIX key names appear across the eight real artifacts and only FOUR are residual-gap lists. Reading
+# the other two would hand the coder items the GAN panel explicitly REJECTED, which is worse than
+# reading nothing:
+#   * `residual_open_items_for_downstream` (MM-14060) -- LOW/EXECUTABILITY/ADVISORY/OBSERVABILITY,
+#     zero HIGH entries.
+#   * `documented_gaps_and_deferrals` (MM-14132) -- NO severity field at all; statuses are DEFERRED,
+#     OUT OF SCOPE, MOVE TO UNIT LEVEL, and one entry records the panel ruling the underlying bug a
+#     FALSE POSITIVE.
+# Both are excluded BY NAME here, and the severity filter below is a second, independent guard:
+# neither key can produce a HIGH entry, so either mechanism alone would suffice. That redundancy is
+# deliberate -- this is the one reader whose failure mode is "coder implements a rejected finding".
+_GAN_GAP_KEYS = ("residual_high_gaps", "qa_gan_residual_gaps", "remaining_gaps")
+_GAN_GAP_KEYS_EXCLUDED = ("residual_open_items_for_downstream", "documented_gaps_and_deferrals")
+# Inner fields drift across artifacts too: summary is `summary` (14312, 14381) or `gap` (14457,
+# 14475), and the verification field is `verified` / `reverified` / `status` / `drafted_fix`.
+_GAN_SUMMARY_FIELDS = ("summary", "gap", "title", "description")
+
+
+def _gan_gaps(partial: dict) -> list[dict]:
+    """The GAN's residual HIGH gaps, normalized to [{severity, summary}]. Never raises.
+
+    HIGH ONLY. MEDIUM/LOW/ADVISORY are dropped: the payload is measured at 1-2 HIGH entries per run
+    (MM-14312 1, MM-14381 1 (+2 MED), MM-14457 2, MM-14475 2), and widening it turns a short,
+    code-actionable list into noise the coder will skim.
+
+    `gan_rounds[].real_gaps` is read; `real_gaps_fixed` is NOT -- rounds 1-2 of MM-14381 use that
+    second key for gaps the GAN ALREADY FIXED. A prefix or substring match on "real_gaps" would
+    catch it and hand the coder work that is already done, which is why the round reader tests the
+    key name for EQUALITY.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(items) -> None:
+        for it in items if isinstance(items, list) else []:
+            if not isinstance(it, dict):
+                continue
+            sev = str(it.get("severity") or it.get("priority") or "").strip().strip("*_ ").upper()
+            if sev != "HIGH":
+                continue
+            summary = ""
+            for f in _GAN_SUMMARY_FIELDS:
+                if it.get(f):
+                    summary = str(it[f]).strip()
+                    break
+            if not summary or summary in seen:
+                continue
+            seen.add(summary)
+            # Only severity + summary. The artifacts wrap each entry in test metadata
+            # (`drafted_fix: "S15 ..."`, `verified`, `reverified`, `status`) that is about the GAN's
+            # own bookkeeping, not about the code -- passing it on would read to the coder as an
+            # instruction to touch the test.
+            out.append({"severity": "HIGH", "summary": summary})
+
+    if not isinstance(partial, dict):
+        return []
+    for key in _GAN_GAP_KEYS:
+        _add(partial.get(key))
+    nested = partial.get("qa_gan")
+    if isinstance(nested, dict):
+        for key in _GAN_GAP_KEYS:
+            _add(nested.get(key))
+    for rnd in partial.get("gan_rounds") or []:
+        # EQUALITY, never a prefix: `real_gaps_fixed` is a different concept (already fixed).
+        if isinstance(rnd, dict):
+            _add(rnd.get("real_gaps"))
+    return out
+
+
 async def qa_scenarios(state: OceanState) -> dict:
     """Design + GAN-harden the SIT test scenarios BEFORE any code exists (skill Station-independent —
     calls `ocean-qa-agent` directly, not `ocean-automation-testing`, since that skill's own contract
@@ -1267,8 +1341,13 @@ async def qa_scenarios(state: OceanState) -> dict:
     partial = _load_json(str(scenarios_path))
     gan_verdict = _gan_verdict(partial)
     telemetry.station_event(exec_id, 1.6, "end", qa_gan_verdict=gan_verdict)
+    gan_gaps = _gan_gaps(partial)
+    if gan_gaps:
+        ui.milestone(f"GAN left {len(gan_gaps)} residual HIGH gap(s) — passing them to the coder")
+    telemetry.station_event(exec_id, 1.6, "gan_gaps", count=len(gan_gaps))
     return {"qa_scenarios_path": str(scenarios_path),
             "qa_gan_verdict": gan_verdict,
+            "qa_gan_residual_gaps": gan_gaps,
             "qa_gan_phase0_gaps": partial.get("qa_gan_phase0_gaps", [])}
 
 
@@ -1304,6 +1383,21 @@ async def coder(state: OceanState) -> dict:
             f"redesign or re-implement anything. Fix EXACTLY these files, re-run the same command "
             f"yourself to confirm it now passes, commit, push, and STOP. Entries marked MINOR are "
             f"advisory and do not block:\n{json.dumps(quality_findings, indent=2)}\n")
+    # D1 Step 1: the GAN's residual HIGH gaps. NOT a rework block -- these are available on the
+    # FIRST coding pass, because qa_scenarios runs pre-code (right after reachability_gate) and the
+    # scenarios are, in this file's own words, "the fixed target coder must satisfy". They never
+    # reached the coder until now.
+    gan_gaps = state.get("qa_gan_residual_gaps") or []
+    if gan_gaps:
+        rework += (
+            f"\nGAN RESIDUAL HIGH GAPS ({len(gan_gaps)}). An adversarial panel hardened this "
+            f"ticket's test scenarios BEFORE any code existed and these HIGH-severity gaps survived "
+            f"its rounds -- they describe code behaviour the SIT will target. Address them in the "
+            f"implementation. Note some may be hypothetical implementation choices rather than "
+            f"observed defects (Phase 1 is AC-only by construction): if one does not apply to the "
+            f"code you actually wrote, say so explicitly in your verdict notes rather than "
+            f"inventing a change to satisfy it:\n{json.dumps(gan_gaps, indent=2)}\n")
+
     # B1. A coverage bounce without this is a blind re-run. Names the mismatch concretely, because
     # the usual cause is the coder reporting one repo while its branch lives in another.
     if state.get("review_coverage_gap"):
