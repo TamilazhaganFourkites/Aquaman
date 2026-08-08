@@ -40,9 +40,11 @@ DESIGN NOTES that are load-bearing rather than stylistic:
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 # Severity strings are taken from schemas so they canonicalize through the ONE predicate every other
@@ -722,3 +724,102 @@ def run_all(dirs: list[Path], container: str, *, timeout: float, cap: int,
         uncovered += len([f for f in files if not language_of(f)])
 
     return findings, "; ".join(reasons)[:600], checked, derived, uncovered
+
+
+# ---- D4: mechanical secret scan before the ready-flip ------------------------------------------
+# The architecture review this module's header quotes ("no coverage floor, no linter, no static
+# analysis, no security scan") is right about the last item at ONE specific place: `flip_ready` is
+# pure `gh` + Jira with nothing mechanical in front of it.
+#
+# What is NOT missing, so this does not duplicate it: `workers/review.md:104-105` makes security an
+# unconditional CRITICAL for harsh_reviewer, and a CRITICAL forces CHANGES_REQUIRED. There IS an
+# enforced security gate upstream -- it is LLM judgment. This adds the MECHANICAL half.
+#
+# The fk-aideveloper gitleaks hook does NOT cover this path, verified: it is a Claude Code
+# PreToolUse hook in that repo's .claude/settings.json, while Aquaman spawns workers through
+# claude_agent_sdk with hooks built IN-PROCESS and never loads user/project settings (grep for
+# setting_sources / settingSources across src+tests returns nothing). Same class as
+# memory/feedback_sdk_worker_loses_harness_protections.
+SECRET_SCANNER = "gitleaks"
+
+
+def secret_scan(dirs: list[Path], timeout: float) -> tuple[list[dict], str, int]:
+    """Scan what this run INTRODUCED for secrets. Returns (findings, could_not_run_reason, scanned).
+
+    Measured against gitleaks 8.30.1 before this was written, because a scanner assumed to detect
+    and silently detecting nothing is the inert-gate defect this queue keeps repairing:
+
+      * exit 1 == leaks found, exit 0 == clean. The REPORT is still the authority here -- an exit
+        code alone cannot distinguish "clean" from "the flag parse failed and it scanned nothing".
+      * `--redact` blanks the `Secret` field. This function additionally never copies `Secret`,
+        `Match` or `Line` into a finding, so a credential cannot reach a milestone, telemetry
+        `output_summary`, run-report.json, the Jira comment, or monitor.db. Redaction at the source
+        is not enough on its own: the finding travels further than the scanner's own output.
+      * AWS's DOCUMENTATION example keys (AKIAIOSFODNN7EXAMPLE and friends) are allowlisted by
+        gitleaks and correctly do NOT fire. A first probe used exactly those and got "no leaks
+        found", which would have read as "the scanner does not work". It does; the test corpus was
+        wrong. Any test for this must plant a secret that is not an upstream allowlisted example.
+
+    Scans the DIFF against the merge base, not the repository's history: a pre-existing secret on
+    `main` is not this run's doing, and blocking a ticket's flip on it would be an unactionable stop
+    on work the ticket never touched. It also keeps the scan proportional to the change.
+    """
+    findings: list[dict] = []
+    reasons: list[str] = []
+    scanned = 0
+    # `shutil.which` FIRST, matching check_go/check_ruby/check_java one screen up. `_run` does not
+    # catch FileNotFoundError, so without this an unavailable scanner does not fail open at all --
+    # it raises out of the middle of the loop. An earlier revision of this function asserted the
+    # opposite ("_run returns rc 127 with no report"); the test for the missing-scanner path caught
+    # it, which is the only reason it is not a crash on every machine without gitleaks.
+    # Redundant with the `except OSError` around the _run call below, and deliberately kept: it
+    # answers "not installed" ONCE instead of once per repo, and with a reason naming the tool
+    # rather than an exception type. A mutation sweep confirms the redundancy is real -- deleting
+    # this block alone keeps every test green because the except arm catches the FileNotFoundError.
+    # Do not delete BOTH: without either one, a machine without gitleaks does not fail open at all,
+    # it raises out of the middle of the loop and takes the ready-flip with it.
+    if not shutil.which(SECRET_SCANNER):
+        return [], f"{SECRET_SCANNER} is not installed — NOT scanned", 0
+    for repo_dir in dirs:
+        base = base_ref(repo_dir, timeout)
+        if not base:
+            reasons.append(f"{repo_dir.name}: no merge base — diff could not be scanned")
+            continue
+        diff = _run(["git", "-C", str(repo_dir), "diff", "--no-color", f"{base}...HEAD"], timeout)
+        if diff.returncode != 0:
+            reasons.append(f"{repo_dir.name}: git diff failed — not scanned")
+            continue
+        payload = (diff.stdout or "").encode("utf-8", "replace")
+        if not payload.strip():
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            report = Path(td) / "gitleaks.json"
+            try:
+                proc = _run([SECRET_SCANNER, "stdin", "--no-banner", "--redact",
+                             "--report-format", "json", "--report-path", str(report)],
+                            timeout, stdin_bytes=payload)
+            except (subprocess.TimeoutExpired, OSError) as e:
+                reasons.append(f"{repo_dir.name}: {SECRET_SCANNER} {type(e).__name__} — NOT scanned")
+                continue
+            if not report.exists():
+                # No report == no scan, whatever the exit code said. Reported as unscanned rather
+                # than clean: the two must never share an answer.
+                reasons.append(f"{repo_dir.name}: {SECRET_SCANNER} did not run "
+                               f"(rc={proc.returncode}) — NOT scanned")
+                continue
+            try:
+                leaks = json.loads(report.read_text() or "[]")
+            except (ValueError, OSError) as e:
+                reasons.append(f"{repo_dir.name}: unreadable {SECRET_SCANNER} report ({type(e).__name__})")
+                continue
+        scanned += 1
+        for leak in leaks if isinstance(leaks, list) else []:
+            if not isinstance(leak, dict):
+                continue
+            # RuleID + location ONLY. Never the secret, its match, or the surrounding line.
+            findings.append(_finding(
+                "CRITICAL", repo_dir, Path(str(leak.get("File") or "<diff>")),
+                f"possible secret in the diff — {SECRET_SCANNER} rule {leak.get('RuleID') or '?'}",
+                line=leak.get("StartLine") or None,
+                fix="remove the credential, rotate it, and move it into the FK config system"))
+    return findings, "; ".join(reasons), scanned

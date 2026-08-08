@@ -229,6 +229,14 @@ QUALITY_GATE_CMD_TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_CMD
 # could-not-run on most runs and add minutes to the rest.
 QUALITY_GATE_JAVA = os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_JAVA", "").lower() in ("1", "true", "yes")
 
+# ---- D4: mechanical secret scan before the ready-flip -----------------------------------------
+# Default ON. Unlike NODE_EVAL above this is free (one `gitleaks stdin` per changed repo over the
+# diff, measured at ~23ms), it is deterministic rather than a judgment, and "a gate shipped
+# default-off is not shipped" (the QUALITY_GATE comment above). Fails CLOSED on a finding and OPEN,
+# loudly, when the scanner could not run -- an absent gitleaks must not halt every flip.
+SECRET_SCAN = os.environ.get("OCEAN_PIPELINE_SECRET_SCAN", "1").lower() in ("1", "true", "yes")
+SECRET_SCAN_TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_SECRET_SCAN_TIMEOUT", "120"))
+
 # ---- D5/D6: independent per-node accuracy evaluation ------------------------------------------
 # An LLM judge scores one node's output against the rubrics in the ocean-coding-agent worker
 # `node-evaluator.md`. The worker was specced end to end and monitor/app.py already handles its

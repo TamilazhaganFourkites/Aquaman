@@ -101,6 +101,10 @@ class OceanState(TypedDict, total=False):
                                      # keying on `attempts >= MAX` (which stays true for the rest of
                                      # the run and would mislabel any LATER, unrelated stop)
 
+    # --- D4: mechanical secret scan at the ready-flip ---
+    secret_findings: list        # [{severity,file,summary,line?,fix_direction?}] — CRITICAL, blocks the flip
+    secret_scan_unverified: str  # non-empty when a repo could NOT be scanned (fails OPEN, loudly)
+
     # --- D5/D6: independent per-node accuracy evaluation (advisory unless EVAL_ENFORCE) ---
     # Declared for the same reason as the quality_gate block above: LangGraph silently DROPS any key
     # a node returns that the schema doesn't know about, so an undeclared key here would make the

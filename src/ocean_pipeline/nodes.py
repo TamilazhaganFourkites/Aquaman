@@ -2724,6 +2724,45 @@ async def flip_ready(state: OceanState) -> dict:
     In Review + posts a PR-link comment (best-effort Jira). This is the intended AUTOMATED terminal
     action; the human boundary is merge/deploy, which the pipeline never performs."""
     telemetry.station_event(state["execution_id"], 6.5, "start")
+    # D4. The mechanical secret scan, BEFORE any gh or Jira call. This is the last automated action
+    # in the pipeline and the one that asks a human to look at the diff, so it is the right place
+    # for the check -- and the fk-aideveloper gitleaks hook provably does NOT cover this path (see
+    # quality.secret_scan's docstring: Aquaman builds SDK hooks in-process and never loads that
+    # repo's settings). An upstream LLM security gate does exist (review.md:104-105 makes security
+    # an unconditional CRITICAL); this is the deterministic half, not a duplicate of it.
+    secret_findings: list = []
+    secret_unverified = ""
+    if config.SECRET_SCAN:
+        dirs = quality.repo_dirs(state.get("worktree_dir", ""),
+                                 config.workspace_dir(state["execution_id"]))
+        try:
+            secret_findings, secret_unverified, scanned = quality.secret_scan(
+                dirs, config.SECRET_SCAN_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 -- an exploding scanner must not silently pass the flip
+            secret_findings, secret_unverified, scanned = [], f"scanner crashed: {type(e).__name__}", 0
+        telemetry.station_event(state["execution_id"], 6.5, "secret_scan",
+                                repos=len(dirs), scanned=scanned, findings=len(secret_findings),
+                                unverified=secret_unverified)
+        if secret_unverified:
+            # Fails OPEN, loudly -- an absent or broken gitleaks must not halt every ready-flip. The
+            # reason is carried to the terminal so it can never read as "scanned and clean".
+            ui.milestone(f"[secret-scan] NOT fully scanned: {secret_unverified}")
+        if secret_findings:
+            # Fails CLOSED on evidence. Do NOT flip, do NOT move the ticket to In Review: flipping a
+            # PR ready is the request for human eyes, and a possible live credential should be
+            # rotated before that audience widens, not after.
+            ui.milestone(f"[secret-scan] BLOCKED the ready-flip: "
+                         f"{len(secret_findings)} possible secret(s) in the diff")
+            telemetry.station_event(state["execution_id"], 6.5, "stop",
+                                    ready_flipped=False, findings=len(secret_findings))
+            return {"ready_flipped": False, "final_status": "failed",
+                    "secret_findings": secret_findings,
+                    "secret_scan_unverified": secret_unverified,
+                    "final_outcome": (
+                        f"secret_scan_blocked: {len(secret_findings)} possible secret(s) in the "
+                        f"diff on branch {state.get('branch')!r}; PR(s) left DRAFT and the ticket "
+                        f"was not moved to In Review — rotate the credential, then re-run")}
+
     # Multi-repo: flip EVERY changed repo's PR ready (fall back to pr_number for a pre-fix single repo).
     pr_numbers = dict(state.get("pr_numbers") or {})
     if not pr_numbers and state.get("pr_number"):
@@ -2742,6 +2781,7 @@ async def flip_ready(state: OceanState) -> dict:
                       f"Merge/deploy remain with the engineer.")
     telemetry.station_event(state["execution_id"], 6.5, "end", ready_flipped=bool(pr_numbers))
     return {"ready_flipped": True, "final_status": "completed",
+            "secret_findings": [], "secret_scan_unverified": secret_unverified,
             "final_outcome": f"sit_passed; service PR(s) {prs_str} ready-for-review"}
 
 
