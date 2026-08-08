@@ -42,12 +42,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import datetime as dt
+import hashlib
 import json
+import secrets
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from ocean_pipeline import agents, jira, schemas  # noqa: E402
+
+ERROR_ROUTE = "__error__"
 
 
 async def _predict(ticket_id: str) -> tuple[str, str]:
@@ -75,7 +81,7 @@ async def _predict(ticket_id: str) -> tuple[str, str]:
     if not summary and not description:
         # No text = nothing to classify blind. Report it rather than silently falling back to a live
         # lookup, which is exactly the leak this function exists to close.
-        return "__error__", "could not fetch title/description (JIRA_API_TOKEN set?)"
+        return ERROR_ROUTE, "could not fetch title/description (JIRA_API_TOKEN set?)"
     try:
         v: schemas.ResearchVerdict = await agents.run_agent(
             agent_md="research.md",
@@ -98,7 +104,7 @@ async def _predict(ticket_id: str) -> tuple[str, str]:
         )
         return v.route, (v.domain_bucket or "")
     except Exception as e:  # noqa: BLE001 — record the error as a miss, keep going
-        return "__error__", f"{type(e).__name__}: {e}"[:140]
+        return ERROR_ROUTE, f"{type(e).__name__}: {e}"[:140]
 
 
 async def _run(rows: list[dict], concurrency: int) -> list[dict]:
@@ -119,21 +125,77 @@ async def _run(rows: list[dict], concurrency: int) -> list[dict]:
     return await asyncio.gather(*(one(r) for r in rows))
 
 
+# Below this many scored rows, an accuracy figure is theatre. The corpus is NINE rows today, so one
+# ticket moves the number 11 points — wider than most differences anyone would act on. The eval still
+# runs and still prints per-ticket results; it just refuses to publish a headline percentage it
+# cannot support. See MM-14816-accuracy-plan.md.
+MIN_SCORABLE_ROWS = 20
+
+
 def _score(results: list[dict]) -> dict:
+    """Accuracy over the rows that were actually MEASURED — errors are excluded, not counted wrong.
+
+    `_predict` returns `__error__` for any failure: an unset JIRA_API_TOKEN, a network blip, a
+    malformed verdict. Scoring that as a wrong answer meant a machine with no Jira credentials
+    reported `route_accuracy: 0.0` — indistinguishable from a router that gets every ticket wrong,
+    from the one instrument every severity claim in the queue is supposed to be checked against.
+    "Could not measure" and "measured, and it failed" are different facts and must not share a
+    number. Same distinction the pipeline draws between could_not_verify and a real failure."""
     n = len(results)
-    route_ok = sum(1 for x in results if x["route_ok"])
-    bucket_scored = [x for x in results if x["bucket_ok"] is not None]
+    errored = [x for x in results if x["pred_route"] == ERROR_ROUTE]
+    scored = [x for x in results if x["pred_route"] != ERROR_ROUTE]
+    route_ok = sum(1 for x in scored if x["route_ok"])
+    # A bucket is scorable only if its route prediction was, too.
+    bucket_scored = [x for x in scored if x["bucket_ok"] is not None]
     bucket_ok = sum(1 for x in bucket_scored if x["bucket_ok"])
     route_misses = collections.Counter(
-        (x["gt_route"], x["pred_route"]) for x in results if not x["route_ok"])
+        (x["gt_route"], x["pred_route"]) for x in scored if not x["route_ok"])
+
+    enough = len(scored) >= MIN_SCORABLE_ROWS
     return {
         "n": n,
-        "route_accuracy": round(route_ok / n, 4) if n else None,
+        "scored": len(scored),
+        "errored": len(errored),
+        "error_ticket_ids": [x["ticket_id"] for x in errored],
+        # None, never 0.0, when there is nothing to stand on — an absent number is honest, a wrong
+        # one is not. `underpowered` says WHY it is absent when rows were scored but too few.
+        "route_accuracy": (round(route_ok / len(scored), 4) if scored and enough else None),
         "route_correct": route_ok,
+        "underpowered": (not enough),
+        "min_scorable_rows": MIN_SCORABLE_ROWS,
         "domain_bucket_scored": len(bucket_scored),
-        "domain_bucket_accuracy": round(bucket_ok / len(bucket_scored), 4) if bucket_scored else None,
+        "domain_bucket_accuracy": (round(bucket_ok / len(bucket_scored), 4)
+                                   if bucket_scored and enough else None),
         "domain_bucket_correct": bucket_ok,
         "route_confusion": [{"gt": gt, "pred": pr, "count": c} for (gt, pr), c in route_misses.items()],
+    }
+
+
+def _provenance(corpus: str) -> dict:
+    """What this number is OF — so a report can be re-derived instead of merely believed.
+
+    A bare accuracy with no run id, timestamp, corpus or code version cannot be reproduced or
+    compared against a later run, which makes it an assertion rather than a measurement."""
+    def _git(*args: str) -> str:
+        try:
+            p = subprocess.run(["git", *args], capture_output=True, text=True, timeout=10,
+                               cwd=Path(__file__).resolve().parent)
+            return p.stdout.strip() if p.returncode == 0 else ""
+        except Exception:  # noqa: BLE001 — provenance is best-effort; never fail the eval for it
+            return ""
+
+    corpus_path = Path(corpus)
+    try:
+        digest = hashlib.sha256(corpus_path.read_bytes()).hexdigest()[:16]
+    except OSError:
+        digest = ""
+    return {
+        "run_id": f"EVAL-{secrets.token_hex(4)}",
+        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "corpus_path": str(corpus_path.resolve()) if corpus_path.exists() else corpus,
+        "corpus_sha256_16": digest,
+        "git_sha": _git("rev-parse", "--short", "HEAD"),
+        "git_dirty": bool(_git("status", "--porcelain")),
     }
 
 
@@ -173,12 +235,23 @@ async def main() -> int:
         print("corpus is empty", file=sys.stderr)
         return 2
 
+    provenance = _provenance(args.corpus)
     results = await _run(rows, args.concurrency)
-    summary = _score(results)
+    summary = {**_score(results), "provenance": provenance}
 
     print(json.dumps(summary, indent=2))
-    print(f"\n  route: {summary['route_correct']}/{summary['n']}"
-          f"   domain_bucket: {summary['domain_bucket_correct']}/{summary['domain_bucket_scored']}\n")
+    # Report over what was MEASURED, and say so when there is no headline to report.
+    print(f"\n  route: {summary['route_correct']}/{summary['scored']} scored"
+          f"   domain_bucket: {summary['domain_bucket_correct']}/{summary['domain_bucket_scored']}")
+    if summary["errored"]:
+        print(f"  !! {summary['errored']} ticket(s) COULD NOT BE MEASURED and are excluded from the "
+              f"accuracy (not counted wrong): {', '.join(summary['error_ticket_ids'][:6])}"
+              + ("…" if summary["errored"] > 6 else ""))
+    if summary["underpowered"]:
+        print(f"  !! NO ACCURACY REPORTED — {summary['scored']} scored row(s) is below the "
+              f"{summary['min_scorable_rows']}-row floor; one ticket would move it "
+              f"{round(100 / max(summary['scored'], 1))} points. Per-ticket results below still stand.")
+    print()
     for x in sorted(results, key=lambda r: (r["route_ok"], r["ticket_id"])):
         flag = "OK" if x["route_ok"] else "XX"
         bflag = {True: "OK", False: "XX", None: "--"}[x["bucket_ok"]]
