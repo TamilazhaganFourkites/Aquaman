@@ -32,7 +32,7 @@ from pathlib import Path
 
 from langgraph.graph import END, StateGraph
 
-from . import config, graph as graph_mod, nodes, telemetry, tracing
+from . import config, graph as graph_mod, kill_switch, nodes, telemetry, tracing
 from .state import OceanState
 
 
@@ -206,6 +206,16 @@ async def run_batch(tickets: list[str]) -> list[dict]:
     stops the rest (run_one already swallows its own exceptions into a failed result)."""
     results = []
     for i, t in enumerate(tickets, 1):
+        # E1: the kill switch is checked FIRST, before anything else about this ticket. A halt
+        # consulted after the other budgets is a preference, not a halt. Ocean had no machine-wide
+        # stop at all: the only ways to end a batch mid-flight were Ctrl-C on the right terminal or
+        # killing uvicorn — neither available to someone not sitting at that machine.
+        halted, why = kill_switch.status()
+        if halted:
+            print(f"\n· HALTED — {why}\n  {len(tickets) - i + 1} ticket(s) not started: "
+                  f"{', '.join(tickets[i - 1:])}\n  release with: rm {kill_switch.KILL_SWITCH_PATH}",
+                  flush=True)
+            break
         # Always printed, regardless of --log-level: this is the ONLY indicator of which
         # ticket in the batch is currently running, not a per-station action detail — it
         # would wrongly disappear at team/management level if it reused ui.milestone()
