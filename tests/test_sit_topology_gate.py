@@ -150,3 +150,22 @@ def test_a_broken_memory_never_fails_the_station():
     src = inspect.getsource(nodes.sit_triage)
     i = src.index("lessons.record_failure")
     assert "except Exception" in src[i:i + 900], "a memory failure could fail the station"
+
+
+# --------------------------------------------------------------- #4, preflight the REAL topology
+def test_the_preflight_is_sized_against_required_services_not_target_repos():
+    """Gap D. `target_repos` is the researcher's Station-0 CANDIDATE list — routinely over-scoped
+    with read-only repos, AND blind to services the ticket never changed but the test still needs
+    (the ES indexer, the delivery chain). Both errors are live in opposite directions."""
+    src = inspect.getsource(nodes.sit_run)
+    assert "_read_topology(exec_id)" in src, "sit_run never reads the real topology"
+    assert "preflight_scope" in src
+    i = src.index("_docker_preflight_reason(")
+    call = src[i:src.index(")", i) + 1]
+    assert "preflight_scope" in call, f"the budget is still sized against target_repos: {call}"
+
+
+def test_the_preflight_falls_back_to_target_repos_when_no_topology_exists():
+    """Back-compat: a run predating topology.json must still be preflighted, not skipped."""
+    src = inspect.getsource(nodes.sit_run)
+    assert 'else state.get("target_repos")' in src, "no fallback — older runs lose their preflight"

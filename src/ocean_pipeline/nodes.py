@@ -2415,7 +2415,17 @@ async def sit_run(state: OceanState) -> dict:
     # full-chain attempt ground for ~40 min before hitting this exact documented ceiling).
     # Exclude THIS run's own containers (named with the exec_id — warm SIT stack + persistent container)
     # from the over-commit check, so a WARM_SIT_INFRA retry isn't blocked by its own reused stack (review #4).
-    reason = _docker_preflight_reason(state.get("target_repos"), exclude_name_substr=exec_id)
+    # sit-topology #4 (Gap D): size the budget against the REAL topology, not `target_repos`.
+    # `target_repos` is the researcher's Station-0 CANDIDATE list -- routinely over-scoped with
+    # read-only repos, and blind to services the ticket never changed but the test still needs (the
+    # ES indexer, the notification delivery chain). Both errors are live: over-scoping demands memory
+    # for repos nothing will boot, and under-scoping green-lights a chain that cannot fit and is then
+    # discovered by polling to a timeout. `required_real_services` is what the classifier says will
+    # ACTUALLY be stood up, so it is what the budget must be sized against.
+    topo_required, _topo_up, _topo_why = _read_topology(exec_id)
+    preflight_scope = ([{"repo": svc} for svc in topo_required] if topo_required
+                       else state.get("target_repos"))
+    reason = _docker_preflight_reason(preflight_scope, exclude_name_substr=exec_id)
     if reason:
         # Fail fast via TYPED STATE — do NOT hand-write a marker into the skill's own verdict file.
         # (That Python-into-skill-file mutation was the multi-writer fragility G3 removes: sit_triage
