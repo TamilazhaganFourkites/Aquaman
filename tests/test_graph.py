@@ -1725,6 +1725,81 @@ def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
         cli._preflight()
 
 
+def test_sit_triage_reads_whether_the_rung_was_emitted_at_all(tmp_path, monkeypatch):
+    """The DETECTION, not just the label. `fidelity_rung` defaults to 0 and coerces to 0, so by the
+    time the validated verdict exists the difference between "absent" and "0" is gone — it has to be
+    read from the raw JSON, before validation. Without this test, hardcoding `_rung_emitted = True`
+    survives the whole suite."""
+    junit = tmp_path / "junit.xml"
+    junit.write_text('<testsuite tests="1" failures="0" errors="0"><testcase name="t"/></testsuite>')
+    monkeypatch.setattr(config, "automation_verdict_path", lambda tid: tmp_path / f"{tid}.json")
+
+    # sit_triage UNLINKS the verdict before calling the skill — its contract is that the SKILL
+    # writes it. Pre-seeding the file is not how the flow works, so the fake writes it, as the real
+    # ocean-automation-testing Station 3 does.
+    pending: dict = {}
+
+    async def _fake_skill(**kw):
+        (tmp_path / "MM-1.json").write_text(json.dumps(pending["verdict"]))
+
+    monkeypatch.setattr(agents, "run_skill", _fake_skill)
+    monkeypatch.setattr(telemetry, "station_event", lambda *a, **kw: None)
+    monkeypatch.setattr(ui, "milestone", lambda *a, **kw: None)
+
+    def _run(verdict: dict) -> dict:
+        pending["verdict"] = verdict
+        return asyncio.run(nodes.sit_triage({
+            "execution_id": "EXE-rung", "ticket_id": "MM-1",
+            "sit_junit_present": True, "sit_junit_path": str(junit),
+        }))
+
+    base = {"ticket_id": "MM-1", "automation_result": "passed", "execution_mode": "local-mock-first"}
+
+    out = _run({**base, "fidelity_rung": 2})
+    assert out["rung_emitted"] is True and out["fidelity_rung"] == 2
+
+    # Explicit 0 — a REAL measured trivial-green. Emitted, just low.
+    out = _run({**base, "fidelity_rung": 0})
+    assert out["rung_emitted"] is True and out["fidelity_rung"] == 0
+
+    # Absent — indistinguishable from the line above once validated, which is the whole problem.
+    out = _run(dict(base))
+    assert out["rung_emitted"] is False and out["fidelity_rung"] == 0
+
+    # A junk value IS emitted (the skill tried); it coerces to 0 but the contract was honoured.
+    out = _run({**base, "fidelity_rung": "nonsense"})
+    assert out["rung_emitted"] is True and out["fidelity_rung"] == 0
+
+
+def test_an_absent_fidelity_rung_is_not_reported_as_a_measured_trivial_green():
+    """`fidelity_rung` defaults to 0, coerces to 0, and `after_sit_triage` stops on 0 — so a skill
+    that never emits the field and a run that genuinely proved nothing produced the SAME stop with
+    the SAME label. They are different problems: one is ocean-automation-testing not honouring its
+    own contract (SKILL.md:689 marks the field REQUIRED on every PASS, and 0 of 18 recorded verdicts
+    carry it), the other is a fact about this ticket.
+
+    Only the LABEL differs — both still stop and leave the PR draft. The point is that an operator
+    can tell which fix is theirs."""
+    base = {"execution_id": "EXE-x", "ticket_id": "MM-1", "automation_result": "passed",
+            "fidelity_rung": 0, "branch": "MM-1/b", "pr_number": 7}
+
+    out = asyncio.run(nodes.stop_run({**base, "rung_emitted": False}))
+    assert "sit_fidelity_not_reported" in out["final_outcome"], out["final_outcome"]
+
+    out = asyncio.run(nodes.stop_run({**base, "rung_emitted": True}))
+    assert "trivial_green_no_signal" in out["final_outcome"], out["final_outcome"]
+
+    # Both are still "the SIT passed but proved nothing" — not a SIT failure — and both leave the PR.
+    for emitted in (True, False):
+        out = asyncio.run(nodes.stop_run({**base, "rung_emitted": emitted}))
+        assert out["final_outcome"].startswith("sit_unverified:"), out["final_outcome"]
+        assert out["ready_flipped"] is False and "left draft" in out["final_outcome"]
+
+    # Absent key (an older checkpoint) must not be read as "not emitted" and mislabel a real Rung 0.
+    out = asyncio.run(nodes.stop_run(dict(base)))
+    assert "trivial_green_no_signal" in out["final_outcome"]
+
+
 def test_domain_bucket_is_validated_not_merely_commented():
     """`route` is a Literal; `domain_bucket` was a bare `str` with its vocabulary in a COMMENT one
     line below it. A typo degraded to no-SME dispatch.
@@ -3253,7 +3328,10 @@ def test_quality_gate_state_keys_survive_the_schema():
     building gates exactly like this one."""
     from ocean_pipeline.state import OceanState
     for k in ("quality_gate_findings", "quality_gate_unverified", "quality_gate_checked_files",
-              "quality_gate_attempts", "quality_gate_stopped"):
+              "quality_gate_attempts", "quality_gate_stopped",
+              # C3: without this declaration sit_triage's write is dropped, stop_run never sees it,
+              # and an absent fidelity_rung silently re-merges with a real trivial-green.
+              "rung_emitted"):
         assert k in OceanState.__annotations__, k
 
 

@@ -131,6 +131,11 @@ class OceanState(TypedDict, total=False):
     # Finding 2 (②-a): non-empty when a Rung-2 claim could NOT be corroborated against the
     # mock's SUT-activity audit (older mock / no audit path). Declared here because LangGraph
     # silently drops any key a node returns that the schema does not know about.
+    # C3: was `fidelity_rung` actually EMITTED by the skill, or merely absent? Both arrive as 0 and
+    # both stop the run, so without this the operator cannot tell "the skill is not honouring its
+    # contract" (0 of 18 recorded verdicts carry the field, though SKILL.md marks it REQUIRED on
+    # every PASS) from "this ticket genuinely proved nothing". Different problems, different fixes.
+    rung_emitted: bool
     rung_corroboration: str
     ref_load_used: bool              # true iff the SIT used --ref-load real reference data
     sit_report: dict                 # tests[] / changed_repos[] / dependencies / evidence

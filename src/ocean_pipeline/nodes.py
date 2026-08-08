@@ -2192,6 +2192,18 @@ async def sit_triage(state: OceanState) -> dict:
     # model's field_validators coerce the known slips, but ANY residual schema violation must DOWNGRADE to
     # could_not_verify — never crash a run that actually executed the SIT. A present-but-invalid verdict is
     # treated exactly like a missing one.
+    # Was `fidelity_rung` EMITTED, or merely absent? Both currently arrive as 0 (the field defaults
+    # to 0 and `_coerce_fidelity_rung` maps anything unparseable to 0), and `after_sit_triage` stops
+    # on rung 0 — so "the skill never wrote the field" and "this run was genuinely trivial-green"
+    # produce an identical stop with an identical message. Those are completely different problems:
+    # one is a skill not honouring its own contract (SKILL.md:689 marks the field REQUIRED on every
+    # PASS, and 0 of 18 recorded verdicts carry it), the other is a real fidelity result about this
+    # ticket. Read the raw key BEFORE validation, where the difference still exists.
+    try:
+        _raw_verdict = json.loads(verdict_path.read_text())
+        _rung_emitted = isinstance(_raw_verdict, dict) and "fidelity_rung" in _raw_verdict
+    except Exception:  # noqa: BLE001 — the real parse below owns the error path
+        _rung_emitted = False
     try:
         v = schemas.AutomationVerdict.model_validate_json(verdict_path.read_text())
     except Exception as e:  # noqa: BLE001 — malformed/schema-invalid verdict → non-fatal could_not_verify
@@ -2295,6 +2307,15 @@ async def sit_triage(state: OceanState) -> dict:
             telemetry.station_event(exec_id, 6.4, "rung_capped_no_sut_activity",
                                     claimed=fidelity_rung, setup_writes=setup_writes)
             fidelity_rung = 0
+    # A PASS with no rung at all is a CONTRACT failure by the skill, not a fidelity result about
+    # this ticket. Say which one it is — the stop that follows looks identical either way.
+    if automation_result == "passed" and not _rung_emitted:
+        ui.milestone(
+            "the SIT verdict carries NO `fidelity_rung` — SKILL.md marks it REQUIRED on every PASS. "
+            "This run is treated as Rung 0 (needs a human, no ready-flip), but that is the SKILL not "
+            "reporting fidelity, NOT a measured trivial-green. Fix the emission in "
+            "ocean-automation-testing before reading anything into the rung.")
+        telemetry.station_event(exec_id, 6.4, "rung_not_emitted", automation_result=automation_result)
     telemetry.station_event(exec_id, 6.4, "end", automation_result=automation_result,
                             failure_class=failure_class, execution_mode=v.execution_mode,
                             needs_onboarding=v.needs_onboarding, graded_junit_sha=_junit_sha,  # F4: audit fingerprint
@@ -2305,6 +2326,7 @@ async def sit_triage(state: OceanState) -> dict:
         "failure_class": failure_class,
         "execution_mode": v.execution_mode,
         "fidelity_rung": fidelity_rung,
+        "rung_emitted": _rung_emitted,   # False => the 0 above is an ABSENT field, not a measurement
         "rung_corroboration": rung_corroboration,
         "ref_load_used": v.ref_load_used,
         "test_automation_pr_url": v.test_automation_pr_url,
@@ -2668,7 +2690,13 @@ async def stop_run(state: OceanState) -> dict:
     elif state.get("needs_onboarding"):
         reason, station = "repo_onboarding_exhausted", 6   # still unsupported after MAX_ONBOARD_ATTEMPTS
     elif trivial_green:
-        reason, station = "trivial_green_no_signal", 6
+        # Distinguish the two things that both arrive as rung 0. "The skill never emitted the field"
+        # is a contract defect in ocean-automation-testing; "the run proved nothing" is a fact about
+        # this ticket. They demand different work, and sharing one label meant every operator read
+        # the first as the second — with SKILL.md:689 marking the field REQUIRED and 0 of 18 recorded
+        # verdicts carrying it, the first is the far likelier reading today.
+        reason, station = ("sit_fidelity_not_reported" if not state.get("rung_emitted", True)
+                           else "trivial_green_no_signal"), 6
     elif review_stop_blocking:
         reason, station = "review_budget_exhausted_blocking_findings", 5
     elif review_stop_no_diff:
