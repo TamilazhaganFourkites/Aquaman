@@ -1725,6 +1725,31 @@ def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
         cli._preflight()
 
 
+def test_the_multi_repo_reporting_contract_is_stated_where_the_coder_reads_it():
+    """B2 — the upstream cause. `_service_slugs`' docstring has always asserted that the coder
+    reports `service_repo` comma-joined, and the splitting works. NOTHING TOLD THE CODER: the
+    schema comment said "the repo" and code.md said "the `repo` you pushed to", both singular.
+
+    So the likely multi-repo outcome was never "N-1 PRs ship unreviewed" (B1's framing) — it was
+    ONE PR plus an orphaned branch on every other repo, with the ticket reading as delivered. That
+    is a worse failure and a one-line prose fix, and until it is fixed B1's symptom is mostly
+    unreachable, which is why it goes first."""
+    assert nodes._service_slugs({"service_repo": "org/a, org/b"}) == ["org/a", "org/b"]
+    assert nodes._service_slugs({"service_repo": " org/a ,org/b , org/c "}) == ["org/a", "org/b", "org/c"]
+
+    # The instruction must exist where the coder actually reads it, not only in the graph's docstring.
+    code_md = config.OCEAN_WORKERS_DIR / "code.md"
+    if not code_md.exists():                      # cross-repo: skip rather than fail a checkout
+        pytest.skip(f"fk-aideveloper worker not present at {code_md}")
+    text = code_md.read_text()
+    assert "comma-separated" in text, "code.md never tells the coder to report multiple repos"
+    assert "orphan" in text.lower(), "code.md does not state the cost of under-reporting"
+
+    schema_src = Path(schemas.__file__).read_text()
+    assert "comma-separated when there is more than one" in schema_src, (
+        "CoderVerdict.repo still documents itself as singular")
+
+
 def test_sit_triage_reads_whether_the_rung_was_emitted_at_all(tmp_path, monkeypatch):
     """The DETECTION, not just the label. `fidelity_rung` defaults to 0 and coerces to 0, so by the
     time the validated verdict exists the difference between "absent" and "0" is gone — it has to be

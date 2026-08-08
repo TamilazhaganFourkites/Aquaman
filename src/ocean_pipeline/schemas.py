@@ -116,7 +116,13 @@ class CoderVerdict(BaseModel):
     files_changed: int = 0
     # The graph opens the PR itself (deterministic code), so the coder only reports WHICH repo
     # it pushed to and the human-readable title/body to use — it never runs `gh pr create`.
-    repo: str = ""            # owner/name (or bare name) of the repo the branch was pushed to
+    # EVERY repo the branch was pushed to, comma-separated when there is more than one
+    # ("cloudqwest/ocean-worker, cloudqwest/tracking-service"). `nodes._service_slugs` splits this
+    # and opens one PR per repo — its docstring has always asserted the comma-joined contract, but
+    # NOTHING TOLD THE CODER: this comment said "the repo" (singular) and code.md said "the `repo`
+    # you pushed to". So the likely multi-repo outcome was never "N-1 PRs ship unreviewed" — it was
+    # one PR plus an ORPHANED branch on every other repo, with the ticket reading as delivered.
+    repo: str = ""
     repo_dir: str = ""        # absolute path of the local clone (reviewer + rework run here)
     pr_title: str = ""        # PR title the open_pr code node will use
     pr_body: str = ""         # PR body the open_pr code node will use
