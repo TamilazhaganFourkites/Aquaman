@@ -16,12 +16,49 @@ from pydantic import BaseModel, Field, computed_field, field_validator, model_va
 
 
 # ---- generic per-node verdicts (written via run_agent's contract) -------
+# The ocean domain buckets, in ONE place. `nodes._SME_BY_BUCKET` maps each to its SME file and is
+# asserted against this set at import (nodes.py) — a bucket added to one and not the other is the
+# fork class this codebase keeps rediscovering, and it degrades silently to "no SME dispatched".
+# Lives here rather than in nodes.py because nodes imports schemas, not the reverse.
+DOMAIN_BUCKETS: frozenset[str] = frozenset({
+    "callback_notification",
+    "load_creation",
+    "ocean_tracking_milestones",
+    "ocean_data_quality",
+    "jt_data_quality",
+    "event_processing_failure",
+})
+
+
 class ResearchVerdict(BaseModel):
     route: Literal["coding", "rca", "sop", "loft", "ff_onboarding", "unclassified"]
     packet_path: str
     target_repos: list[dict]              # [{repo, language, build_env, branch}]
     # Ocean domain the ticket touches, so the graph can consult the right SME node.
-    domain_bucket: str = ""               # callback_notification | load_creation | ocean_tracking_milestones | ocean_data_quality | jt_data_quality | event_processing_failure | ""
+    # Validated below — this used to be a bare `str` whose vocabulary lived in a COMMENT, one line
+    # under `route`, which IS a Literal.
+    domain_bucket: str = ""
+
+    @field_validator("domain_bucket", mode="before")
+    @classmethod
+    def _canonical_bucket(cls, v):
+        """Canonicalize to a known bucket, or "" — never raise.
+
+        NOT a `Literal`, deliberately, even though `route` above is one. This value is LLM-authored:
+        a Literal makes a single typo a ValidationError that fail-parses the ENTIRE ResearchVerdict,
+        losing the route, the packet path and the target repos along with it. That is a strictly
+        worse outcome than the defect it would prevent, and it is the failure mode every validator in
+        this file is written to avoid.
+
+        So near-misses are RECOVERED (case, hyphens, surrounding whitespace/punctuation) and anything
+        still unrecognised degrades to "" — which `sme_consult` already handles: no SME is dispatched
+        and a `skip` station_event records the bucket it could not match. The consequence of a real
+        typo is unchanged (no SME); what changes is that `Ocean_Data-Quality` now finds its SME
+        instead of silently skipping it."""
+        if not isinstance(v, str):
+            return ""
+        token = v.strip().strip(".,;:'\"`").lower().replace("-", "_").replace(" ", "_")
+        return token if token in DOMAIN_BUCKETS else ""
 
 
 class SmeVerdict(BaseModel):

@@ -1725,6 +1725,44 @@ def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
         cli._preflight()
 
 
+def test_domain_bucket_is_validated_not_merely_commented():
+    """`route` is a Literal; `domain_bucket` was a bare `str` with its vocabulary in a COMMENT one
+    line below it. A typo degraded to no-SME dispatch.
+
+    The fix must NOT be a Literal: this value is LLM-authored, and a Literal turns one typo into a
+    ValidationError that fail-parses the whole ResearchVerdict — losing route, packet_path and
+    target_repos too. Near-misses are recovered; anything genuinely unknown still degrades to "" and
+    is telemetered as a skip, exactly as before."""
+    mk = lambda b: schemas.ResearchVerdict(route="coding", packet_path="/x",  # noqa: E731
+                                           target_repos=[], domain_bucket=b).domain_bucket
+    for raw, want in (("ocean_data_quality", "ocean_data_quality"),
+                      ("Ocean_Data-Quality", "ocean_data_quality"),
+                      (" JT Data Quality ", "jt_data_quality"),
+                      ("EVENT-PROCESSING-FAILURE", "event_processing_failure"),
+                      ("callback_notification.", "callback_notification")):
+        assert mk(raw) == want, raw
+
+    # Unrecognised degrades, never raises — and never fail-parses its siblings.
+    for bad in ("ocean_data_qualty", "banana", "", None, 42, ["x"]):
+        assert mk(bad) == ""
+    v = schemas.ResearchVerdict(route="coding", packet_path="/p", target_repos=[{"repo": "r"}],
+                                domain_bucket="nonsense")
+    assert v.route == "coding" and v.packet_path == "/p" and v.target_repos == [{"repo": "r"}], (
+        "a bad bucket must not take the rest of the verdict with it")
+
+
+def test_the_bucket_vocabulary_and_the_sme_map_cannot_drift():
+    """One vocabulary, two consumers, checked at import. A bucket present in one and absent from the
+    other fails SILENTLY at runtime — `_SME_BY_BUCKET.get()` misses, no SME is consulted, and the run
+    continues on a `skip` event nobody watches. Same fork class as the preflight list."""
+    assert set(nodes._SME_BY_BUCKET) == set(schemas.DOMAIN_BUCKETS)
+    # Every bucket resolves to a distinct SME file — a copy-paste in the map is as bad as a gap.
+    assert len(set(nodes._SME_BY_BUCKET.values())) == len(nodes._SME_BY_BUCKET)
+    # And the guard is a real import-time assertion, not a comment describing one.
+    src = Path(nodes.__file__).read_text()
+    assert "assert set(_SME_BY_BUCKET) == set(schemas.DOMAIN_BUCKETS)" in src
+
+
 # ------------------------------------------------- C6: the four untested gate routers
 def test_after_human_gate_never_reads_another_gates_decision_as_approval():
     """THE defect this whole item is about, and it was irreversible.
@@ -2325,6 +2363,63 @@ class _FakeGhProc:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+def test_a_closed_pr_is_never_reused_as_the_deliverable(monkeypatch):
+    """This one actually fired, three times. `find_pr_for_branch` asked for `--state all` and
+    `--json number,state` and then DISCARDED the state, so PR #3088 — declined by a human — was
+    handed back as the result by three separate later runs. The pipeline reported a delivery
+    against a PR that same human had already rejected.
+
+    Filtering alone would only turn a wrong answer into no answer, so `open_draft_pr` must open a
+    NEW one when every existing PR is finished with."""
+    def _listing(prs):
+        def fake_run(cmd, **kw):
+            if "list" in cmd:
+                return _FakeGhProc(stdout=json.dumps(prs))
+            return _FakeGhProc(stdout="")
+        return fake_run
+
+    for state in ("CLOSED", "MERGED", "closed"):
+        monkeypatch.setattr(subprocess, "run", _listing([{"number": 3088, "state": state}]))
+        assert gitops.find_pr_for_branch("org/repo", "MM-1/b") is None, (
+            f"a {state} PR was offered for reuse — it is finished with")
+
+    # An OPEN one is still reused (the idempotency guard the rework loop depends on).
+    monkeypatch.setattr(subprocess, "run", _listing([{"number": 42, "state": "OPEN"}]))
+    assert gitops.find_pr_for_branch("org/repo", "MM-1/b") == 42
+
+    # A dead PR alongside a live one must not shadow the live one, whatever the order.
+    monkeypatch.setattr(subprocess, "run",
+                        _listing([{"number": 3088, "state": "CLOSED"}, {"number": 99, "state": "OPEN"}]))
+    assert gitops.find_pr_for_branch("org/repo", "MM-1/b") == 99
+
+
+def test_open_draft_pr_opens_a_new_one_when_the_old_is_closed(monkeypatch):
+    """The "closed -> open a new one" branch. Without it, filtering by state would leave a run with
+    no PR at all — a different failure, not a fix."""
+    calls = []
+    state = {"prs": [{"number": 3088, "state": "CLOSED"}]}
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if "list" in cmd:
+            return _FakeGhProc(stdout=json.dumps(state["prs"]))
+        if "create" in cmd:
+            state["prs"] = state["prs"] + [{"number": 4001, "state": "OPEN"}]
+            return _FakeGhProc(stdout="")
+        return _FakeGhProc(stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    num = gitops.open_draft_pr("org/repo", "MM-1/b", "t", "b")
+    assert num == 4001, "a declined PR must be replaced, not reported"
+    assert any("create" in c for c in calls), "no new PR was opened"
+
+    # And an OPEN one short-circuits without creating anything.
+    calls.clear()
+    state["prs"] = [{"number": 42, "state": "OPEN"}]
+    assert gitops.open_draft_pr("org/repo", "MM-1/b", "t", "b") == 42
+    assert not any("create" in c for c in calls), "reused an open PR but still created one"
 
 
 def test_find_pr_for_branch_returns_none_when_no_pr(monkeypatch):

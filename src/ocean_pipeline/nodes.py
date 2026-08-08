@@ -628,6 +628,18 @@ _SME_BY_BUCKET = {
     "event_processing_failure": "sme-event-processing-failure.md",
 }
 
+# BOOT CHECK. The bucket vocabulary lives in schemas.DOMAIN_BUCKETS (the ResearchVerdict validator
+# canonicalizes against it); this map turns each bucket into the SME file to dispatch. A bucket in
+# one and not the other fails SILENTLY at runtime — `_SME_BY_BUCKET.get()` misses, no SME is
+# consulted, and the run continues with a `skip` event nobody is watching. That is the same fork
+# class as the preflight list and the SME/RCA drift, so it fails at IMPORT instead: an assertion
+# here is noticed by the first test run and by `ocean-pipeline --print-graph`, long before a ticket
+# is routed to a bucket that dispatches nothing.
+assert set(_SME_BY_BUCKET) == set(schemas.DOMAIN_BUCKETS), (
+    "domain buckets disagree — schemas.DOMAIN_BUCKETS and nodes._SME_BY_BUCKET must match. "
+    f"only in schemas: {sorted(set(schemas.DOMAIN_BUCKETS) - set(_SME_BY_BUCKET))}; "
+    f"only in the SME map: {sorted(set(_SME_BY_BUCKET) - set(schemas.DOMAIN_BUCKETS))}")
+
 
 async def sme_consult(state: OceanState) -> dict:
     """Graph-owned SME dispatch: the graph (not the researcher) picks the ocean domain SME by

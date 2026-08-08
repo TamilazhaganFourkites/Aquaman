@@ -101,20 +101,52 @@ def sync_local_checkout(slug: str) -> str:
         return f"skip: {name} git sync error ({e})"
 
 
+# A PR in one of these states is finished with — reusing it as this run's deliverable means
+# reporting work against something a human already declined or already landed.
+_DEAD_PR_STATES = frozenset({"CLOSED", "MERGED"})
+
+
 def find_pr_for_branch(slug: str, branch: str) -> int | None:
-    """Return an existing PR number for `branch` (any state), or None. Idempotency guard so a
-    rework loop or a re-run never opens a second PR for the same branch."""
+    """An OPEN PR number for `branch`, or None. The idempotency guard for the rework loop.
+
+    It asked for `--state all` and `--json number,state` and then THREW THE STATE AWAY, so a
+    CLOSED PR was reused as the deliverable. That is not hypothetical: PR #3088 was declined
+    (MM-14060-20260801-233046.log:110) and three separate later runs reported it as their result
+    (0801-104256:474, 0802-071612:580, 0803-153623:416) — the pipeline told a human it had
+    delivered a PR that same human had already rejected.
+
+    Still queries `--state all` rather than `--state open`: the caller needs to distinguish "no PR
+    exists" from "a dead one does", because those want different actions and only one of them is
+    worth logging. See `open_draft_pr`."""
+    return _find_pr(slug, branch)[0]
+
+
+def _find_pr(slug: str, branch: str) -> tuple[int | None, list[dict]]:
+    """(reusable open PR number or None, every PR found for the branch)."""
     out = _gh(["pr", "list", "--repo", slug, "--head", branch, "--state", "all",
                "--json", "number,state"])
-    prs = json.loads(out or "[]")
-    return int(prs[0]["number"]) if prs else None
+    prs = [p for p in json.loads(out or "[]") if isinstance(p, dict)]
+    live = [p for p in prs if str(p.get("state", "")).upper() not in _DEAD_PR_STATES]
+    return (int(live[0]["number"]) if live else None), prs
 
 
 def open_draft_pr(slug: str, branch: str, title: str, body: str) -> int:
-    """Idempotently open (or reuse) a DRAFT PR for `branch` on `slug`; return its number."""
-    existing = find_pr_for_branch(slug, branch)
+    """Idempotently open (or reuse) a DRAFT PR for `branch` on `slug`; return its number.
+
+    Reuse means an OPEN PR. If every PR for this branch is closed or merged, a NEW one is opened —
+    dropping the state filter would otherwise silently hand back a declined PR as the deliverable
+    (see `find_pr_for_branch`). This is the "closed -> open a new one" branch that filtering
+    requires: without it the state filter would just turn a wrong answer into no answer."""
+    existing, all_prs = _find_pr(slug, branch)
     if existing is not None:
         return existing
+    if all_prs:
+        # Say so. A silent re-open looks identical to a first-ever open in the log, and the fact
+        # that a human already closed a PR for this exact branch is the most interesting thing
+        # about the run at that moment.
+        dead = ", ".join(f"#{p.get('number')} {p.get('state')}" for p in all_prs)
+        print(f"[gitops] {slug} {branch}: existing PR(s) are finished with ({dead}) — "
+              f"opening a NEW draft PR rather than reporting a closed one as the deliverable")
     _gh(["pr", "create", "--repo", slug, "--head", branch, "--draft",
          "--title", title, "--body", body])
     num = find_pr_for_branch(slug, branch)
