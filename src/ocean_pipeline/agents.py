@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel
 
-from . import config, lessons, metrics, ui
+from . import config, lessons, metrics, telemetry, ui
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -684,11 +684,19 @@ def _station_mcp_config() -> dict | None:
 
 # Finding 3: identity of the ticket this PROCESS is driving, for keying tool-failure lessons. A
 # module-level context is correct here rather than threading four new params through ~20 call sites:
-# `ocean-pipeline` runs exactly one ticket per process (cli.py::_execute; the Monitor spawns a separate
-# subprocess per ticket), so there is only ever one live run to describe. Set by nodes.researcher once
+# `ocean-pipeline` runs exactly one ticket AT A TIME per process (cli.py::_execute drives one; the
+# Monitor spawns a separate subprocess per ticket; `qa_batch.run_batch` drives N tickets in one
+# process but STRICTLY SEQUENTIALLY — see its docstring — and `nodes._summary` re-sets this context
+# at the start of every station, so each ticket overwrites it before any worker reads it),
+# so there is only ever one live run to describe. Set by nodes.researcher once
 # the domain bucket is known — before that, `domain_bucket` is "" and the capture hook stays off,
 # because a lesson with no domain to key on is not recallable by a later ticket anyway.
 _RUN_CONTEXT: dict[str, str] = {"domain_bucket": "", "ticket_id": "", "execution_id": ""}
+
+# Per-label token tally from the LAST _drive, written in its `finally` so it survives an
+# exception. Read only by the retry loop's already-succeeded path (F10) — a station whose
+# work completed before a teardown blip must still report what it spent.
+_LAST_TALLY: dict[str, tuple[int, int, int]] = {}
 
 
 def set_run_context(*, domain_bucket: str = "", ticket_id: str = "", execution_id: str = "") -> None:
@@ -744,7 +752,7 @@ def _capture_tool_failure(node: str):
 
 async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str,
                  label: str = "station", allowed_tools: list[str] | None = None,
-                 model: str | None = None) -> None:
+                 model: str | None = None) -> tuple[int, int, int]:
     # Imported lazily so the graph/routing test suite runs without the SDK (or the
     # `claude` CLI it spawns) installed — the SDK is only needed at actual run time.
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, query
@@ -830,10 +838,18 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
     finally:
         if logf is not None:
             logf.close()
+        # Stash the tally HERE, in the finally, so it survives an exception. The retry loop's
+        # "transient error after the verdict was already written" path returns without _drive ever
+        # reaching its `return` — and that is the most expensive station there is (all the work done,
+        # then a teardown blip). Without this its entire spend was lost.
+        _LAST_TALLY[label] = (in_tok, out_tok, tools)
     spend = metrics.fmt(in_tok, out_tok, tools)
     if spend:
         ui.milestone(f"done — {spend}")
     metrics.add(in_tok, out_tok, tools)
+    # Hand the tally back so the caller can PERSIST it per station (F10). These numbers were already
+    # being computed here for the console line above; they simply had nowhere to go.
+    return in_tok, out_tok, tools
 
 
 def _looks_like_complete_json(path: Path) -> bool:
@@ -853,7 +869,7 @@ async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
                             permission_mode: str, label: str,
                             allowed_tools: list[str] | None = None,
                             verdict_path: Path | None = None,
-                            model: str | None = None) -> None:
+                            model: str | None = None) -> tuple[int, int, int]:
     """Run the worker, retrying on any transient SDK/CLI failure with exponential backoff.
 
     A single claude-CLI ProcessError (e.g. the `Claude Code returned an error result: ...`
@@ -877,16 +893,27 @@ async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
     transient error right after THAT wrongly read as "done" and skip retrying a station that
     actually never finished. A real, fully-written verdict is always valid JSON at minimum (schema
     validation is the caller's job once this returns); a still-truncated one almost never is."""
+    # Drop any tally a PRIOR invocation left under this label before the first attempt. `_drive`
+    # writes `_LAST_TALLY[label]` in its `finally`, so it is normally fresh — but a failure BEFORE
+    # that `try` is entered (lazy SDK import, ClaudeAgentOptions construction) never reaches the
+    # `finally`, and `qa_batch.run_batch` drives N tickets sequentially in ONE process, so without
+    # this the already-succeeded path below could hand back a previous ticket's spend for the same
+    # station label. Zeros are the honest answer when nothing was accumulated (judge review).
+    _LAST_TALLY.pop(label, None)
     last: Exception | None = None
     for attempt in range(config.MAX_AGENT_RETRIES + 1):
         try:
-            await _drive(system_prompt, prompt, cwd, permission_mode, label, allowed_tools, model)
-            return
+            return await _drive(system_prompt, prompt, cwd, permission_mode, label, allowed_tools, model)
         except Exception as e:  # noqa: BLE001 — retry ANY transport/SDK failure
             if verdict_path is not None and _looks_like_complete_json(verdict_path):
                 ui.milestone(f"transient error ({type(e).__name__}) after the verdict was already "
                              f"written — ignoring it, not re-driving the station")
-                return
+                # NOT (0,0,0): this is the station that did ALL of its work and then hit a teardown
+                # blip — the most expensive case there is. Returning zeros made station_spend
+                # early-return and write no row at all, so F10 systematically under-reported exactly
+                # the stations that cost the most. `_drive` already added the real tally to
+                # metrics; hand back what it accumulated.
+                return _LAST_TALLY.get(label, (0, 0, 0))
             if _is_quota_error(e):
                 # MM-14793 (I2): the org's spend pool is dry — every subsequent attempt hits the
                 # identical wall (run-monitoring-findings.md: "every subsequent station call just
@@ -992,7 +1019,7 @@ async def run_agent(
         schema=json.dumps(verdict_model.model_json_schema(), indent=2),
     )
     try:
-        await _drive_with_retry(
+        _spend = await _drive_with_retry(
             system_prompt=_read(path),
             prompt=f"{guardrails}\n\n{task_prompt}\n{contract}",
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
@@ -1003,6 +1030,15 @@ async def run_agent(
             verdict_path=verdict_path,
             model=model,
         )
+        # F10: persist the per-station spend. This sits INSIDE the try, so it is emphatically not
+        # "never in the failure path" — an earlier version of this comment claimed that and a
+        # NameError here duly converted completed stations into failed ones. Guarded explicitly
+        # instead: recording spend must never be able to fail a station that did its work.
+        try:
+            telemetry.station_spend(execution_id, node, *(_spend or (0, 0, 0)),
+                                    model=model or config.STATION_MODEL)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         if not verdict_path.exists():
             _capture_partial(node, execution_id, cwd)   # SDK crash / timeout with no verdict (full probe)
@@ -1021,7 +1057,7 @@ async def run_agent(
         # instruction to finish synchronously, before failing the station.
         _emit(node, "no verdict on first turn — re-driving once (finish synchronously, no background-and-yield)")
         try:
-            await _drive_with_retry(
+            _spend2 = await _drive_with_retry(
                 system_prompt=_read(path),
                 prompt=(
                     f"{guardrails}\n\nYou ENDED YOUR TURN without writing the required verdict to "
@@ -1038,6 +1074,13 @@ async def run_agent(
                 verdict_path=verdict_path,
                 model=model,
             )
+            # The re-drive is EXTRA spend on the SAME station, not a new one — record it under the
+            # same name so a station's cost reflects what it actually consumed.
+            try:
+                telemetry.station_spend(execution_id, node, *(_spend2 or (0, 0, 0)),
+                                        model=model or config.STATION_MODEL)
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
             if not verdict_path.exists():
                 _capture_partial(node, execution_id, cwd)
@@ -1083,7 +1126,7 @@ async def run_skill(
     skill_md = config.FK_AIDEVELOPER_DIR / "skills" / skill_name / "SKILL.md"
     guardrails = AGENT_GUARDRAILS.format(ticket_id=ticket_id)
     try:
-        await _drive_with_retry(
+        _spend3 = await _drive_with_retry(
             system_prompt=_read(skill_md),
             prompt=f"{guardrails}\n\n{task_prompt}",
             cwd=cwd or config.FK_AIDEVELOPER_DIR,
@@ -1093,6 +1136,19 @@ async def run_skill(
             verdict_path=verdict_path,
             model=model,
         )
+        # `run_skill` has NO execution_id parameter — this line was copy-pasted from run_agent and
+        # raised NameError inside the try, which `except Exception` converted to StationError. Every
+        # skill station (qa_scenarios, sit_resolve, sit_author, sit_run, sit_testrail, sit_triage,
+        # learn_repo — 7 of 14) finished all of its real work and was then reported FAILED. The suite
+        # stayed green because the only test guarding it matched SOURCE TEXT instead of running the
+        # function. Use the run context the lessons store already maintains; skip if it is unset.
+        _exec = _RUN_CONTEXT.get("execution_id") or ""
+        if _exec:
+            try:
+                telemetry.station_spend(_exec, node, *(_spend3 or (0, 0, 0)),
+                                        model=model or config.STATION_MODEL)
+            except Exception:  # noqa: BLE001
+                pass
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
         raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}",
                             quota_exhausted=_is_quota_error(e)) from e

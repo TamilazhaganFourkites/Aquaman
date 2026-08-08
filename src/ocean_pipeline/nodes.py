@@ -2709,7 +2709,14 @@ async def rca_agent(state: OceanState) -> dict:
             f"containing the REQUIRED literal line `INDEPENDENT STATUS CHECK: <the query/log check you "
             f"ran to verify the reporter's own premise + its result, or 'N/A: <why there is no "
             f"verifiable premise>'>` — the graph mechanically checks for this and REFUSES to post a "
-            f"report without it (reporter-premise-acceptance hard gate), "
+            f"report without it (reporter-premise-acceptance hard gate), AND the REQUIRED literal "
+            f"line `DISCRIMINATOR: <the check you ran that SEPARATES this root cause from its "
+            f"nearest rival + its result, or 'N/A: <why only one mechanism was plausible>'>` — a "
+            f"SECOND mechanically-checked gate for a DIFFERENT bias (adjacent-mechanism-confidence: "
+            f"naming a real, adjacent mechanism that plausibly fits and stopping, without running "
+            f"what would tell it from the mechanism actually responsible). If both hypotheses "
+            f"predict the same observation it is not a discriminator; answer insufficient_evidence "
+            f"rather than inventing one, "
             f"(4) Impact, (5) Fix, (6) Prevention, (7) Adversarial Self-Critique — the Step 5.5 output: "
             f"every `investigator-bias` entry from skills/ocean-rca/eval/bias-registry.json, the "
             f"specific check performed against THIS hypothesis, and the verdict. Do NOT post to Jira "
@@ -2895,7 +2902,12 @@ async def rca_done(state: OceanState) -> dict:
     # "delivered" there is the same class of false-completeness the RCA guardrails exist to prevent.
     gate = state.get("rca_report_gate_problems") or []
     if gate:
-        telemetry.station_event(state["execution_id"], 0.1, "done", fix_needed=False,
+        # NOT "done" — this branch RETURNS final_status="failed". Sharing the phase with the posted
+        # branch below made `_STATUS["done"] = "completed"` mark the station completed on a run that
+        # failed, so `stations_completed_list` listed rca_router while `stations_failed_list` was
+        # empty. The comment above was already about exactly this class of false completeness; the
+        # telemetry status is the same claim in another column (judge review).
+        telemetry.station_event(state["execution_id"], 0.1, "gate_refused", fix_needed=False,
                                 report_posted=False, gate_problems=len(gate))
         return {"final_status": "failed",
                 "final_outcome": (f"rca_report_NOT_delivered: the report failed its own quality gate "

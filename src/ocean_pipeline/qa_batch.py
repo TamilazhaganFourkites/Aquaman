@@ -114,19 +114,45 @@ async def run_one(ticket_id: str) -> dict:
     "never resumed mid-run" above), silently defeating the entire unattended-sweep purpose."""
     config.QA_REVIEW_AUTO = True
     execution_id = telemetry.new_execution_id()
-    telemetry.station_event(execution_id, 6, "qa_batch_start", ticket_id=ticket_id)
-    app = build_qa_subgraph().compile()
-    initial: OceanState = {
-        "ticket_id": ticket_id, "execution_id": execution_id, "profile": "isbu", "context": "",
-        "coding_attempts": 0, "sit_findings": [],
-    }
-    thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": 50}
-    handler = tracing.callback_handler()
-    if handler is not None:
-        thread = {**thread, "callbacks": [handler], "run_name": ticket_id,
-                 "metadata": {"langfuse_session_id": execution_id,
-                              "langfuse_tags": ["aquaman", "qa-batch", ticket_id]}}
+    # 0.05, not 6: a bare `6` is `6.0` as a dict key, which is `sit_resolve` — so every batch marker
+    # used to file itself under a real station it has nothing to do with. See telemetry's entry for
+    # why the replacement sorts BELOW the pipeline rather than above it (judge review).
+    # Guarded like its sibling in the `finally`: `station_event` sets `_station_t0` BEFORE it
+    # dispatches, and the dispatch can raise (`cannot schedule new futures after shutdown`), which
+    # would abort the sweep on ticket 1 AND leak the timer it just opened. Telemetry must never be
+    # able to stop the batch — that rule was applied to the terminal event and not to this one.
     try:
+        telemetry.station_event(execution_id, 0.05, "qa_batch_start", ticket_id=ticket_id)
+    except Exception:  # noqa: BLE001
+        pass
+    # EVERYTHING after the start event is inside the try/finally below — including graph compilation
+    # and `tracing.callback_handler()`. Both used to sit out here, between the open and the try, so a
+    # raise from either left the station open forever AND propagated out of `run_one`, aborting the
+    # whole unattended sweep on ticket 1. That is reachable, not theoretical: `callback_handler`
+    # loads secrets and resolves a host, unguarded. A judge measured both
+    # (`phases=['qa_batch_start'], station_closed=False`) and it falsified this function's own
+    # "always closes the qa_batch_start it opened" claim.
+    #
+    # `final` is BOUND FIRST, because the `finally` reads it. `except Exception` does NOT catch
+    # CancelledError or KeyboardInterrupt (both BaseException), so on Ctrl-C `final` was never
+    # assigned and the finally raised UnboundLocalError — which replaced the cancellation with an
+    # Aquaman bug, still left the station open (the raise happens BEFORE the station_event), and
+    # broke `run_batch`'s "one ticket's failure never stops the rest" invariant. Caught by a judge on
+    # the exact case the comment below cites as fixed.
+    final: dict = {"final_status": "failed", "final_outcome": "run_one did not complete"}
+    handler = None
+    try:
+        app = build_qa_subgraph().compile()
+        initial: OceanState = {
+            "ticket_id": ticket_id, "execution_id": execution_id, "profile": "isbu", "context": "",
+            "coding_attempts": 0, "sit_findings": [],
+        }
+        thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": 50}
+        handler = tracing.callback_handler()
+        if handler is not None:
+            thread = {**thread, "callbacks": [handler], "run_name": ticket_id,
+                      "metadata": {"langfuse_session_id": execution_id,
+                                   "langfuse_tags": ["aquaman", "qa-batch", ticket_id]}}
         final = await app.ainvoke(initial, config=thread)
     except Exception as e:  # noqa: BLE001 — one ticket's crash must not abort the batch
         final = {"final_status": "failed", "final_outcome": f"{type(e).__name__}: {e}"}
@@ -145,9 +171,32 @@ async def run_one(ticket_id: str) -> dict:
         except Exception:  # noqa: BLE001 — never let cleanup fail the ticket
             pass
         if handler is not None:
-            tracing.flush()
-    telemetry.station_event(execution_id, 6, "qa_batch_end",
-                            final_status=final.get("final_status"))
+            tracing.flush()      # already total: `tracing.flush` wraps its whole body in except-pass
+        # INSIDE the finally, so an exception from `ainvoke` — including a BaseException such as
+        # Ctrl-C — still closes the `qa_batch_start` this function opened. Outside it, the station
+        # leaked with no duration on every non-Exception exit.
+        #
+        # NOT unconditional, and the earlier version of this comment overclaimed: the cleanup above
+        # is guarded with `except Exception`, so a KeyboardInterrupt raised INSIDE the cleanup skips
+        # the rest of this block and the station does leak. (A CancelledError cannot land there —
+        # there is no `await` in this `finally`.) Measured; stated rather than papered over.
+        #
+        # The phase must reflect the OUTCOME, not merely that the wrapper returned. An unconditional
+        # "qa_batch_end" wrote status='completed' for a batch item that failed at sit_run — the same
+        # false-completeness defect the `done`/`gate_refused` split fixed one file over, and passing
+        # final_status as free text does not fix it because no aggregate reads free text.
+        # ALLOW-list, not a deny-list: anything that is not an explicit success is recorded as a
+        # failure. The deny-list version mapped "", None, "error", "blocked" and every future status
+        # to `completed` — the exact false-completeness this event exists to prevent. Latent today
+        # (this subgraph's only terminal node emits completed/failed), which is precisely when it is
+        # cheap to make failure-closed.
+        _failed = str(final.get("final_status") or "").lower() != "completed"
+        try:
+            telemetry.station_event(execution_id, 0.05,
+                                    "qa_batch_failed" if _failed else "qa_batch_end",
+                                    final_status=final.get("final_status"))
+        except Exception:  # noqa: BLE001 — telemetry must never abort the sweep; it is the only
+            pass           # unguarded call left in this finally, and both neighbours are guarded
     return {"ticket_id": ticket_id, "execution_id": execution_id, **final}
 
 

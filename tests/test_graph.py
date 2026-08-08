@@ -23,13 +23,15 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import types
 import urllib.request
 from pathlib import Path
 
 import pytest
 
 from ocean_pipeline import agents, config, gitops, graph, jira, metrics, nodes, report, schemas, telemetry, tracing, ui
-from ocean_pipeline import cli
+from ocean_pipeline import cli, qa_batch
 
 
 class Script:
@@ -1247,6 +1249,10 @@ The VD callback should have fired; it did not. Divergence at the dispatcher.
 - Subscription gap: ruled out — subscription active per log line at 14:02.
 INDEPENDENT STATUS CHECK: ran `select status from loads where id=123` -> status was NULL, so the
 reporter's premise (no callback delivered) is confirmed, not assumed.
+DISCRIMINATOR: the nearest rival was the subscription-gap path. Queried the subscription table for
+this shipper -> active throughout the window, so a gap predicts NO delivery for ANY stop type while
+we observe delivery for every stop type EXCEPT transfer. That splits the two; the dispatcher path is
+the one responsible.
 ## Root Cause
 `dispatcher.rb:88` skips VD when stop_type is transfer; PR #123's diff read and confirmed.
 ## Impact
@@ -1365,6 +1371,34 @@ def test_rca_report_refuses_to_post_a_report_missing_its_own_gates(tmp_path, mon
         "INDEPENDENT STATUS CHECK: ran `select status from loads where id=123` -> status was NULL, so the",
         "INDEPENDENT STATUS CHECK: N/A - internal crash report, no customer-visible premise to verify. The"))
     assert len(posted) == 1 and out["rca_report_gate_problems"] == []
+
+    # Complete EXCEPT the DISCRIMINATOR hard gate (Finding 4) -> refused. Distinct bias from the one
+    # above: adjacent-mechanism-confidence (recurrence 16, the highest investigator bias) is naming a
+    # REAL adjacent mechanism and stopping, without running what would tell it from the actual cause.
+    #
+    # DELIBERATELY LAST, so the conditional skip below cannot take the assertions above with it. In
+    # its first position the skip silently dropped the two INDEPENDENT-STATUS-CHECK cases too —
+    # neither of which involves DISCRIMINATOR, and both of which pass against an old checker.
+    #
+    # CROSS-REPO: this assertion needs fk-aideveloper's checker to KNOW about DISCRIMINATOR, and
+    # `nodes.rca_report` shells out to whatever is at `config.FK_AIDEVELOPER_DIR` — the live tree,
+    # not a pinned copy.
+    #
+    # MERGE ORDER — **land Aquaman FIRST**, and see `docs/MERGE-ORDER.md`. Measured both windows:
+    # fk-aideveloper-first puts the new checker in front of the OLD prompt, so every report is
+    # refused, the gate fails closed and every Ocean RCA run fails for the duration. Aquaman-first is
+    # harmless — the old checker simply ignores the new field. Three earlier reviews recommended the
+    # opposite by reasoning from THIS TEST rather than from production. The skip below removes the
+    # pressure that caused that mistake (the test no longer FAILS in the safe order); it does NOT
+    # make the dangerous order safe. Nothing here can protect production — only the merge order can.
+    _checker = config.FK_AIDEVELOPER_DIR / "skills" / "ocean-rca" / "tools" / "check_rca_report.py"
+    if _checker.exists() and "DISCRIMINATOR" not in _checker.read_text():
+        pytest.skip("live fk-aideveloper checker predates the DISCRIMINATOR gate — expected while "
+                    "Aquaman is landed first; re-enables itself once fk-aideveloper lands")
+    out = _run("\n".join(l for l in _COMPLETE_RCA_REPORT.splitlines()
+                         if not l.startswith("DISCRIMINATOR")))
+    assert posted == []
+    assert any("DISCRIMINATOR" in p for p in out["rca_report_gate_problems"])
 
 
 # ----------------------------------------------------------------- human-approval gate (Phase C)
@@ -3132,3 +3166,586 @@ def test_quality_gate_node_never_propagates_an_exception(tmp_path, monkeypatch):
     assert "UnicodeDecodeError" in out["quality_gate_unverified"]
     assert any("DID NOT" in m for m in said), "and it must be loud"
     assert graph.after_quality_gate({**out}) == "proceed", "fail OPEN, never CLOSED, on infra"
+
+
+# ------------------------------------------------------- F10: per-station spend is persisted
+def test_station_spend_is_recorded_with_the_canonical_station_number(monkeypatch):
+    """F10: "per-station cost is never persisted, preventing visibility into spend distribution."
+    The counts already existed — agents._drive has accumulated them per station all along for the
+    console "done — <spend>" line — they just had nowhere to go."""
+    sent = []
+    monkeypatch.setattr(telemetry, "_dispatch", lambda tool, args: sent.append((tool, args)))
+
+    telemetry.station_spend("EXE-x", "coder", 12345, 6789, 42, model="claude-opus-5")
+    assert len(sent) == 1
+    tool, args = sent[0]
+    assert tool == "aidev_insert_station_event"
+    assert args["station"] == "coder"
+    assert args["station_number"] == 4.0, "must carry the canonical number, not -1"
+    for fragment in ("input_tokens=12345", "output_tokens=6789", "tool_calls=42",
+                     "model=claude-opus-5"):
+        assert fragment in args["output_summary"], fragment
+
+    # A station that spent nothing must not write a row at all.
+    sent.clear()
+    telemetry.station_spend("EXE-x", "coder", 0, 0, 0)
+    assert sent == []
+
+    # An unmapped station name degrades to -1 rather than raising.
+    sent.clear()
+    telemetry.station_spend("EXE-x", "not_a_station", 1, 1, 0)
+    assert sent and sent[0][1]["station_number"] == -1.0
+
+    # DOLLARS ARE DELIBERATELY NOT RECORDED — prices change per model tier and a hardcoded table
+    # goes stale silently, which is the unreproducible-number problem Finding 5 is about.
+    assert "usd" not in args["output_summary"].lower()
+    assert "$" not in args["output_summary"]
+
+
+def test_only_real_lifecycle_transitions_claim_a_lifecycle_status(monkeypatch):
+    """`pipeline_executions_vw` aggregates `groupArrayDistinctIf(station, status = 'completed')`, so
+    ANY row written with status='completed' marks its station complete for every downstream consumer.
+
+    Two writers used to do that wrongly. `station_spend` wrote 'completed' for a cost row, so a
+    station counted as complete the moment it spent a token — including one that then failed, and a
+    re-driven station twice. And `station_event`'s fallback wrote 'completed' for every intra-station
+    ANNOTATION phase (~16 of them), so acquiring a build slot marked the station done. A docstring
+    cannot reach a SQL view; the written VALUES had to change."""
+    sent = []
+    monkeypatch.setattr(telemetry, "_dispatch", lambda tool, args: sent.append(args))
+
+    telemetry.station_spend("EXE-x", "coder", 10, 20, 3, model="m")
+    assert sent[-1]["status"] == "spend", "a cost row must not claim a station completed"
+    assert sent[-1]["tool_calls_made"] == 3, "the table has a typed column for this"
+
+    # Annotations: a fact recorded MID-station, always with a real terminal phase still to come.
+    for phase in ("build_slot", "gan_slot", "slot", "det_override", "test_edit_detected",
+                  "rung_uncorroborated", "report_gate_failed", "a_phase_nobody_has_added_yet"):
+        sent.clear()
+        telemetry.station_event("EXE-x", 4, phase)
+        assert sent[-1]["status"] == "note", f"{phase!r} must not read as a station completion"
+
+    # Real transitions are unchanged.
+    for phase, status in (("start", "started"), ("end", "completed"), ("stop", "failed"),
+                          ("skip", "skipped"), ("done", "completed"),
+                          ("learn_repo_start", "started"), ("learn_repo_end", "completed")):
+        sent.clear()
+        telemetry.station_event("EXE-x", 4, phase)
+        assert sent[-1]["status"] == status, phase
+
+
+def test_a_node_that_returns_failed_never_reports_its_station_completed():
+    """Telemetry status must agree with `final_status`. Both writers got this wrong independently:
+
+      * `rca_done` shared the phase `done` between its posted branch and its gate-REFUSED branch,
+        which returns final_status="failed" — so a failed run listed rca_router in
+        `stations_completed_list` and nothing in `stations_failed_list`.
+      * `qa_batch` emitted an unconditional `qa_batch_end`, passing final_status as FREE TEXT only —
+        so a batch item that failed at sit_run still wrote status='completed'. No aggregate reads
+        free text.
+
+    Enumerated from the source both times, because the phase NAME reads fine in both cases."""
+    for phase, want in (("gate_refused", "failed"), ("done", "completed"),
+                        ("qa_batch_failed", "failed"), ("qa_batch_end", "completed"),
+                        ("unsupported_route", "failed")):
+        assert telemetry._STATUS.get(phase) == want, (
+            f"{phase!r} must record {want!r} — it is the status a downstream aggregate reads")
+
+    # DERIVED, so the rule covers nodes nobody thought to list. The first cut only examined
+    # functions whose returns were UNIFORMLY failed — 1 of 77, and it structurally excluded
+    # `rca_done`, the very node whose defect prompted it, because that node also has a success
+    # return. The rule that actually generalises is per-BRANCH: pair each failing return with the
+    # station_event that dominates it in the same branch.
+    import ast
+    def _status_values(node):
+        """Every literal `final_status` a return expression can evaluate to.
+
+        Resolves a conditional, because `_qa_batch_finish` legitimately picks its status with one and
+        banning that shape would be the tail wagging the dog. Anything it still cannot read is
+        reported by the `opaque` check below rather than silently skipped — a judge injected three
+        unreadable shapes and all three slipped past the first cut."""
+        if isinstance(node, ast.Constant):
+            return [node.value]
+        if isinstance(node, ast.IfExp):
+            return _status_values(node.body) + _status_values(node.orelse)
+        return []
+
+    checked, wrong = [], []
+    for mod in (nodes, qa_batch):
+        tree = ast.parse(Path(mod.__file__).read_text())
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # Walk each statement body; a `station_event` and a failing `return` in the SAME body
+            # belong to the same branch.
+            for scope in [fn] + [n for n in ast.walk(fn)
+                                 if isinstance(n, (ast.If, ast.Try, ast.For, ast.While))]:
+                bodies = [scope.body] + ([scope.orelse] if hasattr(scope, "orelse") else [])
+                for body in bodies:
+                    phases = [s.value.args[2].value for s in body
+                              if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
+                              and isinstance(s.value.func, ast.Attribute)
+                              and s.value.func.attr == "station_event" and len(s.value.args) >= 3
+                              and isinstance(s.value.args[2], ast.Constant)]
+                    fails = any(
+                        isinstance(s, ast.Return) and isinstance(s.value, ast.Dict)
+                        and any(isinstance(k, ast.Constant) and k.value == "final_status"
+                                and set(_status_values(v)) == {"failed"}   # set: an IfExp
+                                # whose arms are BOTH "failed" yields ["failed", "failed"], and a
+                                # list comparison missed it (probe S2)
+                                for k, v in zip(s.value.keys, s.value.values))
+                        for s in body)
+                    if not (phases and fails):
+                        continue
+                    for p in phases:
+                        checked.append((fn.name, p))
+                        got = telemetry._STATUS.get(p, telemetry._ANNOTATION_STATUS)
+                        if got != "failed":
+                            wrong.append((fn.name, p, got))
+    # Anti-vacuity: the first cut examined ONE function and read as thorough.
+    assert len(checked) >= 3, f"the derivation examined almost nothing: {checked}"
+    assert {"rca_done", "unsupported_route"} <= {n for n, _ in checked}, (
+        f"the derivation no longer reaches the nodes it was written for: {sorted(set(checked))}")
+
+    # …and the derivation's BLIND SPOTS are named rather than left to be discovered. It reads a
+    # literal `final_status` in a `return` dict; a node that computes it into a variable, picks it
+    # with a conditional, or returns a helper's result is invisible here and would slip through
+    # silently. A judge injected all three and all three slipped. Nothing above would have noticed,
+    # because the anti-vacuity assertions only prove the OLD nodes are still reached — so flag any
+    # node that sets `final_status` in a shape this cannot analyse, and make adding one a
+    # deliberate act rather than an accident.
+    opaque = []
+    for mod in (nodes, qa_batch):
+        for fn in ast.walk(ast.parse(Path(mod.__file__).read_text())):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for r in ast.walk(fn):
+                if not (isinstance(r, ast.Return) and isinstance(r.value, ast.Dict)):
+                    continue
+                for k, v in zip(r.value.keys, r.value.values):
+                    if (isinstance(k, ast.Constant) and k.value == "final_status"
+                            and not _status_values(v)):
+                        opaque.append((fn.name, type(v).__name__))
+    assert opaque == [], (
+        "these nodes set `final_status` in a shape this derivation cannot read, so their telemetry "
+        f"status is unchecked — use a literal, or extend the derivation: {opaque}")
+    # KNOWN LIMIT, verified by injection rather than assumed: a node that returns a HELPER's dict
+    # (`return _make_failure()`) is invisible to both checks above — the return is a Call, so there
+    # is no `final_status` key to read and nothing to flag. Four shapes were injected as probe
+    # nodes; the literal, the variable and the conditional were all CAUGHT, the helper SLIPPED.
+    # Following calls across functions is real interprocedural analysis and out of proportion here;
+    # what is in proportion is saying so, so the next person does not read this test as exhaustive.
+    assert wrong == [], (
+        "these branches return final_status='failed' but record a non-failure telemetry status, so "
+        f"the run reads as fine in every aggregate: {wrong}")
+
+    # And the branches really are wired to those phases.
+    src = Path(nodes.__file__).read_text()
+    refused = src[src.index("async def rca_done"):]
+    refused = refused[:refused.index("\nasync def ", 1)] if "\nasync def " in refused[1:] else refused
+    assert '"gate_refused"' in refused and 'final_status": "failed"' in refused, \
+        "rca_done's gate-refused branch no longer emits the distinct phase"
+
+
+def test_qa_batch_records_the_outcome_it_actually_had(monkeypatch, tmp_path):
+    """RUN `run_one`, don't grep it. Two mutants proving this fix untested survived a full suite:
+    reverting the station number to `6` (re-filing every batch marker under `sit_resolve`) and
+    gutting the `_failed` predicate. The only guard was a source-string match — the exact thing this
+    repo's own comments warn about, since that is how the `run_skill` NameError stayed green.
+
+    Both halves are asserted from the emitted telemetry: the NUMBER at the call site and the STATUS
+    derived from `final_status`."""
+    sent = []
+    monkeypatch.setattr(telemetry, "station_event",
+                        lambda exec_id, num, phase, **kw: sent.append((num, phase)))
+    monkeypatch.setattr(telemetry, "new_execution_id", lambda: "EXE-batch")
+    monkeypatch.setattr(tracing, "callback_handler", lambda: None)
+    monkeypatch.setattr(nodes, "_release_sit_slot", lambda *_a: None)
+    monkeypatch.setattr(nodes, "_release_build_slot", lambda *_a: None)
+
+    class _App:
+        def __init__(self, final): self._final = final
+        async def ainvoke(self, initial, config=None):
+            # BaseException, not Exception — `CancelledError` and `KeyboardInterrupt` are not
+            # `Exception` subclasses, which is the whole point of the two cases below. A stub that
+            # checked `Exception` would silently RETURN them as a result and test nothing.
+            if isinstance(self._final, BaseException):
+                raise self._final
+            return self._final
+
+    for final, want_phase in (({"final_status": "completed"}, "qa_batch_end"),
+                              ({"final_status": "failed"}, "qa_batch_failed"),
+                              ({"final_status": "blocked"}, "qa_batch_failed"),
+                              (RuntimeError("boom"), "qa_batch_failed"),
+                              # BaseException: `except Exception` does not catch these, so `final`
+                              # is never assigned by the handler. Moving the terminal event into the
+                              # `finally` made that an UnboundLocalError that both swallowed the
+                              # cancellation AND still left the station open — on the very case the
+                              # move was made for. The station must close and the original
+                              # exception must propagate unchanged.
+                              (asyncio.CancelledError(), "qa_batch_failed"),
+                              (KeyboardInterrupt(), "qa_batch_failed")):
+        sent.clear()
+        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
+                            lambda f=final: type("G", (), {"compile": lambda self: _App(f)})())
+        if isinstance(final, BaseException) and not isinstance(final, Exception):
+            with pytest.raises(type(final)):
+                asyncio.run(qa_batch.run_one("MM-1"))
+        else:
+            asyncio.run(qa_batch.run_one("MM-1"))
+        nums = {n for n, _ in sent}
+        phases = [p for _, p in sent]
+        assert nums == {0.05}, f"qa_batch filed under the wrong station number: {nums}"
+        # …and that number must have a NAME, or every row degrades to the `station_0.05` fallback.
+        # Deleting the table entry survived a sweep: asserting the number alone cannot see it.
+        assert telemetry._STATION_NAMES.get(0.05) == "qa_batch"
+        assert phases[0] == "qa_batch_start" and phases[-1] == want_phase, (
+            f"final_status={final} recorded {phases[-1]!r}, expected {want_phase!r}")
+        assert telemetry._STATUS[phases[-1]] in telemetry._TERMINAL_STATUSES
+
+    # A raise from SETUP — graph compilation or tracing — must still close the station and must not
+    # abort the sweep. Both calls used to sit between the start event and the `try`, so either one
+    # left the station open forever AND propagated out of run_one, killing the batch on ticket 1.
+    # `tracing.callback_handler` loads secrets unguarded, so this is a real path, not a theory.
+    def _boom(*_a, **_k):
+        raise RuntimeError("setup exploded")
+
+    for attr, target in (("build_qa_subgraph", qa_batch), ("callback_handler", tracing)):
+        sent.clear()
+        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
+                            lambda: type("G", (), {"compile": lambda self: _App({"final_status": "completed"})})())
+        monkeypatch.setattr(tracing, "callback_handler", lambda: None)
+        monkeypatch.setattr(target, attr, _boom)
+        out = asyncio.run(qa_batch.run_one("MM-1"))
+        assert [p for _, p in sent] == ["qa_batch_start", "qa_batch_failed"], (
+            f"a raise from {attr} left the station open: {sent}")
+        assert out["final_status"] == "failed" and "setup exploded" in out["final_outcome"]
+
+    # TELEMETRY ITSELF must not abort the sweep. The guards around both `station_event` calls
+    # survived a mutation sweep because every case above stubs `station_event` with a lambda that
+    # cannot raise — so the guard read as covered while being untested. `_dispatch` really can raise
+    # ("cannot schedule new futures after shutdown"), and this module's whole purpose is that one
+    # ticket's problem never stops the batch.
+    monkeypatch.setattr(tracing, "callback_handler", lambda: None)   # the loop above left it raising
+    for boom_on in ("qa_batch_start", "qa_batch_end"):
+        calls = []
+
+        def _raising(exec_id, num, phase, _boom=boom_on, **kw):
+            calls.append(phase)
+            if phase == _boom:
+                raise RuntimeError("telemetry backend is down")
+
+        monkeypatch.setattr(telemetry, "station_event", _raising)
+        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
+                            lambda: type("G", (), {"compile": lambda self: _App({"final_status": "completed"})})())
+        out = asyncio.run(qa_batch.run_one("MM-1"))       # must NOT raise
+        assert out["ticket_id"] == "MM-1", f"a telemetry failure on {boom_on} aborted the sweep"
+        assert boom_on in calls
+
+    # …and an unrecognised final_status must record a FAILURE, not a completion (allow-list).
+    monkeypatch.setattr(telemetry, "station_event",
+                        lambda exec_id, num, phase, **kw: sent.append((num, phase)))
+    for status in ({}, {"final_status": None}, {"final_status": ""}, {"final_status": "error"},
+                   {"final_status": "blocked"}):
+        sent.clear()
+        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
+                            lambda f=status: type("G", (), {"compile": lambda self: _App(f)})())
+        asyncio.run(qa_batch.run_one("MM-1"))
+        assert sent[-1][1] == "qa_batch_failed", (
+            f"final_status={status} recorded a COMPLETION: {sent[-1]}")
+
+
+def test_station_durations_are_actually_recorded(monkeypatch):
+    """`_station_seconds` feeds `run-report.json`'s per-station timings. Disabling the timer entirely
+    survived a mutation sweep — nothing asserted a duration is ever produced.
+
+    Also pins that the timer keys off the STATUS, not a hand-written phase tuple: the two used to be
+    separate lists and drifted (`learn_repo_end` got a status but no duration; `blocked_short_circuit`
+    leaked its timer outright), which is why `station_event` now derives both from `_STATUS`."""
+    monkeypatch.setattr(telemetry, "_dispatch", lambda tool, args: None)
+    monkeypatch.setattr(telemetry, "_station_t0", {})
+    monkeypatch.setattr(telemetry, "_station_seconds", {})
+
+    # Every terminal phase must close a timer its own start opened — including the ones added later.
+    for start, end in (("start", "end"), ("start", "stop"), ("start", "skip"),
+                       ("learn_repo_start", "learn_repo_end"),
+                       ("qa_batch_start", "qa_batch_end"), ("qa_batch_start", "qa_batch_failed"),
+                       ("start", "gate_refused"), ("start", "blocked_short_circuit")):
+        telemetry._station_t0.clear()
+        telemetry._station_seconds.clear()
+        telemetry.station_event("EXE-t", 4, start)
+        assert telemetry._station_t0, f"{start!r} did not open a timer"
+        telemetry.station_event("EXE-t", 4, end)
+        assert not telemetry._station_t0, f"{end!r} left the timer open — it leaks"
+        assert telemetry._station_seconds.get(("EXE-t", "coder")) is not None, \
+            f"{start}->{end} recorded no duration"
+
+    # An annotation must NOT close a station that is still running.
+    telemetry._station_t0.clear()
+    telemetry._station_seconds.clear()
+    telemetry.station_event("EXE-t", 4, "start")
+    telemetry.station_event("EXE-t", 4, "build_slot")
+    assert telemetry._station_t0, "an annotation closed a station that is still running"
+
+
+def test_every_station_reaches_a_terminal_status():
+    """DERIVED from the source, not asserted from a guess — which is the whole point of this test.
+
+    Classifying a phase by its NAME is how the annotation fallback got `auto`/`decision` wrong: those
+    sound like mid-station notes, but the three human-review gates (rca_review_gate 0.15,
+    blocked_review_gate 1.55, qa_review_gate 6.15) emit them and NOTHING ELSE — no "start", no "end"
+    — so calling them annotations deleted those stations from every `status = 'completed'` aggregate
+    in `pipeline_executions_vw`. A judge caught it; the same reasoning-by-name error had already
+    shipped twice in adjacent code, so this asserts over the ENUMERATED call sites instead.
+
+    Scanned over EVERY module that calls `station_event`, found by walking the package — not
+    `nodes.py` alone. The first cut hardcoded `nodes.py` and therefore could not see `qa_batch.py`'s
+    two phases, one of which (`qa_batch_end`) is a real terminal event that the annotation default
+    silently demoted. Two files, one classifier: enumerate the classifier's callers, not the file you
+    happen to be editing."""
+    import ast
+    pkg = Path(nodes.__file__).parent
+
+    def _consts(node):
+        """Every literal a phase/station argument can evaluate to — including both arms of a
+        conditional. `qa_batch` picks its terminal phase with an `IfExp` (it must, so the status
+        reflects the outcome), and treating that as "non-literal" would have quietly dropped BOTH
+        of its phases from this enumeration — the same blind spot the single-file scan had."""
+        if isinstance(node, ast.Constant):
+            return [node.value]
+        if isinstance(node, ast.IfExp):
+            return _consts(node.body) + _consts(node.orelse)
+        return []
+
+    by_station, non_literal, files = collections.defaultdict(set), [], set()
+    for path in sorted(pkg.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        # Enclosing function for each call, so a finding is pinned to code rather than to a line
+        # number that a one-line insertion elsewhere in the file invalidates.
+        owner = {}
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(fn):
+                    owner.setdefault(id(sub), fn.name)
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "station_event" and len(n.args) >= 3):
+                continue
+            files.add(path.name)
+            nums, phases = _consts(n.args[1]), _consts(n.args[2])
+            if nums and phases:
+                for num in nums:
+                    by_station[float(num)].update(phases)
+            else:
+                non_literal.append(f"{path.name}::{owner.get(id(n), '<module>')}")
+
+    # Anti-vacuity: pin the shape of what was found, so a refactor that hides call sites FAILS rather
+    # than quietly shrinking the input set. A `> 15` floor let 10 stations vanish undetected.
+    assert files >= {"nodes.py", "qa_batch.py"}, f"lost a caller module: {sorted(files)}"
+    assert len(by_station) >= 26, f"only {len(by_station)} stations found — call sites went missing"
+
+    # `stop_run` picks its number at runtime (it reports the station the run stopped AT), so one
+    # site is legitimately non-literal. Any OTHER one is a hole in this test's coverage. Pinned by
+    # FUNCTION, not line number — a judge showed a one-line insertion at the top of nodes.py
+    # breaking the old `nodes.py:2665` pin without anything actually changing.
+    assert non_literal == ["nodes.py::stop_run"], \
+        f"new non-literal station_event call(s): {non_literal}"
+
+    stuck = []
+    for station, phases in sorted(by_station.items()):
+        statuses = {telemetry._STATUS.get(p, telemetry._ANNOTATION_STATUS) for p in phases}
+        if statuses & telemetry._TERMINAL_STATUSES:
+            continue
+        # A MARKER station legitimately never completes — it never opens either. Declared in
+        # telemetry, not skipped here, and held to its side of that bargain: a marker that starts a
+        # lifecycle without finishing one is the timer leak this whole invariant exists to catch.
+        if station in telemetry._MARKER_STATIONS:
+            assert statuses == {telemetry._ANNOTATION_STATUS}, (
+                f"marker station {station} emits a lifecycle status it never closes: {statuses}")
+            continue
+        stuck.append((station, telemetry._STATION_NAMES.get(station, "?"),
+                      sorted(phases), sorted(statuses)))
+    assert stuck == [], (
+        "these stations emit telemetry but never reach a terminal status, so they vanish from "
+        f"`groupArrayDistinctIf(station, status = 'completed')`: {stuck}")
+
+    # The OPEN direction: a station that starts a timer must be able to close it. Only this
+    # direction is a leak — `teardown_container` (3.6) is deliberately terminal-only (a cleanup node
+    # that reports once and has no phase of its own to open), which is fine: it records no duration
+    # rather than an unbounded one. A station that OPENS and never closes sits forever in
+    # `_station_t0`, reports no duration, and stays `started` in the table.
+    leaked = []
+    for station, phases in sorted(by_station.items()):
+        statuses = {telemetry._STATUS.get(p, telemetry._ANNOTATION_STATUS) for p in phases}
+        if "started" in statuses and not (statuses & telemetry._TERMINAL_STATUSES):
+            leaked.append((station, telemetry._STATION_NAMES.get(station, "?"), sorted(phases)))
+    assert leaked == [], f"these stations open a timer they can never close: {leaked}"
+
+    # And every phase must be a status the DDL documents — `note`/`spend` included.
+    documented = telemetry._TERMINAL_STATUSES | {"started", telemetry._ANNOTATION_STATUS}
+    for phases in by_station.values():
+        for p in phases:
+            assert telemetry._STATUS.get(p, telemetry._ANNOTATION_STATUS) in documented, p
+
+
+def test_run_agent_and_run_skill_actually_record_spend(tmp_path, monkeypatch):
+    """This test replaces two `inspect.getsource(...) in ...` string assertions that PASSED on code
+    which raised NameError on every call. `run_skill` has no `execution_id` parameter; the F10 line
+    was copy-pasted from run_agent, the NameError was caught by `except Exception` and converted to
+    StationError — so all 7 skill stations (the whole SIT chain) completed their work and were then
+    reported FAILED, with 249 tests green. Source-text assertions certify defects. INVOKE the thing."""
+    rows = []
+    monkeypatch.setattr(telemetry, "station_spend",
+                        lambda exec_id, node, i, o, t, model="": rows.append((exec_id, node, i, o, t)))
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+
+    async def fake_drive(**kw):
+        vp = kw.get("verdict_path")
+        if vp is not None:
+            vp.parent.mkdir(parents=True, exist_ok=True)
+            vp.write_text(json.dumps({"route": "coding", "packet_path": "/x", "target_repos": []}))
+        return (1000, 200, 5)
+
+    monkeypatch.setattr(agents, "_drive_with_retry", fake_drive)
+    md = tmp_path / "research.md"
+    md.write_text("# worker\n")          # a REAL file: do not patch _read, it reads the verdict too
+    monkeypatch.setattr(agents, "_agent_path", lambda _n: md)
+
+    asyncio.run(agents.run_agent(agent_md="research.md", node="researcher", ticket_id="MM-1",
+                                 execution_id="EXE-a", task_prompt="go",
+                                 verdict_model=schemas.ResearchVerdict))
+    assert ("EXE-a", "researcher", 1000, 200, 5) in rows, f"run_agent recorded nothing: {rows}"
+
+    # run_skill takes NO execution_id — it must source one from the run context, and must not raise.
+    rows.clear()
+    agents.set_run_context(domain_bucket="callback_notification", ticket_id="MM-1",
+                           execution_id="EXE-b")
+    vpath = tmp_path / "skill.verdict.json"
+    (tmp_path / "SKILL.md").write_text("# skill\n")
+    try:
+        asyncio.run(agents.run_skill(skill_name="ocean-automation-testing", node="sit_run",
+                                     ticket_id="MM-1", task_prompt="go", verdict_path=vpath))
+    except agents.StationError as e:
+        assert "NameError" not in str(e), f"run_skill still raises NameError: {e}"
+        raise
+    assert rows and rows[0][0] == "EXE-b" and rows[0][1] == "sit_run", \
+        f"run_skill recorded nothing or the wrong execution: {rows}"
+
+
+def test_every_station_event_number_and_spend_label_resolve_to_the_same_station():
+    """The two writers must AGREE, or the spend row and the lifecycle rows never join — which is the
+    entire point of putting spend in the same table.
+
+    The first cut of the label fix was pinned only on "coder" (which happens to match the table
+    verbatim) and so could not see that four labels resolved to -1. Fixing those introduced the
+    inverse defect a judge then caught: `qa_scenarios` was mapped to an INVENTED 3.9 while its own
+    station_event calls pass 1.6, so the one station the fix added an entry for was the only one
+    whose rows still didn't join. This test asserts BOTH directions over the real source, so neither
+    mistake can come back."""
+    # 1. Every station_event number PASSED ANYWHERE IN THE PACKAGE has a name (else it degrades to
+    #    the "station_<n>" fallback and no reverse-map entry exists for it at all). Scanned over the
+    #    package, not nodes.py — reading one file is the blind spot that let qa_batch.py pass a bare
+    #    `6` (aliasing to sit_resolve) through this test's sibling for an entire round.
+    pkg = Path(nodes.__file__).parent
+    src = "\n".join(p.read_text() for p in sorted(pkg.glob("*.py")))
+    numbers = sorted({float(n) for n in
+                      re.findall(r"station_event\([^,]+,\s*([0-9.]+)\s*,", src)})
+    assert len(numbers) >= 26, f"only {len(numbers)} numbers matched — call sites went missing"
+    unnamed = [n for n in numbers if n not in telemetry._STATION_NAMES]
+    assert unnamed == [], f"station numbers with no name in _STATION_NAMES: {unnamed}"
+
+    # 1b. And every number the spend map INVENTS must exist in the name table. `station_spend` and
+    #     `station_event` write to one table, so a label mapped to a number nothing is named by
+    #     produces rows that join to nothing — the `qa_scenarios: 3.9` defect, which the file's own
+    #     comment now warns against and which nothing tested.
+    invented = sorted({n for n in telemetry._STATION_NUMBERS.values()
+                       if n not in telemetry._STATION_NAMES})
+    assert invented == [], f"_STATION_NUMBERS maps to numbers no station is named by: {invented}"
+
+    # 2. Every node label that reaches station_spend resolves to a real number, never -1.
+    labels = sorted({m for m in re.findall(r'node="([a-z_0-9]+)"', src)} |
+                    {"coder", "harsh_reviewer", "dep_resolver", "rca_agent", "qa_scenarios",
+                     "sit_run", "sit_triage", "researcher"})
+    unmapped = [l for l in labels if telemetry._STATION_NUMBERS.get(l) is None]
+    assert unmapped == [], f"node labels station_spend cannot number: {unmapped}"
+
+    # 3. The specific agreement that broke: qa_scenarios' spend number IS the number its own
+    #    station_event calls pass.
+    assert telemetry._STATION_NUMBERS["qa_scenarios"] == 1.6
+    assert telemetry._STATION_NAMES[1.6] == "qa_scenarios"
+
+
+def test_spend_survives_a_teardown_blip_after_the_verdict_was_written(monkeypatch, tmp_path):
+    """M2: the "transient error AFTER the verdict was already written" path used to return (0,0,0),
+    which made station_spend early-return and write NO row — so F10 systematically under-reported
+    exactly the most expensive stations (the ones that did all their work and then hit a blip).
+
+    `_drive` stashes its tally in `_LAST_TALLY` inside its `finally`, so it survives the exception.
+    Also pins the staleness guard: a tally left by a PRIOR ticket under the same label (qa_batch
+    drives N tickets sequentially in one process) must never be handed back as this one's spend."""
+    vp = tmp_path / "v.json"
+    vp.write_text('{"ok": true}')
+
+    calls = {"n": 0}
+
+    async def blip(system_prompt, prompt, cwd, permission_mode, label, allowed_tools, model):
+        calls["n"] += 1
+        agents._LAST_TALLY[label] = (900, 80, 7)      # what _drive's own `finally` does
+        raise BlockingIOError("teardown blip after the work was done")
+
+    monkeypatch.setattr(agents, "_drive", blip)
+    monkeypatch.setattr(ui, "milestone", lambda *_a, **_k: None)
+
+    spend = asyncio.run(agents._drive_with_retry(
+        system_prompt="s", prompt="p", cwd=tmp_path, permission_mode="default",
+        label="sit_run", verdict_path=vp))
+    assert spend == (900, 80, 7), "the most expensive station's spend was discarded"
+    assert calls["n"] == 1, "it must NOT re-drive a station whose verdict is already on disk"
+
+    # Staleness: a prior run's tally under the same label must not leak into a run that
+    # accumulated nothing (a failure before _drive's own try is entered).
+    async def die_early(system_prompt, prompt, cwd, permission_mode, label, allowed_tools, model):
+        raise BlockingIOError("died before the tally was ever written")
+
+    agents._LAST_TALLY["sit_run"] = (999_999, 999_999, 999)
+    monkeypatch.setattr(agents, "_drive", die_early)
+    spend2 = asyncio.run(agents._drive_with_retry(
+        system_prompt="s", prompt="p", cwd=tmp_path, permission_mode="default",
+        label="sit_run", verdict_path=vp))
+    assert spend2 == (0, 0, 0), f"a prior ticket's spend leaked into this one: {spend2}"
+
+
+def test_drive_itself_stashes_its_tally_even_when_the_stream_raises(monkeypatch, tmp_path):
+    """The REAL `_drive` — not a stand-in — must write `_LAST_TALLY[label]` from its `finally`.
+
+    The test above patches `_drive` out, so it proves the retry path READS the tally but not that
+    anything WRITES it: a mutation deleting the `finally` line survived the whole suite. `_drive`
+    imports the SDK lazily precisely so the suite can run without it, which is also the seam that
+    lets this drive the real function against a fake `claude_agent_sdk`."""
+    class _Usage:
+        input_tokens, output_tokens = 4242, 314
+
+    class _Msg:
+        usage = _Usage()
+        content = [type("B", (), {"name": "Bash"})(), type("B", (), {"name": "Read"})()]
+
+    async def fake_query(prompt, options):
+        yield _Msg()
+        raise BlockingIOError("SDK teardown blip AFTER the work and the token accounting")
+
+    fake_sdk = types.ModuleType("claude_agent_sdk")
+    fake_sdk.query = fake_query
+    fake_sdk.ClaudeAgentOptions = lambda **kw: types.SimpleNamespace(**kw)
+    fake_sdk.HookMatcher = lambda **kw: types.SimpleNamespace(**kw)
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
+    monkeypatch.setattr(ui, "station_start", lambda *_a, **_k: None)
+    monkeypatch.setattr(ui, "milestone", lambda *_a, **_k: None)
+    monkeypatch.setattr(agents, "_station_logfile", lambda _l: None)
+    monkeypatch.setattr(agents, "_station_mcp_config", lambda: None)
+
+    agents._LAST_TALLY.pop("sit_triage", None)
+    with pytest.raises(BlockingIOError):
+        asyncio.run(agents._drive("sys", "p", tmp_path, "default", "sit_triage"))
+
+    assert agents._LAST_TALLY.get("sit_triage") == (4242, 314, 2), (
+        "_drive did not stash its tally in `finally` — every teardown-blip station reports zero spend")
