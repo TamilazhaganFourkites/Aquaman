@@ -569,6 +569,75 @@ def _service_slugs(state: OceanState) -> list[str]:
     return slugs
 
 
+# ------------------------------------------------- qat-handoff Phase 1.2: 9b judge corroboration
+# The SAME agent that decides whether to defer the Step-9b judge panel also writes the field claiming
+# whether it ran. Two of the three real artifacts say outright that it deferred ("No fresh-agent judge
+# panel spawned", "intentionally deferred to the human review gate"), so a self-report is worth
+# nothing here. This codebase has closed exactly this surface three times before, always the same way:
+# deterministic DISK evidence outranks the agent's account of itself (F1's junit, Finding 2a's mock
+# audit, Finding 2e's fingerprinting).
+#
+# The sentinel is what makes the count trustworthy. Step 5d's GAN dispatches up to 4 sub-agents per
+# round and would otherwise be indistinguishable from a 9b judge -- a 12-dispatch 5d log must yield 0,
+# not 12. ocean-qa-agent's SKILL.md requires every Step-9b judge dispatch to carry STEP9B-JUDGE in its
+# description, and forbids it anywhere in Step 5d.
+_STEP9B_SENTINEL = "STEP9B-JUDGE"
+# `⚡ sub-agent started:` is the ONLY line counted (agents.py's task_started rendering). Deliberately
+# not `⚙ Task` (the tool call) and not `task_progress`: one judge emits all three, and counting any of
+# the others turns a single judge into N+2. Nor the skill's own `⟳ [Step 9b/round 1]` narration -- an
+# agent that PRINTS it without dispatching must score 0, which is the whole point.
+_TASK_STARTED_RE = re.compile(r"^⚡ sub-agent started: (?P<desc>.*?)\s*\(task (?P<tid>[^)]*)\)\s*$")
+# Two rounds is the documented ceiling. A raw count above it means the sentinel is colliding with
+# something else, so it must NOT quietly present as a healthy 2 -- it fails closed instead.
+_MAX_9B_ROUNDS = 2
+
+
+def _corroborated_judge_rounds(raw: int) -> int:
+    """The trustworthy judge count from a raw observed count. Pure, so the FAIL-CLOSED rule is
+    testable without driving the station.
+
+    A raw count above the documented 2-round ceiling means the sentinel is colliding with something
+    else. `min(raw, 2)` would present that collision as a perfectly healthy 2 -- the most dangerous
+    possible answer, because it is indistinguishable from a real two-round pass. Zero instead: a
+    collision is not evidence the judge ran.
+    """
+    return raw if 0 <= raw <= _MAX_9B_ROUNDS else 0
+
+
+def _log_offset(exec_id: str, label: str) -> int:
+    """Byte length of a station log right now, or 0. Never raises.
+
+    Captured BEFORE `run_skill` so the scan below covers this invocation only. Deliberately not "scan
+    after the last `===== pass start =====` separator": `_drive_with_retry` re-drives internally and
+    appends a fresh separator, so a last-separator scan would zero a genuine count recorded before the
+    retry (the `verdict_path is None` case).
+    """
+    try:
+        return (config.artifacts_dir(exec_id) / f"{label}.log").stat().st_size
+    except OSError:
+        return 0
+
+
+def _judge_rounds_observed(exec_id: str, label: str, since: int) -> int:
+    """How many Step-9b judge sub-agents this pass ACTUALLY dispatched, from the station log.
+
+    Returns 0 -- never None -- for a missing, unreadable or empty log: "no evidence" and "no judge"
+    take the same fail-closed answer here, because the field this corroborates is only ever used to
+    DOWNGRADE a claim, never to manufacture one.
+    """
+    try:
+        raw = (config.artifacts_dir(exec_id) / f"{label}.log").read_text(errors="replace")[since:]
+    except OSError:
+        return 0
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        m = _TASK_STARTED_RE.match(line.strip())
+        if m and _STEP9B_SENTINEL in m.group("desc"):
+            # Dedupe on task id: a judge that reconnects or re-narrates must still count once.
+            seen.add(m.group("tid") or line)
+    return len(seen)
+
+
 # ------------------------------------------------------------------ B1: multi-repo review coverage
 def _origin_slug(repo_dir: Path) -> str:
     """`<org>/<name>` for a checkout's `origin`, or "" on any doubt. NEVER the raw URL.
@@ -1835,6 +1904,23 @@ async def sit_author(state: OceanState) -> dict:
             f"write the file from the ALREADY GAN-hardened scenarios at that path -- do NOT let it "
             f"redesign the scenarios. Record the test path, then STOP.\n"
         )
+    # qat-handoff Phase 1.5: invalidate the PREVIOUS pass's 9b verdict before re-authoring.
+    # A 9b verdict grades the test AGAINST THE PRODUCT CODE, and on the code_fault rework loop
+    # (sit_triage -> prep_rework -> coder -> ... -> sit_author) the product code has changed, so the
+    # old verdict is stale BY CONSTRUCTION. Fail-closed covers "missing"; it does not cover "stale",
+    # and a re-authoring pass that fails to write a new one would otherwise leave a later reader
+    # consuming the previous attempt's verdict. Same pattern sit_resolve already uses for the
+    # automation verdict (EXE-2755f777), and for the same reason: existence must mean THIS pass.
+    review_json = config.FK_AIDEVELOPER_DIR / "memory" / "tickets" / f"{tid}-qa-authoring-review.json"
+    try:
+        review_json.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass   # best-effort; an un-deletable stale file is caught by the corroboration below
+    # Phase 1.2: byte offset BEFORE the skill runs, so the judge scan covers this invocation only.
+    _9b_offset = _log_offset(exec_id, "sit_author")
+
     await agents.run_skill(
         skill_name="ocean-automation-testing",
         node="sit_author",
@@ -1842,11 +1928,35 @@ async def sit_author(state: OceanState) -> dict:
         task_prompt=(
             f"Run ocean-automation-testing Station 1 (author) ONLY for {tid} (`--only author`), HEADLESS. "
             f"Station 0 (resolve) already ran — do NOT re-resolve. {author_directive}"
-            f"Do NOT create TestRail cases and do NOT execute the SIT — a human reviews this draft "
-            f"next.\n\n{_summary(state)}"
+            f"Do NOT create TestRail cases and do NOT execute the SIT. "
+            # qat-handoff Phase 1.1. This used to end '— a human reviews this draft next', and the
+            # skill took it LITERALLY: two of three real artifacts record the Step-9b judge panel
+            # as deliberately deferred to that human ("No fresh-agent judge panel spawned").
+            # Nothing suppressed it technically -- no tools restriction, no deny hook, no
+            # max_turns -- it was this sentence. Note the fix is NECESSARY, NOT SUFFICIENT: the
+            # graph really does edge sit_author -> qa_review_gate, so an agent inferring "a human
+            # reviews next" is reasoning correctly about the world. The weight is carried by the
+            # disk corroboration below, which enforces at READ time.
+            f"Step 9b (the fresh adversarial judge panel) is MANDATORY on this pass and must NOT "
+            f"be deferred to the human review gate: the gate reviews your OUTPUT, it does not "
+            f"perform 9b. Dispatch each 9b judge with STEP9B-JUDGE in its description.\n\n"
+            f"{_summary(state)}"
         ),
     )
     partial = _load_json(str(config.automation_verdict_path(tid)))
+    # Phase 1.2: corroborate the 9b judge panel from DISK, never from the field the same agent wrote.
+    judge_rounds_raw = _judge_rounds_observed(exec_id, "sit_author", _9b_offset)
+    review = _load_json(str(review_json))
+    claimed = bool(review.get("judge_spawned")) if isinstance(review, dict) else False
+    # Unclamped, and > the documented ceiling FAILS CLOSED rather than presenting as a healthy 2:
+    # a count above the ceiling means the sentinel is colliding with something else, and a collision
+    # is not evidence the judge ran.
+    judge_rounds = _corroborated_judge_rounds(judge_rounds_raw)
+    if claimed and judge_rounds == 0:
+        ui.milestone("Step 9b claims judge_spawned=true but the station log shows NO matching "
+                     "dispatch this pass — treating it as NOT spawned.")
+    telemetry.station_event(exec_id, 6.1, "9b_corroboration", claimed=claimed,
+                            observed_raw=judge_rounds_raw, observed=judge_rounds)
     telemetry.station_event(exec_id, 6.1, "end")
     # Finding 2e: accept every key real verdicts have used for this (a judge review found `test_path`
     # absent or differently-named in most of 12 real runs) -- `sit_test_path` is the third observed one.
