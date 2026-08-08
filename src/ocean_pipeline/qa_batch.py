@@ -125,6 +125,14 @@ async def run_one(ticket_id: str) -> dict:
     # Phase 2 fails 5 of 5 for a PLUMBING reason and the wrong conclusion gets drawn -- "the judge
     # never runs" when in fact the evidence was never written down.
     os.environ["OCEAN_PIPELINE_EXEC_ID"] = execution_id
+    # ...and the ROOT, for the same reason and in the same breath. A2 moved ARTIFACTS_ROOT off /tmp,
+    # but the ocean-qa-agent tools still fall back to "/tmp/ocean-pipeline" when this is unset (six
+    # of them do, and one comment there still claims that path "matches Aquaman's own config
+    # default" -- it no longer does). cli.py exports it; qa_batch did not. The result would be a
+    # SPLIT BRAIN: the skill writes its junit/mock-audit/ports manifest under /tmp while the control
+    # plane reads ~/.ocean-pipeline, so triage finds nothing and reports a false could_not_verify on
+    # a run that genuinely passed -- the EXE-f749212a shape, reintroduced by a different route.
+    os.environ["OCEAN_PIPELINE_ARTIFACTS"] = str(config.ARTIFACTS_ROOT)
     # 0.05, not 6: a bare `6` is `6.0` as a dict key, which is `sit_resolve` — so every batch marker
     # used to file itself under a real station it has nothing to do with. See telemetry's entry for
     # why the replacement sorts BELOW the pipeline rather than above it (judge review).
