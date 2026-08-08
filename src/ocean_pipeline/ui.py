@@ -128,6 +128,21 @@ def _details(node: str, upd: dict) -> list[str]:
         n = len(upd.get("rca_findings") or [])
         if n:
             d.append(f"{n} fix item(s) identified for the coder")
+    elif node == "qa_scenarios":
+        # D1 Step 3 (bullet 3). This station had NO branch here at all, so the runner printed a bare
+        # "GAN-hardened test scenarios  12m" and the report's Outcome cell was empty -- ~29 minutes
+        # of adversarial work with no visible result anywhere. Cheapest real surface there is.
+        verdict = upd.get("qa_gan_verdict") or ""
+        gaps = upd.get("qa_gan_residual_gaps") or []
+        if verdict:
+            d.append(f"GAN verdict: {verdict}")
+        if upd.get("qa_gan_stop_reason"):
+            d.append(f"stopped: {upd['qa_gan_stop_reason']}")
+        for g in gaps[:3]:
+            if isinstance(g, dict):
+                d.append(f"  HIGH: {str(g.get('summary', ''))[:110]}")
+        if len(gaps) > 3:
+            d.append(f"  … +{len(gaps) - 3} more")
     elif node == "coder":
         fc = upd.get("files_changed")
         d.append(f"{fc} file(s) changed" if fc else "changes committed")
@@ -246,6 +261,13 @@ def _highlight(node: str, upd: dict) -> str:
         if upd.get("quality_gate_unverified"):
             return f"DID NOT fully run — {checked} file(s) checked"
         return f"{checked} file(s) clean"
+    if node == "qa_scenarios":
+        gaps = upd.get("qa_gan_residual_gaps") or []
+        verdict = upd.get("qa_gan_verdict") or "?"
+        # Gated on the GAPS, not the verdict -- same reason as the PR-body section in open_pr.
+        if gaps:
+            return f"{verdict} — {len(gaps)} residual HIGH gap(s)"
+        return f"{verdict} — converged" if verdict else "scenarios hardened"
     if node == "coder":
         # Only ever mention the evaluation when it actually ran -- with NODE_EVAL off (the default)
         # this is unchanged from before D5.

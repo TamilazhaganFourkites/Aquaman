@@ -229,6 +229,15 @@ QUALITY_GATE_CMD_TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_CMD
 # could-not-run on most runs and add minutes to the rest.
 QUALITY_GATE_JAVA = os.environ.get("OCEAN_PIPELINE_QUALITY_GATE_JAVA", "").lower() in ("1", "true", "yes")
 
+# ---- D1 Step 2: GAN round ceiling ------------------------------------------------------------
+# ocean-qa-agent Step 5d's termination is an ordered decision list, not a blanket cap: it may EXTEND
+# past round 3 only when the HIGH count is strictly decreasing AND both scores already clear 90%
+# (the converging shape MM-14312/MM-14381 both showed, cut off by the old cap). A plateau -- flat or
+# rising HIGH with fresh bugs each round, MM-14457/MM-14475 -- stops instead, because extending it
+# mints new bugs rather than converging. This is the ceiling that bounds the extension; pinning it
+# back to 3 restores the old behaviour for a batch without editing SKILL.md mid-run.
+MAX_GAN_ROUNDS = int(os.environ.get("OCEAN_PIPELINE_MAX_GAN_ROUNDS", "5"))
+
 # ---- B1: multi-repo review coverage gate ------------------------------------------------------
 # `harsh_reviewer` runs with ONE cwd (nodes.py, cwd=Path(state["worktree_dir"])) while `open_pr` and
 # `flip_ready` act on EVERY slug in `_service_slugs(state)`. Nothing in between notices a repo that

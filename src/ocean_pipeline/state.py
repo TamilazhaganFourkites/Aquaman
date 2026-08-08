@@ -184,6 +184,8 @@ class OceanState(TypedDict, total=False):
     # `--use-scenarios` so the pytest is written from these, not designed fresh.
     qa_scenarios_path: str            # artifact path ocean-qa-agent wrote on `--scenarios-only`
     qa_gan_verdict: str               # APPROVE | APPROVE WITH FIXES | REJECT (Step 5d) -- surfaced at qa_review_gate
+    qa_gan_stop_reason: str           # D1 Step 2: converged | scores_below_threshold | plateau |
+                                      # round_ceiling — WHY the GAN loop ended, not just its verdict
     qa_gan_residual_gaps: list        # D1 Step 1: residual HIGH gaps the GAN could not close, read
                                       # via the 6-name alias reader + severity filter, wired to coder
     qa_gan_phase0_gaps: list          # HIGH spec gaps from Step 2e, headless-deferred to qa_review_gate

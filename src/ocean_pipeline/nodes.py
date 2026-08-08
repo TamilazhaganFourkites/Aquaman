@@ -1325,6 +1325,13 @@ async def qa_scenarios(state: OceanState) -> dict:
                 f"exists yet for this ticket -- design the test scenarios from the ticket's ACs ALONE (Steps "
                 f"1-2d, 5, 5b, 5d -- Step 2e is disabled, skip it), GAN-harden them (Step 5d test-case "
                 f"GAN), and persist the hardened scenario list + qa_gan_verdict to {scenarios_path}. "
+                # D1 Step 2: the ceiling that bounds Step 5d's evidence-gated extension.
+                # The skill may go past round 3 ONLY while HIGH is strictly decreasing and
+                # both scores clear 90%; a plateau stops regardless. Also ask for the
+                # stop_reason, which is what makes "why did it end" visible downstream.
+                f"max_gan_rounds={config.MAX_GAN_ROUNDS} (the ceiling for Step 5d's "
+                f"evidence-gated extension). Persist `stop_reason` (converged | "
+                f"scores_below_threshold | plateau | round_ceiling) as a TOP-LEVEL key too. "
                 f"**Phase 1 is AC-ONLY — read NO code and NO automation-testing files** (MM-14132/"
                 f"EXE-44302b71): do NOT run Step 3/3b (PR/diff search — none exists yet) AND do NOT run "
                 f"Step 4/4a (sibling-test / helper-file reading) — the sibling-test conventions are applied "
@@ -1348,6 +1355,7 @@ async def qa_scenarios(state: OceanState) -> dict:
     return {"qa_scenarios_path": str(scenarios_path),
             "qa_gan_verdict": gan_verdict,
             "qa_gan_residual_gaps": gan_gaps,
+            "qa_gan_stop_reason": str(partial.get("stop_reason") or ""),
             "qa_gan_phase0_gaps": partial.get("qa_gan_phase0_gaps", [])}
 
 
@@ -1712,6 +1720,19 @@ async def open_pr(state: OceanState) -> dict:
     # what the coder proposed or whether the fallback text above fired.
     ticket_line = f"Ticket: {state['ticket_id']}"
     body = body_text if body_text.startswith(ticket_line) else f"{ticket_line}\n\n{body_text}"
+    # D1 Step 3 (bullet 1): surface the GAN's residual HIGH gaps to the human who reviews this PR.
+    # GATED ON THE GAPS BEING NON-EMPTY, never on `qa_gan_verdict` -- 4 of 5 real artifacts are
+    # REJECT and the verdict vocabulary itself drifts (`APPROVE_WITH_FIXES` vs `APPROVE WITH
+    # FIXES`), so gating on the verdict would put this section on nearly every PR and train
+    # reviewers to skip it. APPENDS ONLY, after the Ticket: line logic: with no gaps the body is
+    # byte-identical to what it was before this existed.
+    gan_gaps = state.get("qa_gan_residual_gaps") or []
+    if gan_gaps:
+        lines = "\n".join(f"- {g.get('summary', '')}" for g in gan_gaps if isinstance(g, dict))
+        body += (f"\n\n---\n**Residual test-coverage gaps ({len(gan_gaps)})** — an adversarial "
+                 f"panel hardened this ticket's test scenarios before the code was written and "
+                 f"these HIGH-severity gaps survived its rounds. They were given to the coder; "
+                 f"please confirm they are addressed or consciously accepted:\n{lines}\n")
     for slug in slugs:                       # one draft PR per changed repo (open_draft_pr is idempotent)
         if slug not in pr_numbers:
             pr_numbers[slug] = gitops.open_draft_pr(slug, branch, title, body)
