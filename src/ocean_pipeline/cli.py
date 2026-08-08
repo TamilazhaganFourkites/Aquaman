@@ -141,6 +141,37 @@ async def _drive_stream(app, initial, thread) -> tuple[dict, float, tuple[str, .
     return snapshot.values, time.monotonic() - start, snapshot.next
 
 
+# Which resume flag each interrupt() gate OWNS. One table, read by both `_pause_message` (what to
+# tell the human) and `_check_gate_flag` (what to accept) — the two must never disagree, because the
+# whole defect class here is a flag reaching a gate it was not meant for.
+_GATE_FLAGS: dict[str, str] = {
+    "rca_review_gate": "approve/reject",
+    "human_gate": "approve/reject",
+    "qa_review_gate": "qa",
+    "blocked_review_gate": "blocked",
+}
+
+
+def _check_gate_flag(execution_id: str, paused_on: tuple[str, ...], flag: str) -> None:
+    """Refuse a resume flag that belongs to a DIFFERENT gate than the one actually paused.
+
+    The flag dispatch in `main` is a flat if/elif that never asks which gate is waiting, and
+    `cli.py`'s own pause path already called that out as a hazard. It was worse than a wrong hint:
+    `--blocked reject` on a paused human_gate arrived as a dict, `after_human_gate` prefix-tested
+    the stringified dict, missed "reject", and FLIPPED THE SERVICE PR READY — a reject read as an
+    approve, irreversibly, from one keystroke.
+
+    `after_human_gate` now fails safe on anything it does not own, so this is the second line of
+    defence rather than the only one. It exists because a silent wrong-gate resume is still a bad
+    outcome even when it fails safe: the human thinks they answered the question they were asked."""
+    owner = next((g for g in paused_on if g in _GATE_FLAGS), "")
+    if not owner or _GATE_FLAGS[owner] == flag:
+        return
+    raise SystemExit(
+        f"--{flag} is not a decision for the gate this run is paused at ({owner}).\n"
+        f"  {_pause_message(execution_id, paused_on)}")
+
+
 def _pause_message(execution_id: str, paused_on: tuple[str, ...]) -> str:
     """The resume hint for whichever interrupt() gate the graph is actually sitting in front
     of. Three gates exist, not all with the same resume flags — a generic "awaiting approval,
@@ -409,8 +440,11 @@ async def _run(ticket_id: str, context: str) -> None:
     await _execute(execution_id, ticket_id, initial, thread)
 
 
-async def _resume_ticket_id(execution_id: str, thread: dict) -> str:
+async def _resume_ticket_id(execution_id: str, thread: dict) -> tuple[str, tuple[str, ...]]:
     """Recover the real ticket_id from the checkpointed graph state before _execute runs.
+
+    Also returns `snapshot.next` — the gate the run is paused at — so the resume can REFUSE a flag
+    belonging to a different gate (see `_check_gate_flag`). One snapshot read serves both.
 
     Without this, a resume hardcoded ticket_id="" — even though the checkpoint has held the
     real value all along (proven by _report()'s own use of final.get("ticket_id", "") on the
@@ -422,15 +456,17 @@ async def _resume_ticket_id(execution_id: str, thread: dict) -> str:
         async with AsyncSqliteSaver.from_conn_string(config.CHECKPOINT_DB) as saver:
             app = compile_app(saver)
             snapshot = await app.aget_state(thread)
-            return snapshot.values.get("ticket_id", "")
+            return snapshot.values.get("ticket_id", ""), tuple(snapshot.next or ())
     except Exception:  # noqa: BLE001 — best-effort recovery only, never block the resume
-        return ""
+        return "", ()
 
 
-async def _resume(execution_id: str, resume_value=None) -> None:
+async def _resume(execution_id: str, resume_value=None, gate_flag: str = "") -> None:
     _preflight()
     thread = {"configurable": {"thread_id": execution_id}, "recursion_limit": RECURSION_LIMIT}
-    ticket_id = await _resume_ticket_id(execution_id, thread)
+    ticket_id, paused_on = await _resume_ticket_id(execution_id, thread)
+    if gate_flag:
+        _check_gate_flag(execution_id, paused_on, gate_flag)
     # A plain crash-resume replays from the checkpoint (input None). Resuming a paused gate injects
     # the decision via Command(resume=...) so the pending interrupt() returns it — a plain string
     # ("approve"/"reject") for the rca_review_gate or ready-flip human_gate, or a {decision, note}
@@ -486,17 +522,21 @@ def main() -> None:
     if args.print_graph:
         print(build_graph().compile().get_graph().draw_mermaid())
     elif args.resume:
+        # This dispatch is GATE-UNAWARE by construction — it reads the flags, not the checkpoint.
+        # `gate_flag` carries which flag was used so `_resume` can check it against the gate the run
+        # is ACTUALLY paused at, before injecting anything. Without that check, `--blocked reject`
+        # reached a paused human_gate as a dict and the ready-flip router read it as an approve.
         if args.qa:   # QA review gate: {decision, note}
-            resume_value = {"decision": args.qa.replace("-", "_"), "note": args.note}
+            resume_value, gate_flag = {"decision": args.qa.replace("-", "_"), "note": args.note}, "qa"
         elif args.blocked:   # MM-14816 (G20) blocked-open-questions gate: {decision, note}
-            resume_value = {"decision": args.blocked, "note": args.note}
+            resume_value, gate_flag = {"decision": args.blocked, "note": args.note}, "blocked"
         elif args.approve:
-            resume_value = "approve"
+            resume_value, gate_flag = "approve", "approve/reject"
         elif args.reject:
-            resume_value = "reject"
+            resume_value, gate_flag = "reject", "approve/reject"
         else:
-            resume_value = None
-        asyncio.run(_resume(args.resume, resume_value))
+            resume_value, gate_flag = None, ""   # plain crash-resume: no decision, nothing to check
+        asyncio.run(_resume(args.resume, resume_value, gate_flag))
     elif args.ticket:
         asyncio.run(_run(args.ticket, args.context))
     else:

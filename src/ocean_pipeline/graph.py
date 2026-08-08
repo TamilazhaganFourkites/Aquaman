@@ -226,8 +226,24 @@ def after_sit_triage(state: OceanState) -> str:
 
 
 def after_human_gate(state: OceanState) -> str:
-    # Off (default) or approved -> flip; an explicit reject on resume -> stop (PR left draft).
-    return "reject" if str(state.get("approval_decision", "")).lower().startswith("reject") else "approve"
+    """Flip the service PR ready, or stop with it left draft.
+
+    The gate is OFF by default, and when off `human_gate` passes through with `approval_decision`
+    unset — so "" MUST mean approve, or the default path stops every green run. That is why this
+    cannot simply fail closed on anything unrecognised.
+
+    But it must not approve on a decision meant for a DIFFERENT gate. It used to prefix-test
+    `str(approval_decision)`, so `--blocked reject` (which arrives as a dict) started with "{",
+    missed the "reject" prefix, and FLIPPED THE PR — a reject read as an approve, irreversibly.
+    Measured: `--blocked reject`, `--blocked post`, `--qa changes` all routed to approve.
+
+    So: "" (gate off / never paused) approves, an explicit approval approves, and everything else —
+    including any decision this gate does not own — stops. Stopping is recoverable: the PR is left
+    draft and a human can flip it. The reverse is not."""
+    raw = state.get("approval_decision", "")
+    if raw in ("", None):
+        return "approve"                     # gate off, or resumed without a decision
+    return "approve" if schemas.gate_decision(raw, ("approve", "approved")) else "reject"
 
 
 def build_graph():

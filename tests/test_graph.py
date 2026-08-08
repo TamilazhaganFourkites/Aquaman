@@ -1605,8 +1605,11 @@ def test_resume_recovers_real_ticket_id_from_checkpoint(tmp_path, monkeypatch):
     asyncio.run(_pause_at_gate())
     nodes._release_sit_slot("EXE-resume-test")  # see _run()'s comment -- ainvoke bypasses cli.py's release
 
-    recovered = asyncio.run(cli._resume_ticket_id("EXE-resume-test", thread))
+    recovered, paused_on = asyncio.run(cli._resume_ticket_id("EXE-resume-test", thread))
     assert recovered == "MM-9999"
+    # The SECOND half is what makes a wrong-gate resume refusable: the same snapshot read now also
+    # reports which gate the run is sitting at.
+    assert "human_gate" in paused_on, f"paused gate not recovered: {paused_on}"
 
 
 def test_resume_ticket_id_best_effort_on_missing_checkpoint(tmp_path, monkeypatch):
@@ -1614,8 +1617,9 @@ def test_resume_ticket_id_best_effort_on_missing_checkpoint(tmp_path, monkeypatc
     handling is the right place for that to surface, not the ticket_id recovery helper."""
     monkeypatch.setattr(config, "CHECKPOINT_DB", str(tmp_path / "checkpoints.sqlite"))
     thread = {"configurable": {"thread_id": "EXE-does-not-exist"}, "recursion_limit": 100}
-    recovered = asyncio.run(cli._resume_ticket_id("EXE-does-not-exist", thread))
+    recovered, paused_on = asyncio.run(cli._resume_ticket_id("EXE-does-not-exist", thread))
     assert recovered == ""
+    assert paused_on == ()   # unknown gate -> _check_gate_flag must not refuse anything
 
 
 def test_resume_passes_recovered_ticket_id_to_execute(tmp_path, monkeypatch):
@@ -1719,6 +1723,118 @@ def test_preflight_fails_when_sme_files_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
     with pytest.raises(SystemExit, match="sme-load-creation.md"):
         cli._preflight()
+
+
+# ------------------------------------------------- C6: the four untested gate routers
+def test_after_human_gate_never_reads_another_gates_decision_as_approval():
+    """THE defect this whole item is about, and it was irreversible.
+
+    `--blocked reject` is a flag for a DIFFERENT gate, but cli's dispatch is flat and gate-unaware,
+    so it reached a paused human_gate as `{"decision": "reject", "note": None}`. human_gate stored
+    `str(...)` of that dict, and the router prefix-tested the result: the string starts with "{", so
+    `.startswith("reject")` was False, so it routed APPROVE — and the service PR was flipped
+    ready-for-review by a command whose literal text was `reject`.
+
+    Measured before the fix: `--blocked reject`, `--blocked post` and `--qa changes` ALL approved."""
+    approve = lambda d: graph.after_human_gate({"approval_decision": d})  # noqa: E731
+
+    # Every foreign-gate decision must now stop, not flip.
+    for foreign in ({"decision": "reject", "note": None},      # --blocked reject
+                    {"decision": "post", "note": None},        # --blocked post
+                    {"decision": "answer", "note": "x"},       # --blocked answer
+                    {"decision": "changes", "note": "x"},      # --qa changes
+                    {"decision": "approve_testrail"},          # --qa approve-testrail
+                    "banana", "{'decision': 'reject'}"):
+        assert approve(foreign) == "reject", f"{foreign!r} routed to approve — this flips a PR"
+
+    # The gate's own vocabulary still works, including case and the past-tense form.
+    for ok in ("approve", "APPROVE", " approve ", "approved"):
+        assert approve(ok) == "approve", ok
+    assert approve("reject") == "reject"
+
+    # And the DEFAULT path must still flip: the gate is off unless REQUIRE_APPROVAL is set, and
+    # human_gate then passes through with no decision at all. Failing closed here would stop every
+    # green run — which is why this router cannot simply reject the unrecognised.
+    assert graph.after_human_gate({}) == "approve"
+    assert approve("") == "approve"
+    assert approve(None) == "approve"
+
+
+def test_gate_decision_canonicalizer():
+    """The shared helper, tested directly — `after_human_gate` alone cannot pin it.
+
+    A foreign DICT rejects whether or not the unwrap exists (unwrapped it isn't an approval;
+    un-unwrapped it isn't a string match either), so the router's tests leave the unwrap
+    unverified. But the helper's contract covers every gate, and two of them (`--qa`, `--blocked`)
+    are dict-carrying by design — so an approving dict must resolve, and the unwrap is what does it."""
+    g = schemas.gate_decision
+    # dict form resolves to its decision
+    assert g({"decision": "approve", "note": None}, ("approve",)) == "approve"
+    assert g({"decision": "changes", "note": "x"}, ("changes", "approve_testrail")) == "changes"
+    # EXACT match, never a prefix — "{'decision':..." must not satisfy a "reject" gate
+    assert g("{'decision': 'reject'}", ("reject",)) == ""
+    assert g("rejected-by-engineer", ("reject",)) == ""
+    # tolerant of the shapes humans and argparse actually produce
+    assert g(" APPROVE ", ("approve",)) == "approve"
+    assert g("approve-no-testrail".replace("-", "_"), ("approve_no_testrail",)) == "approve_no_testrail"
+    # absent / unknown -> "" so each router picks its own fail-safe
+    for empty in ("", None, {}, {"note": "x"}, "banana", 5):
+        assert g(empty, ("approve",)) == "", empty
+
+
+def test_cli_refuses_a_resume_flag_that_belongs_to_a_different_gate():
+    """Second line of defence: refuse the wrong-gate flag before it is ever injected. The router
+    now fails safe, but a silent wrong-gate resume is still bad — the human believes they answered
+    the question they were asked."""
+    for paused, flag in (("human_gate", "blocked"), ("human_gate", "qa"),
+                         ("qa_review_gate", "approve/reject"), ("blocked_review_gate", "qa"),
+                         ("rca_review_gate", "blocked")):
+        with pytest.raises(SystemExit) as e:
+            cli._check_gate_flag("EXE-x", (paused,), flag)
+        assert paused in str(e.value) and "resume" in str(e.value), "the refusal must name the gate"
+
+    # Matching flags pass, and an unknown/absent gate must not refuse anything (a plain crash-resume
+    # has no decision to check, and a future gate should not be blocked by this table).
+    for paused, flag in (("human_gate", "approve/reject"), ("qa_review_gate", "qa"),
+                         ("blocked_review_gate", "blocked"), ("rca_review_gate", "approve/reject")):
+        cli._check_gate_flag("EXE-x", (paused,), flag)
+    cli._check_gate_flag("EXE-x", (), "qa")
+    cli._check_gate_flag("EXE-x", ("some_future_gate",), "qa")
+
+
+def test_gate_flag_table_and_pause_message_agree():
+    """One table, two readers. If `_GATE_FLAGS` and `_pause_message` ever disagree, the CLI refuses
+    a flag while telling the human to use it — which is the same class of defect one level up."""
+    for gate, flag in cli._GATE_FLAGS.items():
+        msg = cli._pause_message("EXE-x", (gate,))
+        for token in (flag.split("/") if "/" in flag else [flag]):
+            assert f"--{token}" in msg, f"_pause_message for {gate} never mentions --{token}"
+
+
+def test_after_blocked_review_and_reachability_and_qa_routers():
+    """The other three routers the queue flagged as having zero test references."""
+    # blocked_review_gate: fails SAFE — the only outward action (the Jira post) needs an EXPLICIT
+    # "post"; everything else continues. Note the router is 2-way while the NODE is 3-way: `answer`
+    # and `reject` differ in the STATE they write (answers carried vs questions carried as caveats),
+    # not in the route. Asserting the node's vocabulary here is the adjacent-inference error this
+    # queue is full of — the route is what `graph.py` returns, not what the node called it.
+    assert graph.after_blocked_review({"blocked_decision": "post"}) == "post"
+    for cont in ({"blocked_decision": "answer"}, {"blocked_decision": "reject"},
+                 {"blocked_decision": ""}, {}):
+        assert graph.after_blocked_review(cont) == "continue", cont
+
+    # reachability: an AC-blocking open question diverts to the human gate BEFORE the ~20-min GAN
+    # and the coder. Whitespace-only entries must not divert — it matches stop_run's stripped filter.
+    assert graph.after_reachability({"blocking_open_questions": ["needs a product call"]}) == "blocked"
+    for clear in ({"blocking_open_questions": []}, {}, {"blocking_open_questions": ["   ", ""]}):
+        assert graph.after_reachability(clear) == "proceed", clear
+
+    # qa_review: "changes" re-authors only while budget remains, then falls through to sit_run.
+    assert graph.after_qa_review({"qa_decision": "changes", "qa_review_iteration": 0}) == "sit_author"
+    assert graph.after_qa_review({"qa_decision": "changes",
+                                  "qa_review_iteration": config.MAX_QA_REVIEW_ITERATIONS}) == "sit_run"
+    assert graph.after_qa_review({"qa_decision": "approve_testrail"}) == ["sit_run", "sit_testrail"]
+    assert graph.after_qa_review({"qa_decision": "approve_no_testrail"}) == "sit_run"
 
 
 def test_a_code_fault_rework_restores_the_qa_changes_budget():

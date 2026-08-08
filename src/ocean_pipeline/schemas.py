@@ -112,6 +112,33 @@ _SEVERITY_ALIASES = {
 }
 
 
+def gate_decision(raw, allowed: tuple[str, ...]) -> str:
+    """The human's decision at a resume gate, as one of `allowed`, or "" if it is not one of them.
+
+    THE GATES ARE NOT INTERCHANGEABLE AND THE RESUME FLAGS ARE NOT VALIDATED AGAINST THE PAUSED ONE.
+    `cli.py`'s flag dispatch is a flat if/elif that never asks which gate is waiting, so
+    `--blocked reject` — a flag for a DIFFERENT gate — reaches a paused human_gate as the DICT
+    `{"decision": "reject", "note": None}`. `nodes.human_gate` then stores `str(decision)`, and
+    `after_human_gate` prefix-tested that string:
+
+        str({"decision": "reject", ...}).startswith("reject")   ->  False   (it starts "{")
+        ->  "approve"  ->  the service PR is FLIPPED READY-FOR-REVIEW
+
+    A reject read as an approve, from one keystroke, irreversibly. `argparse choices=` does not help;
+    it is what PRODUCES the well-formed dict that defeats the prefix test. Measured before the fix:
+    `--blocked reject`, `--blocked post`, `--qa changes` and an unset decision ALL routed to approve.
+
+    So: unwrap the dict, match EXACT tokens (never a prefix — "rejected-by-x" and "reject" are the
+    same intent, but "{'decision': ..." is not an intent at all), and return "" for anything
+    unrecognised so each router can pick its own fail-safe. This mirrors `blocked_review_gate`
+    (nodes.py:998), the one gate that already survived this, and follows `normalize_severity` above:
+    one canonicalizer, imported by every consumer, because the duplication IS the defect."""
+    if isinstance(raw, dict):
+        raw = raw.get("decision", "")
+    token = str(raw or "").strip().strip("-_ ").lower().replace("-", "_")
+    return token if token in allowed else ""
+
+
 def normalize_severity(finding) -> str:
     """A finding's severity as one of CRITICAL / MAJOR / MINOR / "" (absent).
 
