@@ -11,12 +11,18 @@ It must never block or fail a pipeline run. Uses stdlib urllib (no extra depende
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import urllib.request
 
 JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "https://fourkites.atlassian.net").rstrip("/")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
+# Atlassian CLOUD authenticates an API token with Basic <email:token>, NOT Bearer. Bearer is for
+# OAuth access tokens and for Server/DC personal access tokens -- against fourkites.atlassian.net it
+# returns 403 Forbidden. That mattered silently: every writer below swallows errors ("best-effort ->
+# no-op"), so a 403 here means transitions and comments the pipeline reports as done never happened.
+JIRA_EMAIL = os.environ.get("JIRA_EMAIL", "")
 DEBUG = os.environ.get("OCEAN_PIPELINE_JIRA_DEBUG", "").lower() in ("1", "true", "yes")
 TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_JIRA_TIMEOUT", "10"))
 
@@ -25,11 +31,19 @@ def _enabled() -> bool:
     return bool(JIRA_API_TOKEN)
 
 
+def _auth_header() -> str:
+    """Basic when an email is configured (Atlassian Cloud), Bearer otherwise (Server/DC, OAuth)."""
+    if JIRA_EMAIL:
+        raw = f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()
+        return "Basic " + base64.b64encode(raw).decode()
+    return f"Bearer {JIRA_API_TOKEN}"
+
+
 def _req(method: str, path: str, body: dict | None = None) -> dict:
     url = f"{JIRA_BASE_URL}/rest/api/2/{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bearer {JIRA_API_TOKEN}",
+        "Authorization": _auth_header(),
         "Content-Type": "application/json",
         "Accept": "application/json",
     })
