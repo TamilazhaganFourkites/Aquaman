@@ -28,3 +28,45 @@
 {"ticket_id": "MM-14060", "route": "coding", "domain_bucket": ""}
 {"ticket_id": "MM-14065", "route": "rca", "domain_bucket": ""}
 {"ticket_id": "MM-13527", "route": "rca", "domain_bucket": ""}
+# ---- 2026-08-09 EXPANSION: 9 -> 21 rows, so `route` clears MIN_SCORABLE_ROWS = 20 ----
+# LABELLING RULE, stated so the ground truth is auditable rather than my opinion:
+#   The eval feeds the worker TITLE + DESCRIPTION ONLY. If I labelled from that same text, the eval
+#   would measure agreement-with-me, not correctness. So every row below is labelled from a field
+#   the worker CANNOT see:
+#     TIER 1 (structural, strongest) — issue_type:
+#         Incident Ticket / PagerDuty        -> rca   (an operational incident is investigated)
+#         Feature                            -> coding (a feature is built)
+#     TIER 2 — issue_type Query whose summary explicitly asks to investigate -> rca
+#     TIER 3 (weakest, used for 2 rows, flagged inline) — Task whose summary names an unambiguous
+#         code action (Fix / Revert). This one DOES read the prose; treated as the least reliable.
+#   SKIPPED deliberately: tickets where the tiers disagree (MM-14245 is typed PagerDuty but its
+#   summary is a backend migration), and the MM-14378 ai-spec siblings that are ops/config rather
+#   than code (create a company + API key, ELD config, env-config enrollment, share a contract).
+#   `domain_bucket` is left "" on every new row -- unverified, so route-only scoring, per this
+#   file's own rule that a wrong label poisons the eval worse than an unscored one.
+#
+# PER-ROW EVIDENCE (the field the label came from):
+#   MM-14685   rca     <- Incident Ticket
+#   MM-14627   rca     <- Incident Ticket
+#   MM-14758   rca     <- PagerDuty
+#   MM-14825   rca     <- PagerDuty
+#   MM-14046   rca     <- Query + 'Please investigate why'
+#   MM-14147   rca     <- Query + 'Investigate missing'
+#   MM-14524   coding  <- Feature
+#   MM-13780   coding  <- Feature
+#   MM-14700   coding  <- Task ai-spec: create a Java DTS parser
+#   MM-14834   coding  <- Task ai-spec: set an event field
+#   MM-14638   coding  <- TIER 3 prose: 'Fix status update for MW decouple changes'
+#   MM-14650   coding  <- TIER 3 prose: 'Revert OW decouple changes'
+{"ticket_id": "MM-14685", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14627", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14758", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14825", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14046", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14147", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14524", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-13780", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14700", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14834", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14638", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14650", "route": "coding", "domain_bucket": ""}
