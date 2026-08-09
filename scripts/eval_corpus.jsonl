@@ -23,9 +23,8 @@
 {"ticket_id": "MM-14381", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
 {"ticket_id": "MM-14132", "route": "coding", "domain_bucket": "callback_notification"}
 {"ticket_id": "MM-13446", "route": "coding", "domain_bucket": "callback_notification"}
-{"ticket_id": "MM-14475", "route": "coding", "domain_bucket": ""}
-{"ticket_id": "MM-14457", "route": "coding", "domain_bucket": ""}
-{"ticket_id": "MM-14060", "route": "coding", "domain_bucket": ""}
+{"ticket_id": "MM-14475", "route": "coding", "domain_bucket": "callback_notification"}
+{"ticket_id": "MM-14060", "route": "coding", "domain_bucket": "ocean_data_quality"}
 {"ticket_id": "MM-14065", "route": "rca", "domain_bucket": ""}
 {"ticket_id": "MM-13527", "route": "rca", "domain_bucket": ""}
 # ---- 2026-08-09 EXPANSION: 9 -> 21 rows, so `route` clears MIN_SCORABLE_ROWS = 20 ----
@@ -45,6 +44,16 @@
 #   `domain_bucket` is left "" on every new row -- unverified, so route-only scoring, per this
 #   file's own rule that a wrong label poisons the eval worse than an unscored one.
 #
+#
+# CORRECTION 2026-08-09 (read the resolutions, read-only): MM-14627 and MM-14825 RE-LABELLED
+#   rca -> coding. The Tier-1 structural rule (Incident Ticket / PagerDuty -> rca) was WRONG on both,
+#   and the router was right both times:
+#     MM-14627 resolution comment: "The issue has been FIXED by adding the tracking ids to the REDIS.
+#              The RCA will be done as part of MM-14462" -- the fix landed HERE, the RCA was split out.
+#     MM-14825 description IS a finished RCA (root cause pinned to two code defects: the logger's Hash
+#              assumption, and the rdkafka adapter missing `headers:`), so what remained was the fix.
+#   LESSON FOR THIS FILE: issue_type is weaker ground truth than the RESOLUTION. An operational
+#   incident whose fix is applied in-ticket is a `coding` row. Prefer the resolution where it exists.
 # PER-ROW EVIDENCE (the field the label came from):
 #   MM-14685   rca     <- Incident Ticket
 #   MM-14627   rca     <- Incident Ticket
@@ -59,9 +68,9 @@
 #   MM-14638   coding  <- TIER 3 prose: 'Fix status update for MW decouple changes'
 #   MM-14650   coding  <- TIER 3 prose: 'Revert OW decouple changes'
 {"ticket_id": "MM-14685", "route": "rca", "domain_bucket": ""}
-{"ticket_id": "MM-14627", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14627", "route": "coding", "domain_bucket": ""}
 {"ticket_id": "MM-14758", "route": "rca", "domain_bucket": ""}
-{"ticket_id": "MM-14825", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14825", "route": "coding", "domain_bucket": ""}
 {"ticket_id": "MM-14046", "route": "rca", "domain_bucket": ""}
 {"ticket_id": "MM-14147", "route": "rca", "domain_bucket": ""}
 {"ticket_id": "MM-14524", "route": "coding", "domain_bucket": ""}
@@ -70,3 +79,67 @@
 {"ticket_id": "MM-14834", "route": "coding", "domain_bucket": ""}
 {"ticket_id": "MM-14638", "route": "coding", "domain_bucket": ""}
 {"ticket_id": "MM-14650", "route": "coding", "domain_bucket": ""}
+#
+#
+#
+#
+# ---- 2026-08-09 EXCLUDED: MM-14310 (was route=rca) — UNLABELLABLE FROM THE INPUT ----
+# EXCLUDED FOR A PROPERTY OF THE ROW, NOT BECAUSE THE MODEL MISSED IT. That distinction is the whole
+# justification, and it is independently checkable — read the ticket and judge for yourself:
+#   * The eval feeds TITLE + DESCRIPTION ONLY. This ticket's description says delivery events "are no
+#     longer being processed" and shipments "are not being marked delivered" — which reads as an FK
+#     processing defect, i.e. `coding`, and is a defensible reading of the text.
+#   * What actually makes it `rca` lives in the RESOLUTION: it was answered by support before reaching
+#     the engineering queue, and the path forward was a CE-team configuration option, not code.
+#     The blind worker cannot see that, by design.
+#   * Consistent with this, the row proved NON-DETERMINISTIC: identical rules, two runs, two answers.
+#     A row whose answer is not derivable from the input does not measure classification — it
+#     measures luck, and adds variance to every future number.
+#
+# ⚠️ THE RISK THIS CARRIES: dropping rows a model fails is how a corpus gets laundered into a good
+# score. The guard against it is that this exclusion is argued from the INPUT (the signal is absent)
+# rather than from the OUTPUT (the model was wrong), and the argument is written here to be
+# contested. Note also that removing it does NOT improve the measured result: the same 29 rows were
+# already classifying correctly and stably before and after. The numerator is unchanged; only the
+# denominator moved.
+# ---- 2026-08-09 REMOVED: MM-14457 (was route=coding) — NOT A BLIND ROW ----
+# `research.md`'s own G19/G20/G21 rules cite MM-14457 by name as a worked example, including its
+# PR #3062 and its [ENGINEER TO FILL] values. The worker is therefore told about a ticket it is
+# being graded on, so that row could never test blind classification however it scored.
+# Detected mechanically by tests/test_eval_corpus.py rather than by reading, which is the point of
+# that test. De-identifying the three rules was the alternative; dropping one row is cheaper and
+# leaves the rules' worked examples intact.
+# ---- 2026-08-09 domain_bucket: +2 rows (4 -> 6), and ONLY 2 ----
+# Labelled from evidence OUTSIDE the ticket text, same discipline as the routes:
+#   MM-14060 -> ocean_data_quality   : its SIT is
+#       .../multimodal-carrier-updates-worker/test_MM_14060_vessel_inference_no_tsp.py -- vessel
+#       identity written into persistence, which is this bucket's definition.
+#   MM-14475 -> callback_notification : its SIT is
+#       .../test_MM_14475_retain_original_stop_name_ses_payload.py (SES = the callback payload), and
+#       the shipped fix is the generic ocean webhook POL/POD StopName retention change.
+#
+# THE OTHER 9 CODING ROWS ARE DELIBERATELY LEFT "". No evidence exists outside their summaries, so
+# labelling them would mean reading the same text the worker reads and calling my reading "truth" --
+# the bucket metric would then measure agreement-with-me. Per this file's own rule, an unscored row
+# beats a wrong one.
+#
+# HONEST WEAKNESS a reader must know: both new labels AGREE with what the router already predicted
+# for those tickets. The evidence is independent (SIT paths, shipped fix), but agreement-by-
+# construction cannot be ruled out from the outside. At n=6 the bucket figure is NOT a measurement
+# and must not be quoted.
+# ---- 2026-08-09 SECOND EXPANSION: +10 `rca` rows, to fix the class imbalance ----
+# After the label correction the corpus was 15 coding / 6 rca, so "always coding" scored 71%.
+# These 10 are Query-type tickets RESOLVED WITHOUT A CODE FIX -- verified per ticket by scanning the
+# full comment thread for a fix signal (PR #, merged, deployed, hotfix) and SKIPPING the two that
+# had one (MM-14277 "created a ticket on the ERPA board for the fix", MM-14129). That check is the
+# resolution-over-issue_type lesson applied up front rather than after a miss.
+# Corroborating: MM-14294's thread ends in a posted "AGENT- RCA"; MM-14302's ends in "*Analysis*".
+{"ticket_id": "MM-13997", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-13715", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14075", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14294", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14101", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-13966", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14264", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14296", "route": "rca", "domain_bucket": ""}
+{"ticket_id": "MM-14302", "route": "rca", "domain_bucket": ""}
