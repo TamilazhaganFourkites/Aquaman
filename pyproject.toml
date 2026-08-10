@@ -25,7 +25,6 @@ telemetry = ["mcp>=1.0"]   # aidev-db HTTP MCP client (usually already present v
 
 [project.scripts]
 ocean-pipeline = "ocean_pipeline.cli:main"
-ocean-pipeline-qa-batch = "ocean_pipeline.qa_batch:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -472,11 +472,10 @@ def test_the_sme_skip_event_names_the_token_it_could_not_match(monkeypatch):
 def test_an_unmatched_token_cannot_leak_from_one_ticket_to_the_next(monkeypatch):
     """The record lives on the VERDICT, not in a module-level list.
 
-    `qa_batch.py` runs every ticket of a batch in ONE process (`results.append(await run_one(t))`),
-    so a module-level record of the unmatched token would still be there when the next ticket
-    arrived: a ticket that genuinely has no bucket would be reported as carrying the PREVIOUS
-    ticket's typo, and would fire the misrouted-ticket milestone. Only the monitor was safe, and
-    only incidentally — it spawns a subprocess per ticket.
+    A driver that runs every ticket of a batch in ONE process would leave a module-level record of
+    the unmatched token in place when the next ticket arrived: a ticket that genuinely has no bucket
+    would be reported as carrying the PREVIOUS ticket's typo, and would fire the misrouted-ticket
+    milestone. The monitor is safe only incidentally — it spawns a subprocess per ticket.
 
     Gating the READ on a truthy `domain_bucket` does not fix this: the validator blanks the bucket
     in BOTH cases, so that gate suppresses the typo report this record exists to produce."""
@@ -492,3 +491,410 @@ def test_an_unmatched_token_cannot_leak_from_one_ticket_to_the_next(monkeypatch)
     seen = _sme_skip_event(monkeypatch, {"domain_bucket": ""})   # ticket 2: genuinely none
     assert seen.get("unmatched_token") == "", (
         "the previous ticket's unmatched token leaked into this one's telemetry")
+
+
+# ------------------------------------------------- EXE-fb83a6fd: a print() killed a finished station
+def test_a_nonblocking_stdout_cannot_kill_a_station(monkeypatch, capsys):
+    """EXE-fb83a6fd: `agents._emit`'s bare `print` raised `BlockingIOError: [Errno 35]` (EAGAIN,
+    i.e. fd 1 was in non-blocking mode) SEVEN MINUTES into the researcher station, after it had
+    produced 81 KB of completed analysis. The exception propagated out of `_drive`, exhausted the
+    retry budget, and failed the run. All the work was discarded.
+
+    `_emit` is the hottest console path there is — one call per line per SDK message at developer
+    log level — so it is the one that must be incapable of raising."""
+    from ocean_pipeline import ui
+
+    def explode(*_a, **_k):
+        raise BlockingIOError(35, "write could not complete without blocking")
+
+    monkeypatch.setattr("builtins.print", explode)
+    nodes.agents._emit("researcher", "a line of streamed agent activity")  # must not raise
+    ui.milestone("transient error (BlockingIOError); retrying in 3s")      # nor the retry's own report
+    ui.station_start("researcher")
+
+
+def test_the_retry_announcement_cannot_be_what_kills_the_retry(monkeypatch):
+    """The second half of the same traceback. `_drive_with_retry` caught the BlockingIOError and then
+    died inside `ui.milestone` — the line announcing the retry — on the SAME broken stream. It got
+    through attempts 1/4 and 2/4 and never reached 3 or 4.
+
+    A transient-I/O handler that reports through the failing stream cannot work, so this is a
+    separate defect from the `_emit` one: fixing only `_emit` leaves the retry loop just as fragile
+    against the next stdout fault."""
+    from ocean_pipeline import agents, config
+
+    monkeypatch.setattr(config, "MAX_AGENT_RETRIES", 2)
+    monkeypatch.setattr(config, "AGENT_RETRY_BACKOFF_SECONDS", 0)
+    attempts = []
+
+    async def flaky(*_a, **_k):
+        attempts.append(1)
+        raise BlockingIOError(35, "write could not complete without blocking")
+
+    real_print = print
+
+    def explode(*a, **k):
+        # Only the pipeline's own console writes fail; pytest's internals keep working.
+        if a and isinstance(a[0], str) and ("·" in a[0] or a[0].startswith("    [")):
+            raise BlockingIOError(35, "write could not complete without blocking")
+        return real_print(*a, **k)
+
+    monkeypatch.setattr(agents, "_drive", flaky)
+    monkeypatch.setattr("builtins.print", explode)
+    with pytest.raises(BlockingIOError):
+        asyncio.run(agents._drive_with_retry(
+            system_prompt="s", prompt="p", cwd=None, permission_mode="acceptEdits",
+            label="researcher", allowed_tools=None, verdict_path=None, model=None))
+    assert len(attempts) == 3, (
+        f"the retry budget was cut short at {len(attempts)} attempts — the retry's own milestone "
+        f"raised on the same broken stream instead of announcing the retry")
+
+
+def test_a_station_that_dies_still_reports_what_it_spent(monkeypatch):
+    """EXE-fb83a6fd's run-report read `0 tokens · 0 tool calls · 0 station runs` against an 81 KB
+    station log and 7m04s of real work.
+
+    `metrics.add` sat BELOW `_drive`'s `finally`, so it ran only when `_drive` returned normally —
+    a station that spent minutes and then hit a transport fault contributed nothing to
+    `metrics.totals()`, which is what `report.finish` writes as `usage`. The tokens were spent
+    either way."""
+    from ocean_pipeline import agents, metrics
+
+    before = metrics.totals()["output"]
+
+    class _Msg:
+        pass
+
+    async def _stream(**_k):
+        yield _Msg()
+        raise BlockingIOError(35, "write could not complete without blocking")
+
+    monkeypatch.setattr(agents, "_usage", lambda _m: (100, 50))
+    monkeypatch.setattr(agents, "_count_tools", lambda _m: 2)
+    monkeypatch.setattr(agents, "_milestones", lambda _m: [])
+    monkeypatch.setattr(agents, "_format_message", lambda _m: ["line"])
+    # `query` is imported INSIDE _drive (`from claude_agent_sdk import ... query`), so the patch has
+    # to land on the source module, not on `agents`.
+    import claude_agent_sdk
+    monkeypatch.setattr(claude_agent_sdk, "query", _stream)
+
+    with pytest.raises(BlockingIOError):
+        asyncio.run(agents._drive("s", "p", None, "acceptEdits", "researcher", None, None))
+
+    assert metrics.totals()["output"] > before, (
+        "a station that died after real token spend contributed 0 to the run's usage totals")
+
+
+def test_startup_puts_stdout_back_into_blocking_mode(monkeypatch):
+    """The layer that removes the failure class rather than surviving it.
+
+    `O_NONBLOCK` lives on the open file description, shared across fork/exec, so a descendant that
+    flips it flips it here too — and every writer in this codebase assumes a blocking pipe (the
+    monitor drains continuously, so waiting is correct and brief)."""
+    import os as _os
+
+    from ocean_pipeline import cli
+
+    r, w = _os.pipe()
+    try:
+        _os.set_blocking(w, False)
+        assert _os.get_blocking(w) is False, "the fixture must actually start non-blocking"
+
+        class _Stream:
+            def fileno(self):
+                return w
+
+        monkeypatch.setattr(cli.sys, "stdout", _Stream())
+        monkeypatch.setattr(cli.sys, "stderr", _Stream())
+        cli._force_blocking_stdio()
+        assert _os.get_blocking(w) is True, (
+            "stdout was left non-blocking, so the next full pipe raises EAGAIN instead of waiting")
+    finally:
+        _os.close(r)
+        _os.close(w)
+
+
+def test_forcing_blocking_mode_never_refuses_to_run(monkeypatch):
+    """A redirected/replaced stream with no real fd must not be a reason to abort a run — the
+    pipeline is routinely driven with captured stdout (pytest, and any in-process driver)."""
+    from ocean_pipeline import cli
+
+    class _NoFd:
+        def fileno(self):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr(cli.sys, "stdout", _NoFd())
+    monkeypatch.setattr(cli.sys, "stderr", object())   # no fileno at all
+    cli._force_blocking_stdio()   # must not raise
+
+
+def test_a_failed_station_writes_its_spend_row_too(monkeypatch, tmp_path):
+    """The per-station half of the same accounting gap. `telemetry.station_spend` sat inside
+    `run_agent`'s `try`, so the station that cost the most — all the work, then a transport fault —
+    wrote no row at all. That is the F10 defect the success path already documents, on the other
+    branch."""
+    from ocean_pipeline import agents, config, telemetry
+
+    rows = []
+    monkeypatch.setattr(telemetry, "station_spend", lambda *a, **kw: rows.append(a))
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    monkeypatch.setattr(agents, "_capture_partial", lambda *a, **kw: None)
+    agents._LAST_TALLY["researcher"] = (100, 50, 2)
+
+    async def boom(*_a, **_k):
+        raise BlockingIOError(35, "write could not complete without blocking")
+
+    monkeypatch.setattr(agents, "_drive_with_retry", boom)
+    with pytest.raises(agents.StationError):
+        asyncio.run(agents.run_agent(
+            agent_md="research.md", node="researcher", ticket_id="MM-1",
+            execution_id="EXE-spend", task_prompt="p",
+            verdict_model=__import__("ocean_pipeline.schemas", fromlist=["x"]).ResearchVerdict))
+
+    assert rows and rows[0][1:] == ("researcher", 100, 50, 2), (
+        f"no spend row for the failed station (got {rows!r}) — the station that cost the most is "
+        f"the one missing from the ledger")
+
+
+# ------------------------------------------------- EXE-fb83a6fd: the declined-tool-call cascade
+def test_workers_are_told_a_declined_tool_call_is_not_a_stop_signal():
+    """The cascade that cost EXE-fb83a6fd ~40 minutes.
+
+    A declined tool result carries the text "STOP what you are doing and wait for the user to tell
+    you how to proceed". There is NO interactive user on a pipeline run, so a worker that obeys it
+    ends its turn with no verdict — and `run_agent` answers a missing verdict by re-driving the
+    WHOLE station in a fresh session. It happened to the researcher AND the dependency resolver in
+    one run; Station 0 alone went from a 4.3m median to 25m.
+
+    The re-drive prompt (agents.py) already warned about background tasks, but ONLY the re-drive —
+    the first pass, which is where the damage happens, never saw it."""
+    from ocean_pipeline import agents
+
+    g = agents.AGENT_GUARDRAILS
+    assert "run_in_background: false" in g, (
+        "workers are not told to dispatch sub-agents synchronously")
+    assert "DECLINED TOOL CALL IS NOT A STOP SIGNAL" in g, (
+        "a declined tool call still reads to the worker as an instruction to halt the station")
+    assert "no verdict" in g.lower() or "write your verdict" in g.lower(), (
+        "nothing tells the worker to finish and write its verdict anyway")
+
+
+def test_the_fanout_bound_is_stated_as_a_number():
+    """"Keep it bounded" is not an instruction a model can follow. Every denial in EXE-fb83a6fd
+    happened with 6-11 sub-agents in flight and none with zero, so the cap is the load-bearing
+    part."""
+    import re as _re
+
+    from ocean_pipeline import agents
+
+    g = agents.AGENT_GUARDRAILS
+    assert _re.search(r"at most \d+ in flight", g), (
+        "the fan-out limit is qualitative, so there is nothing for the worker to check against")
+
+
+def test_an_agent_internal_header_never_becomes_its_own_monitor_row():
+    """`run_agent`'s verdict re-drive prints a `▶ <node>:verdict-redrive` header. The monitor built
+    a row for it, but the completion ✓ is keyed on the REAL node name and resolves the real row —
+    so the re-drive row pulsed forever. Observed twice in one run, under a station already showing
+    "✓ 25m36s".
+
+    Real station labels come from ui._LABELS and are plain English, so a colon in a header is by
+    construction an agent-internal label."""
+    from ocean_pipeline import ui
+
+    import ast as _ast
+
+    app = (pathlib.Path(__file__).resolve().parents[1] / "monitor" / "app.py")
+    tree = _ast.parse(app.read_text())
+
+    # Find the guard BY STRUCTURE: an `if` over `header_label` whose body is exactly `continue`.
+    # Structural, not textual, for two reasons the previous version got wrong: matching the source
+    # text passes on a behaviour-preserving reorder of the boolean operands, and — worse — it never
+    # looks at the body, so deleting the `continue` under it leaves the test green while every
+    # phantom row comes back. `monitor/app.py` cannot be imported here: `store.init()` runs at
+    # module scope against the REAL monitor.db.
+    guard = None
+    for node in _ast.walk(tree):
+        if (isinstance(node, _ast.If)
+                and len(node.body) == 1 and isinstance(node.body[0], _ast.Continue)
+                and any(isinstance(n, _ast.Name) and n.id == "header_label"
+                        for n in _ast.walk(node.test))):
+            guard = node
+            break
+    assert guard is not None, (
+        "monitor/app.py has no `if <header_label ...>: continue` guard — either the skip was "
+        "removed, or its body is no longer a `continue`, so agent-internal headers become station "
+        "rows that no outcome line can resolve")
+
+    test_src = _ast.unparse(guard.test)
+
+    def skipped(label: str) -> bool:
+        return bool(eval(test_src, {}, {"header_label": label}))  # noqa: S307 — the monitor's own expr
+
+    assert skipped("researcher:verdict-redrive"), "the verdict re-drive header still gets a row"
+    assert skipped("eval_coder"), "the node-evaluator header still gets a row"
+    for real in ui._LABELS.values():
+        assert not skipped(real), f"the skip rule hides a REAL station: {real!r}"
+    for lbl in ui._LABELS.values():
+        assert not (lbl.startswith("eval_") or ":" in lbl), lbl
+
+
+def test_workers_are_given_the_checkout_path_instead_of_searching_for_it():
+    """EXE-fb83a6fd: `researcher`, `sme_consult` and `dep_resolver` each issued `find ~` / `find /`
+    hunting for repo checkouts — which the whole-disk guard then refused. All four repos were
+    sitting at `config.PROJECTS_ROOT/<name>` the whole time, the same path
+    `gitops.sync_local_checkout` fast-forwards before those stations run. The path was simply never
+    in any prompt: `PROJECTS_ROOT` appeared ZERO times in agents.py.
+
+    Formatted from config, not hardcoded, so a different root stays correct."""
+    from ocean_pipeline import agents, config
+
+    g = agents.AGENT_GUARDRAILS.format(ticket_id="MM-1", projects_root=config.PROJECTS_ROOT)
+    assert str(config.PROJECTS_ROOT) in g, (
+        "workers are never told where local checkouts live, so they scan the filesystem for them")
+    assert "find ~" in g and "find /" in g, "the searches to avoid are not named concretely"
+    # The raw template must interpolate, never hardcode one machine's path.
+    assert "{projects_root}" in agents.AGENT_GUARDRAILS
+    assert "/Users/" not in agents.AGENT_GUARDRAILS, "a machine-specific path is baked into the template"
+
+
+def test_every_guardrails_caller_supplies_every_placeholder():
+    """A `.format` placeholder added to a shared template silently breaks EVERY call site that was
+    not updated — as a KeyError at station dispatch, i.e. at run time, not import time."""
+    import re as _re
+
+    from ocean_pipeline import agents, config
+
+    src = inspect.getsource(agents)
+    placeholders = set(_re.findall(r"\{([a-z_]+)\}", agents.AGENT_GUARDRAILS))
+    assert placeholders == {"ticket_id", "projects_root"}, placeholders
+    calls = _re.findall(r"AGENT_GUARDRAILS\.format\(([^)]*)\)", src)
+    assert calls, "no AGENT_GUARDRAILS.format call site found — did it move?"
+    for c in calls:
+        for name in placeholders:
+            assert f"{name}=" in c, f"call site `format({c})` is missing {name}="
+    # And it actually renders.
+    agents.AGENT_GUARDRAILS.format(ticket_id="MM-1", projects_root=config.PROJECTS_ROOT)
+
+
+# ---------------------------------------- round-1 judge findings 1 and 5
+def test_a_failed_console_write_cannot_rewrite_a_completed_run_as_failed(monkeypatch):
+    """`cli._execute` prints `[DONE]`/`[BLOCKED]` INSIDE the `try` whose `except Exception` sets
+    `final_status`. A bare `print` there turns an EAGAIN into a second, contradictory outcome: one
+    `completed` telemetry row and one `failed` row for the SAME execution, and a monitor entry with
+    no PR for a run that opened one.
+
+    Guarding only the reporting lines and leaving the control lines bare relocates the fault onto
+    the one line that decides the recorded outcome."""
+    import ast as _ast
+
+    from ocean_pipeline import cli, ui
+
+    # Structural, not textual: an alias (`_say = ui.write`) is behaviour-identical and must pass,
+    # while a bare `print` must fail. Matching the source text got both directions wrong.
+    tree = _ast.parse(inspect.getsource(cli._execute).lstrip())
+    bare = []
+    for node in _ast.walk(tree):
+        if not (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                and node.func.id == "print"):
+            continue
+        text = " ".join(_ast.unparse(a) for a in node.args)
+        if any(mark in text for mark in ("[DONE]", "[BLOCKED]", "[PAUSED]", "[FAILED]",
+                                         "[QUOTA_EXHAUSTED]")):
+            bare.append(text[:60])
+    assert not bare, (
+        f"{bare} are bare `print` inside _execute's try — an EAGAIN there is caught by "
+        f"`except Exception` and rewrites the run's final_status, so one run records both "
+        f"`completed` and `failed`")
+
+    # And the thing they route through must actually be unable to raise, or the above is cosmetic.
+    def explode(*_a, **_k):
+        raise BlockingIOError(35, "write could not complete without blocking")
+    monkeypatch.setattr("builtins.print", explode)
+    monkeypatch.setattr(ui.sys, "stdout", type("S", (), {"fileno": lambda self: 1,
+                                                          "flush": lambda self: None})())
+    monkeypatch.setattr(ui.os, "set_blocking", lambda *a: None)
+    ui.write("[DONE] MM-1 status=completed")   # must not raise
+
+
+def test_ui_write_restores_blocking_and_retries_before_dropping(monkeypatch):
+    """Dropping the line is the last resort. The monitor parses this stream with ^-anchored regexes,
+    so a swallowed `✓` leaves a station row pulsing forever and a swallowed `[DONE]` leaves the run
+    unresolved — the same phantom-row defect this change removes elsewhere. EAGAIN is repairable:
+    put the fd back into blocking mode and re-emit."""
+    from ocean_pipeline import ui
+
+    calls, restored, flushes = [], [], []
+
+    class _Stdout:
+        def fileno(self):
+            return 4242
+        def flush(self):
+            flushes.append(1)
+
+    def flaky(text, **_kw):
+        calls.append(text)
+        raise BlockingIOError(35, "write could not complete without blocking")
+
+    monkeypatch.setattr("builtins.print", flaky)
+    monkeypatch.setattr(ui.sys, "stdout", _Stdout())
+    monkeypatch.setattr(ui.os, "set_blocking", lambda fd, b: restored.append((fd, b)))
+
+    ui.write("[DONE] MM-1 status=completed pr=#4242")
+
+    assert len(calls) == 1, (
+        f"print was called {len(calls)}x — re-printing appends a SECOND copy of text the "
+        f"BufferedWriter still holds, and a duplicated ✓ line adds a second station row")
+    assert flushes == [1], "the queued bytes were never re-attempted"
+    assert restored == [(4242, True)], (
+        f"got {restored!r} — blocking must be restored on STDOUT's own fd, not a hardcoded 1")
+
+
+def test_every_failure_path_records_the_station_spend():
+    """`_drive` stashes its tally in a `finally`, but each `station_spend` call sits inside a `try`
+    the exception skipped — so the stations that cost the most wrote no row. There are THREE such
+    paths (first drive, verdict re-drive, run_skill), and the re-drive's tally is keyed by its own
+    label while the ROW belongs to the station."""
+    from ocean_pipeline import agents
+
+    import ast as _ast
+
+    def _calls_in_except(fn) -> int:
+        """Count `_record_failed_spend` calls that are REACHABLE inside an `except` handler.
+
+        `"_record_failed_spend(" in getsource(fn)` proves only that the text exists — wrapping the
+        call in `if False:` leaves it passing while the row is never written."""
+        tree = _ast.parse(inspect.getsource(fn).lstrip())
+        n = 0
+        for h in (x for x in _ast.walk(tree) if isinstance(x, _ast.ExceptHandler)):
+            # A DIRECT statement of the handler body. Walking the whole handler would also count a
+            # call buried under `if False:` — dead code that writes no row while the text is still
+            # there for a source-match to find.
+            for stmt in h.body:
+                if (isinstance(stmt, _ast.Expr) and isinstance(stmt.value, _ast.Call)
+                        and isinstance(stmt.value.func, _ast.Name)
+                        and stmt.value.func.id == "_record_failed_spend"):
+                    n += 1
+        return n
+
+    assert _calls_in_except(agents.run_agent) == 2, (
+        "run_agent must record spend on BOTH its failure paths — the first drive and the verdict "
+        "re-drive")
+    assert _calls_in_except(agents.run_skill) == 1, "run_skill writes no spend row on failure"
+    src = inspect.getsource(agents.run_agent)
+    assert '_record_failed_spend(execution_id, node, f"{node}:verdict-redrive", model)' in src, (
+        "the verdict re-drive reads the wrong tally key — `_LAST_TALLY` is keyed by the LABEL "
+        "handed to _drive, and the re-drive's is `<node>:verdict-redrive`")
+
+    # And the helper actually reads the label it is given, and reports under the station.
+    rows = []
+    real = agents.telemetry.station_spend
+    agents.telemetry.station_spend = lambda *a, **kw: rows.append(a)
+    try:
+        agents._LAST_TALLY["coder:verdict-redrive"] = (7, 11, 3)
+        agents._record_failed_spend("EXE-x", "coder", "coder:verdict-redrive", None)
+    finally:
+        agents.telemetry.station_spend = real
+        agents._LAST_TALLY.pop("coder:verdict-redrive", None)
+    assert rows == [("EXE-x", "coder", 7, 11, 3)], (
+        f"got {rows!r} — the re-drive's spend must be recorded against the station, not its label")

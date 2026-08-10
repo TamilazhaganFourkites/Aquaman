@@ -42,10 +42,10 @@ class ResearchVerdict(BaseModel):
     # the already-blanked `domain_bucket`, so without this a typo'd bucket and a ticket with no
     # bucket both read as "(none)" and a misrouted ticket looks correctly skipped.
     #
-    # This MUST stay on the verdict rather than in a module-level record: `qa_batch` runs every
-    # ticket of a batch in ONE process, so anything module-level reports the first ticket's typo
-    # against every later bucket-less ticket. DERIVED, never model-supplied -- the validator below
-    # writes it unconditionally.
+    # This MUST stay on the verdict rather than in a module-level record: any driver that runs
+    # more than one ticket in ONE process would otherwise report the first ticket's typo against
+    # every later bucket-less ticket. DERIVED, never model-supplied -- the validator below writes
+    # it unconditionally.
     domain_bucket_raw: str = ""
 
     @model_validator(mode="before")

@@ -12,12 +12,11 @@ its own test. Three of them are the kind of thing that looks like a detail and i
 """
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
 
-from ocean_pipeline import kill_switch, qa_batch
+from ocean_pipeline import kill_switch
 
 
 @pytest.fixture(autouse=True)
@@ -88,53 +87,13 @@ def test_the_path_is_env_overridable_and_not_under_tmp():
         importlib.reload(kill_switch)
 
 
-def test_an_engaged_switch_stops_a_batch_before_the_next_ticket(monkeypatch, tmp_path):
-    """Semantic 1, end to end: the batch must consult it BEFORE starting each ticket, and stop
-    without touching the rest of the queue."""
-    monkeypatch.setattr(kill_switch, "KILL_SWITCH_PATH", tmp_path / "HALT")
-    started: list[str] = []
-
-    async def _fake_run_one(ticket: str) -> dict:
-        started.append(ticket)
-        if len(started) == 2:               # engage midway, as an operator would
-            kill_switch.engage("stop after this one")
-        return {"ticket_id": ticket, "final_status": "completed"}
-
-    monkeypatch.setattr(qa_batch, "run_one", _fake_run_one)
-    results = asyncio.run(qa_batch.run_batch(["MM-1", "MM-2", "MM-3", "MM-4"]))
-
-    assert started == ["MM-1", "MM-2"], "the batch kept starting tickets after the halt"
-    assert len(results) == 2, "only completed tickets should be reported"
-
-    # Released -> the next batch runs normally again.
-    kill_switch.release()
-    started.clear()
-    monkeypatch.setattr(qa_batch, "run_one",
-                        lambda t: asyncio.sleep(0, {"ticket_id": t, "final_status": "completed"}))
-    assert len(asyncio.run(qa_batch.run_batch(["MM-5", "MM-6"]))) == 2
-
-
-def test_a_switch_engaged_before_the_batch_starts_nothing(monkeypatch, tmp_path):
-    monkeypatch.setattr(kill_switch, "KILL_SWITCH_PATH", tmp_path / "HALT")
-    kill_switch.engage()
-    called: list[str] = []
-
-    async def _never(ticket: str) -> dict:
-        called.append(ticket)
-        return {}
-
-    monkeypatch.setattr(qa_batch, "run_one", _never)
-    assert asyncio.run(qa_batch.run_batch(["MM-1", "MM-2"])) == []
-    assert called == [], "a pre-engaged switch must start nothing at all"
-
-
 def test_every_driver_that_starts_a_run_consults_the_halt():
     """E1's stated scope is MACHINE-WIDE, and it shipped consulted in exactly one place.
 
-    `qa_batch` had it; `cli._run` (the ordinary `ocean-pipeline MM-1234` entry point, and the one
-    `run-batch.sh` loops), both monitor batch drivers, and `run-batch.sh` itself did not — so an
-    engaged switch stopped the unattended sweep and nothing else. A stop that one of five entry
-    points honours is a convention, not a stop.
+    It shipped consulted in the unattended sweep only; `cli._run` (the ordinary
+    `ocean-pipeline MM-1234` entry point, and the one `run-batch.sh` loops), both monitor batch
+    drivers, and `run-batch.sh` itself did not — so an engaged switch stopped one driver and
+    nothing else. A stop that one of several entry points honours is a convention, not a stop.
 
     Asserted per driver by NAME so a new driver added without the consult is visible here, rather
     than as a run that started during a halt."""
@@ -142,7 +101,6 @@ def test_every_driver_that_starts_a_run_consults_the_halt():
 
     root = pathlib.Path(__file__).resolve().parents[1]
     drivers = {
-        "src/ocean_pipeline/qa_batch.py": "kill_switch.status(",
         "src/ocean_pipeline/cli.py": "kill_switch.status(",
         "monitor/app.py": "_kill_switch.",
         "run-batch.sh": "KILL_SWITCH",

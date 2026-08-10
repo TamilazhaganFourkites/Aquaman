@@ -11,6 +11,9 @@ of the one below it:
 """
 from __future__ import annotations
 
+import os
+import sys
+
 from datetime import datetime
 
 from . import config, metrics
@@ -61,10 +64,48 @@ _LABELS = {
 _STOP_NODES = {"stop_run", "unsupported_route"}
 
 
+def write(text: str) -> None:
+    """The ONE console write. Never raises — console output must not be able to kill a station.
+
+    EXE-fb83a6fd died here: `print` to fd 1 raised `BlockingIOError: [Errno 35]` (EAGAIN) mid-run,
+    which propagated out of `agents._emit` and failed the researcher station AFTER it had completed
+    81 KB of analysis. EAGAIN means fd 1 is in NON-BLOCKING mode — `O_NONBLOCK` lives on the open
+    file description, which is shared across fork/exec, so any descendant that flips it flips it for
+    this process too. `cli._force_blocking_stdio` puts it back at startup; this is the second layer,
+    because the flip can happen at any time after that and a dropped log line must never cost a run.
+
+    ON EAGAIN, RESTORE BLOCKING AND FLUSH — DO NOT RE-PRINT. stdout is block-buffered here (nothing
+    sets PYTHONUNBUFFERED or -u, and `monitor/app.py` gives the child a PIPE), and a `BufferedWriter`
+    RETAINS the bytes when its flush raises. The text is therefore still queued: printing it again
+    appends a SECOND copy, and both go out on the next successful flush. A duplicated `✓` outcome
+    line makes `monitor/app.py` append a second station row (its `for/else` finds no `running` event
+    to replace), so the retry manufactures the phantom-row defect this change removes elsewhere.
+
+    Flushing is the whole repair: it re-attempts the queued bytes exactly once, after putting the fd
+    back into blocking mode — EAGAIN means a descendant flipped fd 1 on the shared open file
+    description, and flipping it back is what makes the write complete.
+
+    OSError (e.g. EPIPE, reader gone) is unrecoverable — there is nothing left to write to — and is
+    swallowed because a station must not die reporting; the station log
+    (`agents._station_logfile`, written and flushed independently) is the durable record."""
+    try:
+        print(text, flush=True)
+        return
+    except BlockingIOError:
+        pass
+    except OSError:
+        return
+    try:
+        os.set_blocking(sys.stdout.fileno(), True)
+        sys.stdout.flush()
+    except (AttributeError, BlockingIOError, OSError, ValueError):
+        pass
+
+
 def station_start(node: str) -> None:
     """Header printed when a node's agent begins; milestones stream under it.
     Keyed on the LangGraph node name — the same label map as the completion line."""
-    print(f"\n▶  {_now()}  {_LABELS.get(node, node)}", flush=True)
+    write(f"\n▶  {_now()}  {_LABELS.get(node, node)}")
 
 
 def milestone(text: str) -> None:
@@ -78,7 +119,7 @@ def milestone(text: str) -> None:
     # physical line. `agents._milestones` builds this text from `Task.description` and
     # `Write/Edit.file_path`, which are agent-controlled, so a newline here forges a completed run
     # (with a PR number) into monitor.db, or auto-pauses the discovery queue.
-    print(f"     · {_one_line(text, limit=300)}", flush=True)
+    write(f"     · {_one_line(text, limit=300)}")
 
 
 def node_label(node: str) -> str:
@@ -379,10 +420,10 @@ def _highlight_raw(node: str, upd: dict) -> str:
 
 
 def banner(ticket: str, execution_id: str) -> None:
-    print("\n" + "═" * WIDTH)
-    print(f"  FK Ocean Pipeline   ·   {ticket}")
-    print(f"  run {execution_id}   ·   started {_now()}")
-    print("═" * WIDTH, flush=True)
+    write("\n" + "═" * WIDTH)
+    write(f"  FK Ocean Pipeline   ·   {ticket}")
+    write(f"  run {execution_id}   ·   started {_now()}")
+    write("═" * WIDTH)
 
 
 def step(node: str, upd: dict, elapsed: float) -> None:
@@ -399,25 +440,25 @@ def step(node: str, upd: dict, elapsed: float) -> None:
     hi = _highlight(node, upd)
     if hi:
         line += f"   {hi}"
-    print(line, flush=True)
+    write(line)
     if _at_least("developer"):
         for det in _details(node, upd):
             # Clamped like the highlight, and for the same reason: the `└ ` prefix only guards the
             # FIRST physical line. A newline inside a detail bullet starts an unprefixed line, and
             # `monitor/app.py`'s `_DONE_RE` / `_PAUSED_RE` / `_QUOTA_RE` are anchored at `^`.
-            print(f"        └ {_one_line(det, limit=300)}", flush=True)
+            write(f"        └ {_one_line(det, limit=300)}")
 
 
 def summary(final: dict, total: float) -> None:
     status = (final.get("final_status") or "unknown").upper()
-    print("─" * WIDTH)
-    print(f"  RESULT: {status}   ·   took {_fmt_elapsed(total)}   ·   finished {_now()}")
+    write("─" * WIDTH)
+    write(f"  RESULT: {status}   ·   took {_fmt_elapsed(total)}   ·   finished {_now()}")
     if final.get("final_outcome"):
         # Same channel. `final_outcome` is built from agent output (and, on one path, from a
         # pydantic ValidationError's message), and lands in the same parsed stream.
-        print(f"  {_one_line(final['final_outcome'], limit=300)}")
+        write(f"  {_one_line(final['final_outcome'], limit=300)}")
     t = metrics.totals()
     usage = metrics.fmt(t["input"], t["output"], t["tools"])
     if usage:
-        print(f"  usage: {usage}   across {t['stations']} station runs")
-    print("═" * WIDTH + "\n", flush=True)
+        write(f"  usage: {usage}   across {t['stations']} station runs")
+    write("═" * WIDTH + "\n")

@@ -916,8 +916,8 @@ async def sme_consult(state: OceanState) -> dict:
         # Name the token the researcher actually returned. Logging `bucket` alone printed "(none)"
         # for a typo and for a genuinely bucket-less ticket alike, so a misrouted ticket read as a
         # correctly-skipped one. Read from STATE, which is per-ticket: a module-level record would
-        # be shared by every ticket in a `qa_batch` process and report ticket 1's typo against
-        # ticket 2.
+        # be shared by every ticket in a process that drives more than one, and would report
+        # ticket 1's typo against ticket 2.
         unmatched = state.get("domain_bucket_raw") or ""
         telemetry.station_event(exec_id, 0.5, "skip", domain_bucket=bucket or "(none)",
                                 unmatched_token=unmatched)
@@ -1910,15 +1910,17 @@ async def sit_resolve(state: OceanState) -> dict:
     verdict_path.parent.mkdir(parents=True, exist_ok=True)
     if verdict_path.exists():
         verdict_path.unlink()  # fresh Station-6 attempt (drop a prior loop's verdict)
-    # This node is shared by the main graph (which always knows pr_number by now — open_pr already
-    # ran) and qa_batch's subgraph (which enters HERE with no coder/open_pr step, so pr_number is
-    # never set). Embedding "Service PR #None" in the prompt was misleading in the qa_batch case;
+    # DEFENSIVE, with no live caller: `open_pr` is the only main-graph edge into this node
+    # (`learn_repo` re-enters within the same run, after open_pr) and it always sets pr_number, and a
+    # `--resume` replays the accumulated checkpoint state rather than a partial dict. Kept because
+    # the cost is one branch and the failure it prevents — a prompt asserting "Service PR #None" —
+    # is silent and reaches the worker. Phrase it truthfully rather than
     # phrase truthfully for each instead of asserting a number that doesn't exist.
     pr_context = (
         f"Service PR #{state['pr_number']}; Station 5 APPROVED so Station 0.5's gate auto-passes. "
         if state.get("pr_number") else
         "No PR number given — resolve the existing service PR for this ticket yourself "
-        "(qa-batch mode: there is no pending review, so Station 0.5's gate is not relevant here). "
+        "(no PR is open yet, so Station 0.5's gate is not relevant here). "
     )
     await agents.run_skill(
         skill_name="ocean-automation-testing",

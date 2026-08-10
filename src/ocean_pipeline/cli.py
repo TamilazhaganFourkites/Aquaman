@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -341,7 +342,7 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             gate_marker.write(execution_id, ticket_id,
                               next((g for g in paused_on if g in _GATE_FLAGS), ", ".join(paused_on)),
                               _pause_message(execution_id, paused_on))
-            print(f"\n[PAUSED] {_pause_message(execution_id, paused_on)}")
+            ui.write(f"\n[PAUSED] {_pause_message(execution_id, paused_on)}")
         else:
             gate_marker.clear(execution_id)   # E2: reached a terminal state — no longer waiting
             _report(execution_id, final, total)
@@ -359,10 +360,10 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             if (final.get("final_status") or "") == "blocked":
                 qs = final.get("blocking_open_questions") or []
                 qtail = ("; ".join(str(q) for q in qs))[:400] if qs else ""
-                print(f"[BLOCKED] {ticket_id} final_status: blocked — open questions unresolved, "
+                ui.write(f"[BLOCKED] {ticket_id} final_status: blocked — open questions unresolved, "
                       f"answer in Jira{': ' + qtail if qtail else ''}")
             else:
-                print(f"[DONE] {ticket_id} status={final.get('final_status') or 'completed'}"
+                ui.write(f"[DONE] {ticket_id} status={final.get('final_status') or 'completed'}"
                       + (f" pr=#{pr}" if pr else ""))
     except Exception as e:  # noqa: BLE001 — never leave a `running` row orphaned (AP-223)
         # MM-14793 (I2): a StationError tagged quota_exhausted (agents.py's _is_quota_error) means
@@ -381,9 +382,9 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
             # Distinct marker (monitor/app.py's _QUOTA_RE) — never collapsed into [FAILED], so the
             # monitor can surface it separately and auto-pause further auto-queue dispatch instead
             # of burning more work into the same dry pool (see monitor/app.py's handling).
-            print(f"\n[QUOTA_EXHAUSTED] {ticket_id} {type(e).__name__}: {e}")
+            ui.write(f"\n[QUOTA_EXHAUSTED] {ticket_id} {type(e).__name__}: {e}")
         else:
-            print(f"\n[FAILED] {type(e).__name__}: {e}")
+            ui.write(f"\n[FAILED] {type(e).__name__}: {e}")
         final = {**final, "final_status": final.get("final_status") or final_status,
                  "final_outcome": final.get("final_outcome") or f"{type(e).__name__}: {e}"}
         raise
@@ -428,7 +429,7 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
 
 async def _run(ticket_id: str, context: str) -> None:
     _preflight()
-    # E1, machine-wide. The halt was consulted only in `qa_batch`, so `ocean-pipeline MM-1234` --
+    # E1, machine-wide. The halt was consulted in one driver only, so `ocean-pipeline MM-1234` --
     # the ordinary single-run entry point, and the one `run-batch.sh` loops -- started a fresh run
     # straight through an engaged switch. A stop that one of five entry points honours is not a
     # stop; it is a convention.
@@ -497,7 +498,31 @@ async def _resume(execution_id: str, resume_value=None, gate_flag: str = "") -> 
     await _execute(execution_id, ticket_id, initial, thread)
 
 
+def _force_blocking_stdio() -> None:
+    """Put fd 1/2 back into BLOCKING mode before the run starts.
+
+    `O_NONBLOCK` is a property of the open file description, which is SHARED across fork/exec — so a
+    descendant that sets it (the Node-based `claude` CLI the SDK spawns is the suspected source on
+    macOS) sets it for this process too. Once it flips, a `print` that would previously have waited
+    for the reader instead raises `BlockingIOError: [Errno 35]`. EXE-fb83a6fd lost a completed
+    researcher station to exactly that, seven minutes in.
+
+    Blocking is what every writer here already assumes: the monitor drains the pipe continuously
+    (`monitor/app.py`'s readline loop), so waiting is correct and brief. `ui.write` swallows the
+    error as a second layer, because this call fixes the mode only at startup and nothing stops a
+    later child from flipping it again.
+
+    Best-effort by design: a redirected/replaced stream with no real fd raises here, and that is not
+    a reason to refuse to run."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            os.set_blocking(stream.fileno(), True)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def main() -> None:
+    _force_blocking_stdio()
     p = argparse.ArgumentParser(prog="ocean-pipeline")
     p.add_argument("ticket", nargs="?", help="Jira ticket id, e.g. MM-14615")
     p.add_argument("--context", default="", help="extra context for the run")

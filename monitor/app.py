@@ -459,7 +459,22 @@ async def _drive_process(run: TicketRun, args: list[str],
                 # update current_label (a real station's own header stays authoritative for any
                 # [PAUSED] line that follows, since eval_node always completes synchronously before
                 # its enclosing station's own outcome line prints).
-                if header_label.startswith("eval_"):
+                #
+                # `<node>:verdict-redrive` is the SAME failure with a different label. run_agent
+                # re-drives a worker that ended its turn without a verdict, passing
+                # `label=f"{node}:verdict-redrive"` — so this header fires, LABEL_TO_NODE has no
+                # entry, and the row is created under a node name no outcome line will ever carry
+                # (the ✓ is keyed on the real node, and resolves the real station's row). Observed
+                # on EXE-fb83a6fd: "Research & routing ✓ 25m36s" sitting under a
+                # "researcher:verdict-redrive" spinner that pulsed for the rest of the run, plus a
+                # second one for dep_resolver. The re-drive's time and spend are already folded into
+                # its own station (agents.py records both under `node`), so there is nothing to show.
+                #
+                # Matched on the ":" rather than the exact suffix: every real station label is plain
+                # English from ui._LABELS ("Research & routing"), so a colon in a header is by
+                # construction an agent-internal label, and any future one is covered without
+                # another round of phantom spinners.
+                if header_label.startswith("eval_") or ":" in header_label:
                     continue
                 current_label = header_label
                 node = LABEL_TO_NODE.get(current_label, current_label)
@@ -648,7 +663,7 @@ async def _run_batch_from(batch: Batch, start: int) -> None:
     for i in range(start, len(batch.tickets)):
         # E1, machine-wide. `batch.cancelled` stops THIS batch from the UI; the kill switch stops
         # every driver on the machine, including from another terminal or another host over the
-        # shared filesystem. Consulted per ticket, like `qa_batch` does, so an engaged switch stops
+        # shared filesystem. Consulted PER TICKET, so an engaged switch stops
         # the batch at the next boundary rather than only at its start.
         _halted, _why = _kill_switch.status()
         if _halted:

@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 from ocean_pipeline import agents, config, gitops, graph, jira, metrics, nodes, quality, report, schemas, telemetry, tracing, ui
-from ocean_pipeline import cli, qa_batch
+from ocean_pipeline import cli
 
 
 class Script:
@@ -2460,30 +2460,6 @@ def test_human_gate_forces_pause_on_2d_2e_blockers_even_with_approval_off(monkey
     assert seen["ac_before"] == ["AC1", "AC2"]
 
 
-def test_qa_batch_finish_treats_trivial_green_as_unverified_not_completed():
-    """Finding 2c whole-diff follow-up: qa_batch.py is a SEPARATE terminal node reusing the same
-    sit_triage verdict the main graph gates on -- without this check it reported a Rung-0 trivial
-    green as a clean 'completed' pass, the exact false-confidence scenario this fix targets."""
-    from ocean_pipeline import qa_batch
-
-    trivial = qa_batch._qa_batch_finish({"automation_result": "passed", "fidelity_rung": 0})
-    assert trivial["final_status"] == "failed"
-    assert "trivial_green_no_signal" in trivial["final_outcome"]
-
-    genuine = qa_batch._qa_batch_finish({"automation_result": "passed", "fidelity_rung": 2})
-    assert genuine["final_status"] == "completed"
-    assert "sit_passed" in genuine["final_outcome"]
-
-    # A genuine failure must be completely unaffected by fidelity_rung -- trivial_green must not
-    # leak into (or otherwise alter) the already-existing failed-path messaging.
-    failed = qa_batch._qa_batch_finish({"automation_result": "failed", "failure_class": "code_fault",
-                                        "fidelity_rung": 0})
-    assert failed["final_status"] == "failed"
-    assert "code_fault" in failed["final_outcome"]
-    assert "trivial_green" not in failed["final_outcome"]
-
-
-# ----------------------------------------------------------------- gitops.py real logic
 class _FakeGhProc:
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
@@ -2844,8 +2820,8 @@ def test_docker_resources_parses_real_fields(monkeypatch):
 # ----------------------------------------------------------------- sit_resolve pr_number prompt
 def test_sit_resolve_prompt_omits_pr_number_when_unset(tmp_path, monkeypatch):
     """Regression: sit_resolve is shared by the main graph (pr_number always known by now) and
-    qa_batch's subgraph (no coder/open_pr step -- pr_number never set), so the prompt used to
-    literally say "Service PR #None" for every qa-batch ticket. Must phrase truthfully instead of
+    the QA-only path (no coder/open_pr step -- pr_number never set), so the prompt used to
+    literally say "Service PR #None" whenever it was unset. Must phrase truthfully instead of
     asserting a number that doesn't exist."""
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: tmp_path / f"{tid}.json")
     captured = {}
@@ -3699,19 +3675,38 @@ def test_only_real_lifecycle_transitions_claim_a_lifecycle_status(monkeypatch):
         assert sent[-1]["status"] == status, phase
 
 
+def _package_modules():
+    """Every module in `ocean_pipeline`, imported.
+
+    DERIVED, never a hardcoded tuple. These invariants exist because an enumeration run over
+    `nodes.py` alone missed a second caller module; replacing that tuple with a shorter tuple would
+    rebuild the same blind spot the moment a new module starts calling `station_event` or returning
+    a `final_status`."""
+    import importlib
+    import pkgutil
+
+    import ocean_pipeline
+
+    mods = []
+    for m in pkgutil.iter_modules(ocean_pipeline.__path__):
+        if not m.ispkg:
+            mods.append(importlib.import_module(f"ocean_pipeline.{m.name}"))
+    assert len(mods) >= 10, f"only {len(mods)} modules discovered — the package scan is broken"
+    return mods
+
+
 def test_a_node_that_returns_failed_never_reports_its_station_completed():
     """Telemetry status must agree with `final_status`. Both writers got this wrong independently:
 
       * `rca_done` shared the phase `done` between its posted branch and its gate-REFUSED branch,
         which returns final_status="failed" — so a failed run listed rca_router in
         `stations_completed_list` and nothing in `stations_failed_list`.
-      * `qa_batch` emitted an unconditional `qa_batch_end`, passing final_status as FREE TEXT only —
-        so a batch item that failed at sit_run still wrote status='completed'. No aggregate reads
-        free text.
+      * a wrapper station emitted an unconditional terminal phase, passing final_status as FREE
+        TEXT only — so an item that failed mid-run still wrote status='completed'. No aggregate
+        reads free text.
 
     Enumerated from the source both times, because the phase NAME reads fine in both cases."""
     for phase, want in (("gate_refused", "failed"), ("done", "completed"),
-                        ("qa_batch_failed", "failed"), ("qa_batch_end", "completed"),
                         ("unsupported_route", "failed")):
         assert telemetry._STATUS.get(phase) == want, (
             f"{phase!r} must record {want!r} — it is the status a downstream aggregate reads")
@@ -3725,8 +3720,8 @@ def test_a_node_that_returns_failed_never_reports_its_station_completed():
     def _status_values(node):
         """Every literal `final_status` a return expression can evaluate to.
 
-        Resolves a conditional, because `_qa_batch_finish` legitimately picks its status with one and
-        banning that shape would be the tail wagging the dog. Anything it still cannot read is
+        Resolves a conditional: a node may legitimately pick its status with one, and banning
+        that shape would be the tail wagging the dog. Anything it still cannot read is
         reported by the `opaque` check below rather than silently skipped — a judge injected three
         unreadable shapes and all three slipped past the first cut."""
         if isinstance(node, ast.Constant):
@@ -3736,7 +3731,7 @@ def test_a_node_that_returns_failed_never_reports_its_station_completed():
         return []
 
     checked, wrong = [], []
-    for mod in (nodes, qa_batch):
+    for mod in _package_modules():
         tree = ast.parse(Path(mod.__file__).read_text())
         for fn in ast.walk(tree):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -3780,7 +3775,7 @@ def test_a_node_that_returns_failed_never_reports_its_station_completed():
     # node that sets `final_status` in a shape this cannot analyse, and make adding one a
     # deliberate act rather than an accident.
     opaque = []
-    for mod in (nodes, qa_batch):
+    for mod in _package_modules():
         for fn in ast.walk(ast.parse(Path(mod.__file__).read_text())):
             if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -3812,114 +3807,6 @@ def test_a_node_that_returns_failed_never_reports_its_station_completed():
         "rca_done's gate-refused branch no longer emits the distinct phase"
 
 
-def test_qa_batch_records_the_outcome_it_actually_had(monkeypatch, tmp_path):
-    """RUN `run_one`, don't grep it. Two mutants proving this fix untested survived a full suite:
-    reverting the station number to `6` (re-filing every batch marker under `sit_resolve`) and
-    gutting the `_failed` predicate. The only guard was a source-string match — the exact thing this
-    repo's own comments warn about, since that is how the `run_skill` NameError stayed green.
-
-    Both halves are asserted from the emitted telemetry: the NUMBER at the call site and the STATUS
-    derived from `final_status`."""
-    sent = []
-    monkeypatch.setattr(telemetry, "station_event",
-                        lambda exec_id, num, phase, **kw: sent.append((num, phase)))
-    monkeypatch.setattr(telemetry, "new_execution_id", lambda: "EXE-batch")
-    monkeypatch.setattr(tracing, "callback_handler", lambda: None)
-    monkeypatch.setattr(nodes, "_release_sit_slot", lambda *_a: None)
-    monkeypatch.setattr(nodes, "_release_build_slot", lambda *_a: None)
-
-    class _App:
-        def __init__(self, final): self._final = final
-        async def ainvoke(self, initial, config=None):
-            # BaseException, not Exception — `CancelledError` and `KeyboardInterrupt` are not
-            # `Exception` subclasses, which is the whole point of the two cases below. A stub that
-            # checked `Exception` would silently RETURN them as a result and test nothing.
-            if isinstance(self._final, BaseException):
-                raise self._final
-            return self._final
-
-    for final, want_phase in (({"final_status": "completed"}, "qa_batch_end"),
-                              ({"final_status": "failed"}, "qa_batch_failed"),
-                              ({"final_status": "blocked"}, "qa_batch_failed"),
-                              (RuntimeError("boom"), "qa_batch_failed"),
-                              # BaseException: `except Exception` does not catch these, so `final`
-                              # is never assigned by the handler. Moving the terminal event into the
-                              # `finally` made that an UnboundLocalError that both swallowed the
-                              # cancellation AND still left the station open — on the very case the
-                              # move was made for. The station must close and the original
-                              # exception must propagate unchanged.
-                              (asyncio.CancelledError(), "qa_batch_failed"),
-                              (KeyboardInterrupt(), "qa_batch_failed")):
-        sent.clear()
-        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
-                            lambda f=final: type("G", (), {"compile": lambda self: _App(f)})())
-        if isinstance(final, BaseException) and not isinstance(final, Exception):
-            with pytest.raises(type(final)):
-                asyncio.run(qa_batch.run_one("MM-1"))
-        else:
-            asyncio.run(qa_batch.run_one("MM-1"))
-        nums = {n for n, _ in sent}
-        phases = [p for _, p in sent]
-        assert nums == {0.05}, f"qa_batch filed under the wrong station number: {nums}"
-        # …and that number must have a NAME, or every row degrades to the `station_0.05` fallback.
-        # Deleting the table entry survived a sweep: asserting the number alone cannot see it.
-        assert telemetry._STATION_NAMES.get(0.05) == "qa_batch"
-        assert phases[0] == "qa_batch_start" and phases[-1] == want_phase, (
-            f"final_status={final} recorded {phases[-1]!r}, expected {want_phase!r}")
-        assert telemetry._STATUS[phases[-1]] in telemetry._TERMINAL_STATUSES
-
-    # A raise from SETUP — graph compilation or tracing — must still close the station and must not
-    # abort the sweep. Both calls used to sit between the start event and the `try`, so either one
-    # left the station open forever AND propagated out of run_one, killing the batch on ticket 1.
-    # `tracing.callback_handler` loads secrets unguarded, so this is a real path, not a theory.
-    def _boom(*_a, **_k):
-        raise RuntimeError("setup exploded")
-
-    for attr, target in (("build_qa_subgraph", qa_batch), ("callback_handler", tracing)):
-        sent.clear()
-        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
-                            lambda: type("G", (), {"compile": lambda self: _App({"final_status": "completed"})})())
-        monkeypatch.setattr(tracing, "callback_handler", lambda: None)
-        monkeypatch.setattr(target, attr, _boom)
-        out = asyncio.run(qa_batch.run_one("MM-1"))
-        assert [p for _, p in sent] == ["qa_batch_start", "qa_batch_failed"], (
-            f"a raise from {attr} left the station open: {sent}")
-        assert out["final_status"] == "failed" and "setup exploded" in out["final_outcome"]
-
-    # TELEMETRY ITSELF must not abort the sweep. The guards around both `station_event` calls
-    # survived a mutation sweep because every case above stubs `station_event` with a lambda that
-    # cannot raise — so the guard read as covered while being untested. `_dispatch` really can raise
-    # ("cannot schedule new futures after shutdown"), and this module's whole purpose is that one
-    # ticket's problem never stops the batch.
-    monkeypatch.setattr(tracing, "callback_handler", lambda: None)   # the loop above left it raising
-    for boom_on in ("qa_batch_start", "qa_batch_end"):
-        calls = []
-
-        def _raising(exec_id, num, phase, _boom=boom_on, **kw):
-            calls.append(phase)
-            if phase == _boom:
-                raise RuntimeError("telemetry backend is down")
-
-        monkeypatch.setattr(telemetry, "station_event", _raising)
-        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
-                            lambda: type("G", (), {"compile": lambda self: _App({"final_status": "completed"})})())
-        out = asyncio.run(qa_batch.run_one("MM-1"))       # must NOT raise
-        assert out["ticket_id"] == "MM-1", f"a telemetry failure on {boom_on} aborted the sweep"
-        assert boom_on in calls
-
-    # …and an unrecognised final_status must record a FAILURE, not a completion (allow-list).
-    monkeypatch.setattr(telemetry, "station_event",
-                        lambda exec_id, num, phase, **kw: sent.append((num, phase)))
-    for status in ({}, {"final_status": None}, {"final_status": ""}, {"final_status": "error"},
-                   {"final_status": "blocked"}):
-        sent.clear()
-        monkeypatch.setattr(qa_batch, "build_qa_subgraph",
-                            lambda f=status: type("G", (), {"compile": lambda self: _App(f)})())
-        asyncio.run(qa_batch.run_one("MM-1"))
-        assert sent[-1][1] == "qa_batch_failed", (
-            f"final_status={status} recorded a COMPLETION: {sent[-1]}")
-
-
 def test_station_durations_are_actually_recorded(monkeypatch):
     """`_station_seconds` feeds `run-report.json`'s per-station timings. Disabling the timer entirely
     survived a mutation sweep — nothing asserted a duration is ever produced.
@@ -3934,7 +3821,6 @@ def test_station_durations_are_actually_recorded(monkeypatch):
     # Every terminal phase must close a timer its own start opened — including the ones added later.
     for start, end in (("start", "end"), ("start", "stop"), ("start", "skip"),
                        ("learn_repo_start", "learn_repo_end"),
-                       ("qa_batch_start", "qa_batch_end"), ("qa_batch_start", "qa_batch_failed"),
                        ("start", "gate_refused"), ("start", "blocked_short_circuit")):
         telemetry._station_t0.clear()
         telemetry._station_seconds.clear()
@@ -3964,8 +3850,8 @@ def test_every_station_reaches_a_terminal_status():
     shipped twice in adjacent code, so this asserts over the ENUMERATED call sites instead.
 
     Scanned over EVERY module that calls `station_event`, found by walking the package — not
-    `nodes.py` alone. The first cut hardcoded `nodes.py` and therefore could not see `qa_batch.py`'s
-    two phases, one of which (`qa_batch_end`) is a real terminal event that the annotation default
+    `nodes.py` alone. The first cut hardcoded `nodes.py` and therefore could not see a second
+    caller module's phases, one of which was a real terminal event that the annotation default
     silently demoted. Two files, one classifier: enumerate the classifier's callers, not the file you
     happen to be editing."""
     import ast
@@ -3973,7 +3859,7 @@ def test_every_station_reaches_a_terminal_status():
 
     def _consts(node):
         """Every literal a phase/station argument can evaluate to — including both arms of a
-        conditional. `qa_batch` picks its terminal phase with an `IfExp` (it must, so the status
+        conditional. A node may pick its terminal phase with an `IfExp` (it must, so the status
         reflects the outcome), and treating that as "non-literal" would have quietly dropped BOTH
         of its phases from this enumeration — the same blind spot the single-file scan had."""
         if isinstance(node, ast.Constant):
@@ -4006,7 +3892,7 @@ def test_every_station_reaches_a_terminal_status():
 
     # Anti-vacuity: pin the shape of what was found, so a refactor that hides call sites FAILS rather
     # than quietly shrinking the input set. A `> 15` floor let 10 stations vanish undetected.
-    assert files >= {"nodes.py", "qa_batch.py"}, f"lost a caller module: {sorted(files)}"
+    assert "nodes.py" in files, f"lost a caller module: {sorted(files)}"
     assert len(by_station) >= 26, f"only {len(by_station)} stations found — call sites went missing"
 
     # `stop_run` picks its number at runtime (it reports the station the run stopped AT), so one
@@ -4112,7 +3998,7 @@ def test_every_station_event_number_and_spend_label_resolve_to_the_same_station(
     mistake can come back."""
     # 1. Every station_event number PASSED ANYWHERE IN THE PACKAGE has a name (else it degrades to
     #    the "station_<n>" fallback and no reverse-map entry exists for it at all). Scanned over the
-    #    package, not nodes.py — reading one file is the blind spot that let qa_batch.py pass a bare
+    #    package, not nodes.py — reading one file is the blind spot that let a second module pass a bare
     #    `6` (aliasing to sit_resolve) through this test's sibling for an entire round.
     pkg = Path(nodes.__file__).parent
     src = "\n".join(p.read_text() for p in sorted(pkg.glob("*.py")))
@@ -4149,7 +4035,7 @@ def test_spend_survives_a_teardown_blip_after_the_verdict_was_written(monkeypatc
     exactly the most expensive stations (the ones that did all their work and then hit a blip).
 
     `_drive` stashes its tally in `_LAST_TALLY` inside its `finally`, so it survives the exception.
-    Also pins the staleness guard: a tally left by a PRIOR ticket under the same label (qa_batch
+    Also pins the staleness guard: a tally left by a PRIOR ticket under the same label (a sweep
     drives N tickets sequentially in one process) must never be handed back as this one's spend."""
     vp = tmp_path / "v.json"
     vp.write_text('{"ok": true}')

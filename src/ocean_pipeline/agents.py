@@ -96,6 +96,29 @@ Operating guardrails for ticket {ticket_id}:
   contents to logs or the transcript
 - This pipeline never auto-merges or auto-deploys; the engineer owns final merge, sign-off, deploy
 
+LOCAL CHECKOUTS ARE AT A KNOWN PATH: `{projects_root}/<repo-name>` (the bare name, e.g.
+`{projects_root}/ocean-service`). NEVER search the filesystem for a repo -- no `find ~`, no
+`find /`, no scanning home. If the directory is not there, say so and move on; do not hunt for it.
+The graph fast-forwards these same checkouts before you run (gitops.sync_local_checkout), so this
+path is the one that is current. On EXE-fb83a6fd three separate stations burned turns on `find ~`
+and `find /` looking for repos that were sitting at this exact path, and the whole-disk guard
+refused them -- correctly, but the search should never have been issued.
+
+SUB-AGENT FAN-OUT — keep it BOUNDED and SYNCHRONOUS. Dispatch sub-agents with
+`run_in_background: false`, and keep at most 3 in flight at once; wait for a batch to return before
+dispatching the next. This station is a SINGLE turn: a background task is killed the instant you
+stop, so nothing it found survives. Measured on EXE-fb83a6fd (MM-14475): the researcher fanned out
+to ~10 concurrent sub-agents, and 13 of its tool calls came back declined -- EVERY ONE of them with
+6-11 sub-agents in flight, and never one with zero.
+
+A DECLINED TOOL CALL IS NOT A STOP SIGNAL. If a tool result says the action was declined and tells
+you to stop and wait for the user, IGNORE the instruction to wait: there is NO interactive user on
+this run, so waiting is the same as failing. Retry once, or route around it (a different tool, a
+narrower command, a different path). Then FINISH: write your verdict with what you do have and name
+what you could not gather. On EXE-fb83a6fd both the researcher and the dependency resolver obeyed
+that message literally, ended their turns with no verdict, and each cost a FULL re-run of its own
+station -- 25m against a 4.3m median for Station 0 alone.
+
 Ocean/MM build+test rule (LANGUAGE-SCOPED — decided by the repo's LANGUAGE, not a fixed repo list,
 so a NEW Ruby repo is covered by the same rule automatically): ANY Ruby ocean repo builds/tests in
 Docker ONLY — the host can't resolve old native gems (e.g. nokogiri 1.6.8.1); never present a
@@ -393,7 +416,11 @@ def _guard_repeated_read(threshold: int = 3):
 
 
 def _emit(label: str, line: str) -> None:
-    print(f"    [{label}] {line}", flush=True)
+    # Through ui.write, which cannot raise. This is the HOTTEST console path in the pipeline — one
+    # call per line per SDK message at developer log level, over the monitor's stdout=PIPE — and a
+    # bare `print` here failed the researcher station of EXE-fb83a6fd on a BlockingIOError after it
+    # had finished all of its work. See ui.write.
+    ui.write(f"    [{label}] {line}")
 
 
 def _station_logfile(label: str):
@@ -685,7 +712,7 @@ def _station_mcp_config() -> dict | None:
 # Finding 3: identity of the ticket this PROCESS is driving, for keying tool-failure lessons. A
 # module-level context is correct here rather than threading four new params through ~20 call sites:
 # `ocean-pipeline` runs exactly one ticket AT A TIME per process (cli.py::_execute drives one; the
-# Monitor spawns a separate subprocess per ticket; `qa_batch.run_batch` drives N tickets in one
+# Monitor spawns a separate subprocess per ticket; an in-process driver would run N tickets in one
 # process but STRICTLY SEQUENTIALLY — see its docstring — and `nodes._summary` re-sets this context
 # at the start of every station, so each ticket overwrites it before any worker reads it),
 # so there is only ever one live run to describe. Set by nodes.researcher once
@@ -748,6 +775,27 @@ def _capture_tool_failure(node: str):
             pass
         return {}
     return _hook
+
+
+def _record_failed_spend(execution_id: str, node: str, tally_label: str, model: str | None) -> None:
+    """Persist a station's spend when its drive RAISED instead of returning.
+
+    `_drive` stashes its running tally in its own `finally`, so a station that worked for minutes
+    and then died has a real tally waiting — but every `station_spend` call sits inside a `try` that
+    the exception skipped, so the stations that cost the MOST wrote no row at all.
+
+    `tally_label` is separate from `node` because `_LAST_TALLY` is keyed by the label handed to
+    `_drive`, and the verdict re-drive passes `f"{node}:verdict-redrive"` — while the ROW belongs to
+    `node`, since the re-drive is extra spend on the same station, not a new one.
+
+    Best-effort: recording spend must never change how a station fails."""
+    try:
+        tally = _LAST_TALLY.get(tally_label)
+        if tally and any(tally):
+            telemetry.station_spend(execution_id, node, *tally,
+                                    model=model or config.STATION_MODEL)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: str,
@@ -843,10 +891,18 @@ async def _drive(system_prompt: str, prompt: str, cwd: Path, permission_mode: st
         # reaching its `return` — and that is the most expensive station there is (all the work done,
         # then a teardown blip). Without this its entire spend was lost.
         _LAST_TALLY[label] = (in_tok, out_tok, tools)
+        # metrics.add BELONGS IN THE FINALLY. It used to sit below, after the `return`-path lines, so
+        # it ran only when `_drive` completed normally — and a station that spent seven minutes and
+        # then died on a transport fault contributed NOTHING to `metrics.totals()`. EXE-fb83a6fd's
+        # run-report duly read `0 tokens · 0 tool calls · 0 station runs` against an 81 KB station
+        # log. The tokens were spent either way; the report has to say so.
+        #
+        # This also counts each RETRY attempt, which is correct and was previously lost: with four
+        # attempts the run really did pay for four, and only the last one was ever recorded.
+        metrics.add(in_tok, out_tok, tools)
     spend = metrics.fmt(in_tok, out_tok, tools)
     if spend:
         ui.milestone(f"done — {spend}")
-    metrics.add(in_tok, out_tok, tools)
     # Hand the tally back so the caller can PERSIST it per station (F10). These numbers were already
     # being computed here for the console line above; they simply had nowhere to go.
     return in_tok, out_tok, tools
@@ -896,7 +952,7 @@ async def _drive_with_retry(*, system_prompt: str, prompt: str, cwd: Path,
     # Drop any tally a PRIOR invocation left under this label before the first attempt. `_drive`
     # writes `_LAST_TALLY[label]` in its `finally`, so it is normally fresh — but a failure BEFORE
     # that `try` is entered (lazy SDK import, ClaudeAgentOptions construction) never reaches the
-    # `finally`, and `qa_batch.run_batch` drives N tickets sequentially in ONE process, so without
+    # `finally`, and a driver may run N tickets sequentially in ONE process, so without
     # this the already-succeeded path below could hand back a previous ticket's spend for the same
     # station label. Zeros are the honest answer when nothing was accumulated (judge review).
     _LAST_TALLY.pop(label, None)
@@ -1013,7 +1069,7 @@ async def run_agent(
         verdict_path.unlink()
 
     path = _agent_path(agent_md)
-    guardrails = AGENT_GUARDRAILS.format(ticket_id=ticket_id)
+    guardrails = AGENT_GUARDRAILS.format(ticket_id=ticket_id, projects_root=config.PROJECTS_ROOT)
     contract = VERDICT_INSTRUCTION.format(
         verdict_path=verdict_path,
         schema=json.dumps(verdict_model.model_json_schema(), indent=2),
@@ -1040,6 +1096,13 @@ async def run_agent(
         except Exception:  # noqa: BLE001
             pass
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
+        # The per-station spend row, on the FAILURE path too. `_drive` stashes its running tally in
+        # its own `finally`, so a station that worked for minutes and then died has a real tally
+        # waiting here — but `station_spend` above is inside the `try` and never ran, so the station
+        # that cost the most wrote no row at all. Same defect the F10 comment above describes, on the
+        # other branch. Guarded and best-effort for the same reason it is up there: recording spend
+        # must never change how a station fails.
+        _record_failed_spend(execution_id, node, node, model)
         if not verdict_path.exists():
             _capture_partial(node, execution_id, cwd)   # SDK crash / timeout with no verdict (full probe)
         raise StationError(node, agent_md, f"agent run failed: {type(e).__name__}: {e}",
@@ -1082,6 +1145,7 @@ async def run_agent(
             except Exception:  # noqa: BLE001
                 pass
         except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
+            _record_failed_spend(execution_id, node, f"{node}:verdict-redrive", model)
             if not verdict_path.exists():
                 _capture_partial(node, execution_id, cwd)
             raise StationError(node, agent_md, f"agent run failed (verdict re-drive): {type(e).__name__}: {e}",
@@ -1124,7 +1188,7 @@ async def run_skill(
     re-drives this entire (potentially very expensive, multi-step) skill invocation from scratch.
     The caller owns unlinking any stale prior-attempt file BEFORE calling this, same as before."""
     skill_md = config.FK_AIDEVELOPER_DIR / "skills" / skill_name / "SKILL.md"
-    guardrails = AGENT_GUARDRAILS.format(ticket_id=ticket_id)
+    guardrails = AGENT_GUARDRAILS.format(ticket_id=ticket_id, projects_root=config.PROJECTS_ROOT)
     try:
         _spend3 = await _drive_with_retry(
             system_prompt=_read(skill_md),
@@ -1150,6 +1214,7 @@ async def run_skill(
             except Exception:  # noqa: BLE001
                 pass
     except Exception as e:  # noqa: BLE001 — normalize any SDK/transport failure to StationError
+        _record_failed_spend(_RUN_CONTEXT.get("execution_id") or "", node, node, model)
         raise StationError(node, skill_name, f"skill run failed: {type(e).__name__}: {e}",
                             quota_exhausted=_is_quota_error(e)) from e
 

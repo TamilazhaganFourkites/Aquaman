@@ -47,22 +47,16 @@ _STATION_NAMES = {
     # Numbered 4.6 it sorted after a station it precedes, so `maxIf(station_number, ...)` in
     # the DDL reported max_station_reached = 4.6 for a run whose quality_gate then failed --
     # past a station it never finished. That is the exact defect this file already documents
-    # for 5.9 / 6.45 below, and the same remedy applies (qa_batch uses 0.05 for the same reason).
+    # for 5.9 / 6.45 below, and the same remedy applies.
     4.05: "node_eval",
     5: "harsh_review", 5.9: "code_fault_rework",
     5.95: "learn_repo", 6.0: "sit_resolve", 6.1: "sit_author", 6.15: "qa_review_gate",
     6.2: "sit_run", 6.3: "sit_testrail", 6.4: "sit_triage", 6.45: "environment_failure_rework",
     6.5: "flip_ready",
-    # qa_batch.py's own wrapper events. It used to pass a bare `6`, which is `6.0` to a dict key, so
-    # every batch marker filed itself under `sit_resolve` — a real station it has nothing to do with.
-    #
-    # 0.05, NOT 6.9. The first cut used 6.9 and a judge showed it reintroducing the defect its own
-    # sibling finding had just fixed: the DDL computes
-    # `maxIf(station_number, status IN ('completed','started'))`, so a number above every real
-    # station (max is 6.5 flip_ready) made EVERY batch item report max_station_reached = 6.9 — past
-    # flip_ready — no matter where it actually stopped. A wrapper that BRACKETS the run must sort
-    # below the run, not above it.
-    0.05: "qa_batch",
+    # A WRAPPER station that brackets a whole run must be numbered BELOW every real station, not
+    # above. The DDL computes `maxIf(station_number, status IN ('completed','started'))`, so a
+    # wrapper numbered past `flip_ready` (6.5) would make every run it brackets report
+    # max_station_reached beyond flip_ready no matter where it actually stopped.
 }
 # Aquaman phase label -> the server's station status value.
 _STATUS = {
@@ -103,11 +97,6 @@ _STATUS = {
     # a choice. Was `"skip"` -> `"skipped"`.
     "could_not_run": "failed",
     "blocked_short_circuit": "blocked",
-    # qa_batch.py wraps the QA-only subgraph and emits its own pair. `qa_batch_end` is that batch
-    # item's REAL terminal event, so it must not fall through to the annotation default — a judge
-    # caught the annotation change silently demoting it, because the enumeration behind that change
-    # was run over nodes.py alone and `station_event` is called from TWO files.
-    "qa_batch_start": "started", "qa_batch_end": "completed", "qa_batch_failed": "failed",
     # `code_fault_rework` (5.9) and `environment_failure_retry` (6.45) are plain-code counter bumps
     # that hand control BACK to an earlier station and emit nothing else — so "started" left them
     # permanently open in `pipeline_station_events`, and because the DDL's
@@ -146,8 +135,8 @@ _STATUS = {
 # annotation only if its station also emits a terminal phase on every path. Three review gates emit
 # their decision and nothing else, so `auto`/`decision` are terminal (see above) — a judge caught
 # that being got wrong here, and `test_every_station_reaches_a_terminal_status` now enumerates EVERY
-# phase string across the WHOLE PACKAGE (not just nodes.py — `qa_batch.py` calls this too, which an
-# earlier single-file enumeration missed) so the next person cannot repeat it by inspection.
+# phase string across the WHOLE PACKAGE rather than nodes.py alone — `station_event` has more than
+# one caller module, and a single-file enumeration silently misses the others.
 _ANNOTATION_STATUS = "note"
 # A station is CLOSED by any of these. Used for the duration bookkeeping in `station_event` and by
 # `test_every_station_reaches_a_terminal_status`, so there is exactly one definition of "terminal".

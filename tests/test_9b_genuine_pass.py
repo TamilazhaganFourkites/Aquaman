@@ -20,12 +20,11 @@ remaining methods and sent a human to QAT to verify 3/17 of the ticket.
 """
 from __future__ import annotations
 
-import ast
 import inspect
 
 import pytest
 
-from ocean_pipeline import nodes, qa_batch, quality
+from ocean_pipeline import nodes, quality
 
 
 def _src(methods: str) -> str:
@@ -166,24 +165,3 @@ def test_the_state_declares_the_phase2_keys():
     for k in ("qa_judge_rounds_observed", "qa_genuine_passed", "qa_genuine_passed_why",
               "qa_method_census"):
         assert k in OceanState.__annotations__, f"{k} would be dropped by LangGraph"
-
-
-# --------------------------------------------------------------- the plumbing prerequisite
-def test_qa_batch_stamps_the_exec_id():
-    """Without this EVERY qa_batch run writes no station log, so Phase 2 corroborates 0 judges on all
-    5 runs and the wrong conclusion gets drawn — "the judge never runs" when the evidence was simply
-    never written down. qa_batch is exactly the unattended sweep used to accumulate runs."""
-    src = inspect.getsource(qa_batch)
-    assert 'os.environ["OCEAN_PIPELINE_EXEC_ID"]' in src, "run_one never exports its execution_id"
-    i_stamp = src.index('os.environ["OCEAN_PIPELINE_EXEC_ID"]')
-    i_invoke = src.index("app.ainvoke")
-    assert i_stamp < i_invoke, "the id is stamped after the graph starts, so the log is still empty"
-
-
-def test_qa_batch_imports_os_at_module_scope():
-    """The stamp is a NameError without it, and this file's own history has two of those — the exact
-    class where the guarding test asserted source text rather than executability."""
-    tree = ast.parse(inspect.getsource(qa_batch))
-    imported = {a.name.split(".")[0] for n in ast.walk(tree)
-                if isinstance(n, ast.Import) for a in n.names}
-    assert "os" in imported
