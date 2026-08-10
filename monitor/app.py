@@ -40,6 +40,7 @@ import os
 import re
 import shutil
 import signal
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -51,6 +52,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import jira_client
+# The control plane's own halt, imported from the installed package (the monitor spawns
+# `ocean-pipeline` as a subprocess, so it shares the machine but not the process).
+from ocean_pipeline import kill_switch as _kill_switch
 import store
 from runtime import runtime
 
@@ -249,6 +253,33 @@ if _stale:
 # of that — how many tickets THIS process tries to run at once — not a safety mechanism itself.
 _RUN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TICKETS)
 
+
+# Bounded cleanup. Both are grace periods, never deadlines for real work: the drain exists only so
+# the child cannot block on a full pipe while we wait for it, and the wait exists only so a child
+# that is already finishing gets recorded properly. A child still running past them is recorded from
+# HOW WE GOT HERE, not from the timeout -- a crash is `failed`, a cancel is `interrupted` (the
+# ladder in `_drive_process` tests `exiting_exc` before `timed_out`). We never signal it, and we
+# never wait on it forever.
+STREAM_DRAIN_GRACE = 2.0
+CHILD_EXIT_GRACE = 5.0
+
+
+async def _drain_to_log(stream, log_fh) -> None:
+    """Keep emptying the child's stdout so it can never block on `write()`. Best-effort: this runs
+    inside a `finally` during shutdown, where raising would mask the original exception."""
+    while True:
+        try:
+            raw = await stream.readline()
+        except (ValueError, asyncio.LimitOverrunError):
+            continue                      # over-long line; same handling as the main loop
+        except Exception:                 # noqa: BLE001 -- cleanup must not raise
+            return
+        if not raw:
+            return
+        if log_fh is not None:
+            with contextlib.suppress(Exception):
+                log_fh.write(raw.decode("utf-8", errors="replace"))
+
 # Tracks every currently-live `ocean-pipeline` subprocess, keyed by ticket, so any one of them can
 # be force-killed from the UI independently of the others — there was previously no way to do this
 # short of killing the whole monitor process. With real concurrency, MULTIPLE entries here are
@@ -330,21 +361,27 @@ async def _drive_process(run: TicketRun, args: list[str],
     if batch is not None and batch.cancelled:
         _RUN_SEMAPHORE.release()
         return
-    run.status = "running"
-    if run.started_at is None:
-        run.started_at = time.time()
-    if batch is not None:
-        idx_now = _resolve_idx(batch, run)
-        if idx_now is not None:
-            store.save_ticket(batch.id, idx_now, run)
     proc = None
     log_fh = None
-    # Inherit this app's own environment (AQUAMAN_BIN's PATH, credentials, etc.) and
-    # layer the batch's gate-auto overrides on top — config.py reads these via
-    # os.environ.get(...) at the CHILD process's own import time, so this is the only
-    # way to make the checkbox state win over whatever's exported in the parent shell.
-    child_env = {**environ, **(env_overrides or {})}
+    # THE `try` STARTS HERE, not after the bookkeeping below. Everything from the acquire to the
+    # `try` used to be outside it — `_resolve_idx` plus a `store.save_ticket` — so an exception in
+    # that window took the slot permanently (measured: 3 remaining -> 2). Both calls are
+    # low-risk (`_resolve_idx` is a list scan; `save_ticket` swallows), which is exactly why it
+    # would never have been noticed. The nested `finally` below claims to cover "an exception
+    # anywhere in this block"; this is what makes that true rather than nearly true.
     try:
+        run.status = "running"
+        if run.started_at is None:
+            run.started_at = time.time()
+        if batch is not None:
+            idx_now = _resolve_idx(batch, run)
+            if idx_now is not None:
+                store.save_ticket(batch.id, idx_now, run)
+        # Inherit this app's own environment (AQUAMAN_BIN's PATH, credentials, etc.) and
+        # layer the batch's gate-auto overrides on top — config.py reads these via
+        # os.environ.get(...) at the CHILD process's own import time, so this is the only
+        # way to make the checkbox state win over whatever's exported in the parent shell.
+        child_env = {**environ, **(env_overrides or {})}
         proc = await asyncio.create_subprocess_exec(
             AQUAMAN_BIN, *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -523,19 +560,77 @@ async def _drive_process(run: TicketRun, args: list[str],
             procs.remove(proc)
             if not procs:
                 _RUNNING_PROCS.pop(run.ticket, None)
-        if log_fh is not None:
-            log_fh.close()
-        if proc is not None:
-            await proc.wait()
-            if run.status != "paused":
-                run.status = "done" if (run.final_status or "").lower() in ("completed",) else (
-                    "failed" if run.final_status else ("done" if proc.returncode == 0 else "failed"))
+        # DRAIN, THEN WAIT — both bounded, and neither optional.
+        #
+        # `stdout=PIPE` is emptied by the read loop above and by nothing else. Once that loop exits,
+        # a child with output still buffered blocks on its next `write()`, so an unbounded
+        # `proc.wait()` here never returns: the slot is held, the run stays `"running"`, and Ctrl+C
+        # on uvicorn hangs. Draining first lets a child that is finishing actually finish; bounding
+        # the wait means one that is not finishing cannot wedge us. Cost on a Ctrl+C during a live
+        # run: up to STREAM_DRAIN_GRACE + CHILD_EXIT_GRACE.
+        #
+        # NEVER SIGNAL THE CHILD. `start_new_session=True` above exists so a Ctrl+C on this terminal
+        # does not reach an hours-long pipeline; a `terminate()` here would undo that. The child
+        # does not survive this process either way (the pipe dies with us) — but it gets to finish
+        # and be recorded rather than dying mid-station.
+        #
+        # The recorded status comes from HOW WE GOT HERE (the ladder below), not from whether the
+        # wait timed out.
+
+        exiting_exc = sys.exc_info()[0]
+        try:
+            if proc is None and run.status != "paused":
+                # THE SPAWN ITSELF FAILED (a misconfigured AQUAMAN_BIN is the common case). The
+                # ladder below lives under `if proc is not None:`, so nothing recorded this run and
+                # the row persisted at "running" forever — the UI's TERMINAL set excludes it, so
+                # the ticket pulses with no Retry until a restart's reconcile_stale() clears it.
+                #
+                # Same "how we got here" rule as the ladder: `create_subprocess_exec` is an await
+                # point, so a cancel delivered there also leaves `proc is None`, and that is
+                # "we stopped watching", not "it failed". INSIDE this try, so an exception in the
+                # persistence below cannot skip the slot release.
+                run.status = ("interrupted" if exiting_exc is asyncio.CancelledError else "failed")
                 run.finished_at = time.time()
-            if batch is not None:
-                idx_now = _resolve_idx(batch, run)
-                if idx_now is not None:
-                    store.save_ticket(batch.id, idx_now, run)
-        _RUN_SEMAPHORE.release()
+                if batch is not None:
+                    _idx = _resolve_idx(batch, run)
+                    if _idx is not None:
+                        store.save_ticket(batch.id, _idx, run)
+            if proc is not None:
+                if proc.stdout is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(_drain_to_log(proc.stdout, log_fh),
+                                               timeout=STREAM_DRAIN_GRACE)
+                if log_fh is not None:
+                    log_fh.close()
+                timed_out = False
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=CHILD_EXIT_GRACE)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                if run.status != "paused":
+                    # HOW WE GOT HERE OUTRANKS HOW LONG IT TOOK. Testing
+                    # `timed_out` first, so a run whose read loop DIED but whose child outlived the
+                    # grace was recorded "interrupted" -- "the operator shut the monitor down" --
+                    # for a crash. Measured: with the drain disabled, that is the outcome at every
+                    # backlog size from 4MB to 40MB. The exception is the fact; the timeout is only
+                    # how the cleanup ended.
+                    if exiting_exc is not None and exiting_exc is not asyncio.CancelledError:
+                        run.status = "failed"
+                    elif exiting_exc is asyncio.CancelledError or timed_out:
+                        # Cancelled, or the child never exited within the grace. Both are
+                        # "we stopped watching", not "it failed".
+                        run.status = "interrupted"
+                    else:
+                        run.status = "done" if (run.final_status or "").lower() in ("completed",) else (
+                            "failed" if run.final_status else
+                            ("done" if proc.returncode == 0 else "failed"))
+                    run.finished_at = time.time()
+                if batch is not None:
+                    idx_now = _resolve_idx(batch, run)
+                    if idx_now is not None:
+                        store.save_ticket(batch.id, idx_now, run)
+        finally:
+            _RUN_SEMAPHORE.release()
 
 
 async def _run_batch_from(batch: Batch, start: int) -> None:
@@ -551,6 +646,16 @@ async def _run_batch_from(batch: Batch, start: int) -> None:
     a semaphore slot — that's the real point where a still-queued ticket can and does notice
     `batch.cancelled` and back out before ever spawning a process."""
     for i in range(start, len(batch.tickets)):
+        # E1, machine-wide. `batch.cancelled` stops THIS batch from the UI; the kill switch stops
+        # every driver on the machine, including from another terminal or another host over the
+        # shared filesystem. Consulted per ticket, like `qa_batch` does, so an engaged switch stops
+        # the batch at the next boundary rather than only at its start.
+        _halted, _why = _kill_switch.status()
+        if _halted:
+            batch.cancelled = True
+            print(f"[monitor] HALTED — {_why}; {len(batch.tickets) - i} ticket(s) not started",
+                  flush=True)
+            break
         if batch.cancelled:
             return
         run = batch.tickets[i]
@@ -629,7 +734,11 @@ async def _auto_worker() -> None:
     below."""
     while True:
         try:
-            if not runtime.paused:
+            # E1, machine-wide. `runtime.paused` is the UI's own pause; the kill switch is the
+            # out-of-band stop that works from another terminal or another host over the shared
+            # filesystem. The auto-queue is the driver most likely to be running unattended, so it
+            # is the one where an unhonoured halt costs the most.
+            if not runtime.paused and not _kill_switch.engaged():
                 for run in _auto_batch.tickets:
                     if run.status == "queued" and not run.execution_id:
                         await _drive_process(run, [run.ticket, "--log-level", _auto_batch.log_level],
