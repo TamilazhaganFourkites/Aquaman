@@ -663,7 +663,14 @@ def _judge_rounds_observed(exec_id: str, label: str, since: int) -> int:
     DOWNGRADE a claim, never to manufacture one.
     """
     try:
-        raw = (config.artifacts_dir(exec_id) / f"{label}.log").read_text(errors="replace")[since:]
+        # BYTES, not characters. `_log_offset` returns `st_size`, a BYTE count, so slicing the
+        # decoded string by it starts PAST the boundary by one char per multi-byte glyph --
+        # and these logs are dense with them (⚡ on every dispatch, plus ✓ — ·). Measured on a
+        # 200-line pass: 1000 chars of drift, which swallowed BOTH judge dispatches and made
+        # `judge_rounds = 0` on a pass where the judge demonstrably ran twice. Fail-closed in
+        # direction, but it makes the Phase 2 instrument assert the opposite of the truth.
+        raw = (config.artifacts_dir(exec_id) / f"{label}.log").read_bytes()[since:].decode(
+            "utf-8", "replace")
     except OSError:
         return 0
     seen: set[str] = set()
@@ -773,7 +780,7 @@ def _review_coverage(state: OceanState,
     so the gate has nothing to protect -- the same reasoning as open_pr's own guard.
 
     COULD-NOT-RUN FAILS OPEN, LOUDLY: if the reviewed dir yields no slug (no origin, git missing),
-    `unverified` is set and the gap is forced empty. Sibling precedent, stated at graph.py:330:
+    `unverified` is set and the gap is forced empty. Sibling precedent, stated on `after_quality_gate`'s `"proceed"` edge in graph.py:
     "clean, or could-not-run (fails OPEN, loudly)". Failing closed would turn a broken git into a
     zero-PR halt on every run -- an infra fault wearing the costume of an unreviewed repo.
     """
@@ -1125,7 +1132,9 @@ async def prep_container(state: OceanState) -> dict:
             _release_build_slot(exec_id)   # start failed — nothing to hold capacity for
         return {"container_name": container if ready else "", "container_ready": ready}
     except OSError as e:
-        telemetry.station_event(exec_id, 3.5, "skip", reason=f"prep error ({e})")
+        # `could_not_run`, not `skip`: this is the EXCEPTION handler, so the station tried and
+        # failed. `"skipped"` reads as "we chose not to" — the collapse `eval_could_not_run` avoids.
+        telemetry.station_event(exec_id, 3.5, "could_not_run", reason=f"prep error ({e})")
         _release_build_slot(exec_id)
         return {"container_ready": False}
 
@@ -1704,7 +1713,14 @@ async def quality_gate(state: OceanState) -> dict:
         # gated (the lesson from _check_rca_report's four silent infra-failure modes).
         ui.milestone(f"QUALITY GATE DID NOT FULLY RUN — {unverified}. "
                      f"{checked} of {derived} changed file(s) were actually checked.")
-        telemetry.station_event(exec_id, 4.5, "skip", reason=unverified[:300],
+        # An ANNOTATION, not a terminal status. `_STATUS["skip"] == "skipped"` closes the station,
+        # so this closed 4.5 BEFORE its own `end` fired: the gate ran, produced findings and routed
+        # on them, while telemetry recorded it skipped with the `end` carrying no duration.
+        # (The other `"skip"` sites — 0.5, 0.6, 3.5 — RETURN before their station's `end`, so there
+        # the skip IS the outcome and `"skipped"` is right. The discriminator is the return, not
+        # whether a `start` was emitted; `test_no_station_emits_a_TERMINAL_phase_AND_THEN_KEEPS_GOING`
+        # checks exactly that.)
+        telemetry.station_event(exec_id, 4.5, "gate_unverified", reason=unverified[:300],
                                 checked=checked, derived=derived)
 
     blocking = [f for f in findings if schemas.is_blocking_finding(f)]
@@ -1781,12 +1797,24 @@ async def harsh_reviewer(state: OceanState) -> dict:
     # B1: multi-repo review coverage. `harsh_reviewer` has ONE cwd, so `covered` is ALWAYS a
     # singleton -- do NOT pass repo_dirs() here or the gate over-claims coverage and never fires.
     wt = state.get("worktree_dir") or ""
-    reviewed_dirs = [Path(wt)] if wt else [config.FK_AIDEVELOPER_DIR]
+    # EMPTY when there is no worktree -- never FK_AIDEVELOPER_DIR. The review actually runs with
+    # `cwd=None` in that case, not in the control plane's own checkout; and because that
+    # directory IS a git repo, `_origin_slug` would return a VALID BUT WRONG slug, `covered`
+    # would be non-empty, and `_review_coverage`'s documented "no slug -> fail open" branch
+    # would never fire. The gap would then be the entire service-repo set: a bounce, then a
+    # stop, reporting fk-aideveloper as "reviewed" and the real repo as "unreviewed".
+    reviewed_dirs = [Path(wt)] if wt else []
     branch_repos, covered, gap, unverified = _review_coverage(state, reviewed_dirs)
     attempts, stopped = _coverage_budget(state, gap)
     if unverified:
         ui.milestone(f"REVIEW COVERAGE NOT DERIVED — {unverified}. Proceeding (fails OPEN).")
-        telemetry.station_event(state["execution_id"], 5, "skip", reason=unverified[:300])
+        # An ANNOTATION on a station that already ENDED four lines above, not a terminal status.
+        # `"skip"` maps to `"skipped"` in telemetry._STATUS, so emitting it here re-recorded station
+        # 5 as *skipped* on a run whose review completed and produced a verdict — the review is not
+        # what was skipped; deriving its coverage is. Its sibling `coverage_gap` right below was
+        # already a note for exactly this reason; this one was not.
+        telemetry.station_event(state["execution_id"], 5, "coverage_unverified",
+                                reason=unverified[:300])
     elif gap:
         ui.milestone(f"REVIEW COVERAGE GAP — reviewed {covered}, but {gap} carry this branch "
                      f"and would receive a PR unreviewed.")
@@ -2013,7 +2041,11 @@ async def sit_author(state: OceanState) -> dict:
     except OSError:
         census = {"parsed": False, "total": 0, "skip_guarded": 0}
     genuine, genuine_why = _genuine_passed(review, judge_rounds, census)
-    if not genuine and str(review.get("qa_authoring_review_verdict") or "").upper() == "PASSED":
+    # `isinstance` guard, matching the one at the `claimed = ...` line above: `_load_json`
+    # returns whatever the file holds, so a top-level JSON ARRAY in the review file makes
+    # `.get` raise AttributeError and crash sit_author outright.
+    if not genuine and isinstance(review, dict) \
+            and str(review.get("qa_authoring_review_verdict") or "").upper() == "PASSED":
         ui.milestone(f"Step 9b says PASSED but it is NOT a genuine pass — {genuine_why}")
     telemetry.station_event(exec_id, 6.1, "9b_genuine", genuine=genuine, why=genuine_why[:200],
                             methods=census.get("total"), skip_guarded=census.get("skip_guarded"))
@@ -2662,6 +2694,10 @@ async def sit_triage(state: OceanState) -> dict:
     # by polling to a 65-minute timeout, though the information was available at second zero.
     topo_required, topo_up, topo_unverified = _read_topology(exec_id)
     topo_gap = topology_gap(topo_required, topo_up)
+    # `and topo_required` means a MISSING topology.json cannot gate here, deliberately: gating on
+    # absence halts every run whose skill copy predates the write contract. Fails OPEN, loudly --
+    # the milestone + telemetry below keep "no services were required" distinguishable from
+    # "nobody wrote down which were". Same precedent as `after_quality_gate`'s "proceed" edge.
     if topo_gap or (topo_unverified and topo_required):
         why = (f"required service(s) not up: {topo_gap}" if topo_gap else topo_unverified)
         telemetry.station_event(exec_id, 6.4, "end", automation_result="failed",
@@ -2690,6 +2726,19 @@ async def sit_triage(state: OceanState) -> dict:
                                "evidence": f"topology gate: {why}", "ac_coverage": []},
                 "final_outcome": (f"SIT_TOPOLOGY_GAP: {why} — the SIT could not have exercised the "
                                   f"change, so this run is could_not_verify, not a code fault")}
+
+    if topo_unverified:
+        # NOT gating (see above) -- but not silent either. Without this, a run that never wrote
+        # topology.json and a run whose topology was clean produce byte-identical output, so the
+        # question "was this SIT's service topology ever checked?" has no answer after the fact.
+        # That is the same "could not measure" / "measured and passed" collapse the junit gate and
+        # the coverage gate each refuse; the difference here is only that the response is a record
+        # rather than a stop.
+        ui.milestone(f"SIT topology evidence is UNVERIFIED ({topo_unverified}) — the run proceeds "
+                     f"because nothing was declared as required, but nothing was checked either")
+        telemetry.station_event(exec_id, 6.4, "topology_unverified",
+                                topology_unverified=topo_unverified,
+                                topology_required=len(topo_required), gated=False)
 
     if verdict_path.exists():
         # Fresh Station-3 attempt, right before the one call that's actually about to run: this
@@ -3027,6 +3076,9 @@ async def prep_rework(state: OceanState) -> dict:
             "quality_gate_findings": [], "quality_gate_stopped": False,
             "qa_review_iteration": 0,
             "eval_attempts": 0, "eval_gap": "", "eval_stopped": False,
+            # Cleared for the same reason as the eight keys above: a Station-6 code fault is a FRESH
+            # coding attempt, so last attempt's accuracy verdict must not gate this one.
+            "node_evaluations": [],
             # B1: three of six. `review_coverage_unverified` deliberately does NOT reset, matching
             # quality_gate_unverified — an infra fault that survives a rework stays visible at the end.
             "review_coverage_attempts": 0, "review_coverage_gap": [],
@@ -3078,7 +3130,7 @@ async def _eval_node(state: OceanState, node: str, job: str, output: str) -> dic
             cwd=Path(state["worktree_dir"]) if state.get("worktree_dir") else None,
         )
     except Exception as e:  # noqa: BLE001 -- advisory: a judge failure must never fail the station
-        telemetry.station_event(exec_id, 4.6, "eval_could_not_run", eval_node=node,
+        telemetry.station_event(exec_id, 4.05, "eval_could_not_run", eval_node=node,
                                 error=f"{type(e).__name__}: {e}")
         ui.milestone(f"[eval] {node}: could not run ({type(e).__name__}) -- advisory, continuing")
         return {"eval_unverified": f"{node}: evaluator could not run ({type(e).__name__})"}
@@ -3092,7 +3144,7 @@ async def _eval_node(state: OceanState, node: str, job: str, output: str) -> dic
     unverified = "" if ev.verdict else f"{node}: evaluator returned no readable verdict"
     score = "not reported" if ev.accuracy is None else str(ev.accuracy)
     ui.milestone(f"[eval] {node}: accuracy={score} verdict={ev.verdict or 'UNREADABLE'}")
-    telemetry.station_event(exec_id, 4.6, "eval", eval_node=node,
+    telemetry.station_event(exec_id, 4.05, "eval", eval_node=node,
                             accuracy=ev.accuracy, verdict=ev.verdict, issues=len(ev.issues or []))
 
     evaluations = (state.get("node_evaluations") or []) + [record]
@@ -3122,16 +3174,22 @@ def _eval_gate(state: OceanState) -> str:
         This is what makes NODE_EVAL safe to switch on: it cannot, by itself, change where a run goes.
       * WARN -- the spec defines it as "minor gaps, usable". Gating on WARN would collapse the
         three-value enum into a two-value one and make the middle rung unreachable.
-      * an UNREADABLE verdict ("") -- fails OPEN, matching the sibling precedent at graph.py:330
+      * an UNREADABLE verdict ("") -- fails OPEN, matching the `after_quality_gate` "proceed" precedent in graph.py
         ("clean, or could-not-run (fails OPEN, loudly)"). A transport failure or a malformed judge
         reply is an infra fault, and failing closed on it would convert every judge outage into a
         halted pipeline. `eval_unverified` carries it so it reads as unmeasured, never as clean.
     """
     if not config.EVAL_ENFORCE:
         return ""
+    # LATEST evaluation per node only. The list is append-only within a rework cycle, so scanning
+    # all of it let a FAIL on pass 1 gate every later pass regardless of its own verdict -- a gate
+    # the subject cannot clear is a stop, not a gate. (`prep_rework` clears the list, but only on
+    # that path; this node must be right on the paths that skip it.)
+    latest: dict = {}
     for ev in state.get("node_evaluations") or []:
-        if not isinstance(ev, dict):
-            continue
+        if isinstance(ev, dict):
+            latest[str(ev.get("node") or "")] = ev
+    for ev in latest.values():
         if schemas.eval_verdict(ev.get("verdict")) == "FAIL":
             score = ev.get("accuracy")
             got = "not reported" if score is None else score
@@ -3274,7 +3332,11 @@ async def human_gate(state: OceanState) -> dict:
             + "Resume with --approve or --reject."
         ),
     })
-    return {"approval_decision": str(decision)}
+    # Same defect, same fix. `human_gate` is the gate that FLIPS PRs ready, so the stringified
+    # dict mattered more here than at the RCA gate: `after_human_gate` reads "" as reject, so it
+    # failed closed rather than open, but for the wrong reason — it never saw the decision at all.
+    return {"approval_decision": schemas.gate_decision(
+        decision, ("approve", "approved", "reject", "rejected"))}
 
 
 # ------------------------------------------------------------------ ready-flip (plain code, on GREEN)
@@ -3303,6 +3365,28 @@ async def flip_ready(state: OceanState) -> dict:
         telemetry.station_event(state["execution_id"], 6.5, "secret_scan",
                                 repos=len(dirs), scanned=scanned, findings=len(secret_findings),
                                 unverified=secret_unverified)
+        if not dirs:
+            # ZERO REPOSITORIES RESOLVED -- fails CLOSED, unlike the fail-open below. "gitleaks is
+            # not installed" is an infra gap that must not halt every ready-flip; "we could not find
+            # the repo the diff is in" means NOTHING about this change was examined, and the next
+            # thing this node does is flip the PR ready and move the ticket to In Review.
+            ui.milestone("[secret-scan] BLOCKED the ready-flip: no repository directories were "
+                         "resolved, so nothing was scanned at all")
+            telemetry.station_event(state["execution_id"], 6.5, "stop",
+                                    ready_flipped=False, findings=0, unverified=secret_unverified)
+            return {"ready_flipped": False, "final_status": "failed",
+                    "secret_findings": [],
+                    # NOT a code fault: the reachable shape is a passed SIT, approved by a human,
+                    # whose artifacts dir was cleaned while it sat paused. For the run report and a
+                    # human reader only -- `gan_effect.py` does not read `failure_class`, so it
+                    # still counts this run as a primary success.
+                    "failure_class": "could_not_verify",
+                    "secret_scan_unverified": secret_unverified,
+                    "final_outcome": (
+                        "secret_scan_not_run: no repository directories were resolved for branch "
+                        f"{state.get('branch')!r}, so the diff was never scanned; PR(s) left DRAFT "
+                        "and the ticket was not moved to In Review — an unscanned diff must not be "
+                        "sent for human review")}
         if secret_unverified:
             # Fails OPEN, loudly -- an absent or broken gitleaks must not halt every ready-flip. The
             # reason is carried to the terminal so it can never read as "scanned and clean".
@@ -3370,12 +3454,12 @@ async def stop_run(state: OceanState) -> dict:
         return {"final_status": "blocked", "ready_flipped": False,
                 "final_outcome": "blocked_open_questions: posted to Jira for product/UX; "
                                  "awaiting answers before coding"}
-    if str(state.get("rca_approval_decision", "")).lower().startswith("reject"):
+    if schemas.gate_decision(state.get("rca_approval_decision", ""), ("reject", "rejected")):
         # Human rejected the RCA at its review gate — before any coding started.
         telemetry.station_event(state["execution_id"], 0.15, "stop", reason="rca_rejected_by_engineer")
         return {"final_status": "failed",
                 "final_outcome": "human rejected the RCA report at the review gate; no action taken"}
-    if str(state.get("approval_decision", "")).lower().startswith("reject"):
+    if schemas.gate_decision(state.get("approval_decision", ""), ("reject", "rejected")):
         # Human rejected the ready-flip at the approval gate — not a SIT failure.
         telemetry.station_event(state["execution_id"], 6.5, "stop", reason="rejected_by_engineer")
         return {"final_status": "failed", "ready_flipped": False,
@@ -3420,7 +3504,7 @@ async def stop_run(state: OceanState) -> dict:
         # state, so keying on it would mislabel a later, unrelated stop -- the exact class the
         # quality_gate arm above documents. Sits directly below it because the deterministic
         # gate outranks the LLM judge when both fired (see graph.after_quality_gate).
-        reason, station = "eval_accuracy_failed", 4.6
+        reason, station = "eval_accuracy_failed", 4.05
     elif state.get("review_coverage_stopped"):
         # B1. Keyed on `review_coverage_stopped`, never on `review_coverage_gap` — a gap from a
         # BOUNCED pass persists in state and would mislabel a later, unrelated stop.
@@ -3689,8 +3773,16 @@ async def rca_review_gate(state: OceanState) -> dict:
         "gate_problems": [str(g) for g in gate],
         "prompt": prompt,
     })
-    telemetry.station_event(exec_id, 0.15, "decision", decision=str(decision))
-    return {"rca_approval_decision": str(decision)}
+    # CANONICALISED HERE, not stringified. `str(decision)` turned `{'decision': 'reject', ...}`
+    # -- the shape `cli.py`'s flag dispatch actually delivers -- into "{'decision': ...}", so the
+    # `schemas.gate_decision` call in the router received a string that had already lost its
+    # structure and returned "". The routers were switched to the canonicalizer, but its own
+    # docstring says "unwrap the dict", and the caller stringified before it ever arrived: same
+    # outcome as the prefix test it replaced. The state stays `str` (see state.py); what changes is
+    # that it now holds a canonical token or "".
+    canonical = schemas.gate_decision(decision, ("approve", "approved", "reject", "rejected"))
+    telemetry.station_event(exec_id, 0.15, "decision", decision=canonical or str(decision)[:80])
+    return {"rca_approval_decision": canonical}
 
 
 # ------------------------------------------------------------------ unsupported route (terminal)

@@ -10,6 +10,7 @@ marker operation may ever fail a run. That is what most of these tests are about
 """
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -85,7 +86,9 @@ def test_a_malformed_marker_is_ignored_not_reported_as_waiting():
 def test_the_gates_dir_is_flat_env_overridable_and_not_under_tmp():
     """Flat, so "what needs me?" is an `ls` rather than a walk of every execution's artifacts dir —
     and not under /tmp, where a nightly cleaner would quietly erase the record."""
-    import importlib, os
+    import importlib
+    import os
+
     saved = dict(os.environ)
     try:
         os.environ["OCEAN_PIPELINE_GATES_DIR"] = "/somewhere/gates"
@@ -109,7 +112,20 @@ def test_cli_writes_on_pause_and_clears_on_every_terminal_path():
     src = Path(cli.__file__).read_text()
     assert "gate_marker.write(" in src, "nothing records a pause"
     # Cleared on BOTH terminal paths — the clean finish and the exception handler.
+    #
+    # `count(...) >= 2` counted TEXT, so two clears on the same path (or one in a comment) satisfied
+    # it while the crash path stayed uncovered — the precise gap the assertion names. Locate the
+    # exception handler and require a clear inside it.
     assert src.count("gate_marker.clear(") >= 2, (
         "a crashed run must clear its marker too, or it advertises a gate forever")
+    tree = ast.parse(src)
+    cleared_in_handler = any(
+        isinstance(call.func, ast.Attribute) and call.func.attr == "clear"
+        and isinstance(call.func.value, ast.Name) and call.func.value.id == "gate_marker"
+        for h in ast.walk(tree) if isinstance(h, ast.ExceptHandler)
+        for call in ast.walk(h) if isinstance(call, ast.Call))
+    assert cleared_in_handler, (
+        "no `except` block in cli.py clears the gate marker — a run that crashes at a pause "
+        "advertises a gate nobody can answer, forever")
     pause_at = src.index("gate_marker.write(")
     assert "[PAUSED]" in src[pause_at:pause_at + 400], "the marker must be written at the pause"

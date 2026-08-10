@@ -32,7 +32,7 @@ from pathlib import Path
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from . import config, gate_marker, metrics, report, telemetry, tracing, ui
+from . import config, gate_marker, kill_switch, metrics, report, telemetry, tracing, ui
 from .graph import build_graph, compile_app
 from .nodes import _SME_BY_BUCKET, _release_build_slot, _release_gan_slot, _release_sit_slot
 from .state import OceanState
@@ -428,6 +428,13 @@ async def _execute(execution_id: str, ticket_id: str, initial, thread) -> None:
 
 async def _run(ticket_id: str, context: str) -> None:
     _preflight()
+    # E1, machine-wide. The halt was consulted only in `qa_batch`, so `ocean-pipeline MM-1234` --
+    # the ordinary single-run entry point, and the one `run-batch.sh` loops -- started a fresh run
+    # straight through an engaged switch. A stop that one of five entry points honours is not a
+    # stop; it is a convention.
+    halted, why = kill_switch.status()
+    if halted:
+        raise SystemExit(f"HALTED — {why}\n  release with: rm {kill_switch.KILL_SWITCH_PATH}")
     if _project(ticket_id) not in config.ISBU_PROJECTS:
         raise SystemExit(
             f"{ticket_id}: not an isbu board. This orchestrator runs the full Ocean/MM pipeline only."

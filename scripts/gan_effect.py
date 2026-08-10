@@ -67,7 +67,14 @@ def _runs(artifacts_root: Path) -> list[dict]:
             "ticket": rep.get("ticket"),
             "arm": arm,
             "n_gaps": len(gaps) if isinstance(gaps, list) else None,
-            "primary_sit_passed": rep.get("final_status") == "completed",
+            # The PRE-REGISTERED variable. `final_status` is a fallback for runs recorded
+            # before `automation_result` was written to the report, and it is a DIFFERENT
+            # measure (a run can finish "completed" without the SIT passing), so it is
+            # flagged rather than silently blended.
+            "primary_sit_passed": (rep["automation_result"] == "passed"
+                                   if rep.get("automation_result")
+                                   else rep.get("final_status") == "completed"),
+            "primary_is_proxy": not rep.get("automation_result"),
             "secondary_coding_attempts": rep.get("coding_attempts"),
             "secondary_review_findings": len(rep.get("review_findings") or []),
             "_scen": str(scen),
@@ -76,10 +83,29 @@ def _runs(artifacts_root: Path) -> list[dict]:
 
 
 def analyse(runs: list[dict]) -> dict:
-    arms = {a: [r for r in runs if r["arm"] == a] for a in ("gaps", "clean", "unknown")}
+    # EXCLUDED from the arms, not an abort. A run whose PRIMARY variable fell back to the
+    # `final_status` proxy is measuring a DIFFERENT variable, so averaging it in produces a number
+    # that reads as the pre-registered measure and is not. But aborting the whole analysis on one
+    # such run is worse: `report.finish` writes `automation_result: ""` for any run that ends
+    # before Station 6 (paused at a gate, aborted, RCA-only), and those runs can never acquire the
+    # key however often they are re-run -- one of them would silence the analyser permanently.
+    # Dropping them from the comparison keeps the remaining runs analysable and keeps the count
+    # visible, so a reader can see how much of the corpus was set aside.
+    comparable = [r for r in runs if not r.get("primary_is_proxy")]
+    arms = {a: [r for r in comparable if r["arm"] == a] for a in ("gaps", "clean", "unknown")}
+    # Runs whose PRIMARY variable had to fall back to the `final_status` proxy. `_runs` flags each
+    # one; nothing read the flag, so `primary_sit_passed` silently mixed the two measures — a mean
+    # over 3 real FAILs and 2 proxy PASSes reads as 0.4 and means nothing. Surfaced here, and the
+    # verdict is withheld when the mix is material, because a pre-registration that quietly
+    # substitutes its own outcome measure is worse than none.
+    n_proxy = sum(1 for r in runs if r.get("primary_is_proxy"))
+    # `n_total` counts what was READ; `n_comparable` what was analysed. Keeping both means the
+    # exclusion is visible rather than silently shrinking the corpus.
     result = {
         "n_total": len(runs),
+        "n_comparable": len(comparable),
         "n_by_arm": {a: len(v) for a, v in arms.items()},
+        "n_primary_from_proxy": n_proxy,
         "min_per_arm": MIN_PER_ARM,
         "outcomes": OUTCOMES,
         "comparisons": {},

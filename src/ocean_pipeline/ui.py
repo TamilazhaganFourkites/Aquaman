@@ -73,7 +73,12 @@ def milestone(text: str) -> None:
     streamed "what's happening right now" detail belongs to the "give me everything" tier."""
     if not _at_least("developer"):
         return
-    print(f"     · {text}", flush=True)
+    # Clamped for the same reason `step()` is: `monitor/app.py` parses this stream with `^`-anchored
+    # `_DONE_RE` / `_PAUSED_RE` / `_QUOTA_RE`, and the `     · ` prefix only guards the FIRST
+    # physical line. `agents._milestones` builds this text from `Task.description` and
+    # `Write/Edit.file_path`, which are agent-controlled, so a newline here forges a completed run
+    # (with a PR number) into monitor.db, or auto-pauses the discovery queue.
+    print(f"     · {_one_line(text, limit=300)}", flush=True)
 
 
 def node_label(node: str) -> str:
@@ -81,13 +86,23 @@ def node_label(node: str) -> str:
 
 
 def outcome_line(node: str, update: dict) -> str:
-    """Highlight + detail facts for a node, flattened to one line (for the report table)."""
+    """Highlight + detail facts for a node, flattened to one line (for the report table).
+
+    Sanitised here for the `_details` bullets; the highlight arrives already clamped by
+    `_highlight`. The `qa_scenarios` stop reason is additionally checked against its four
+    documented values before being flattened — that clamp carries meaning, this one is the backstop.
+    """
     parts = []
     hi = _highlight(node, update)
     if hi:
         parts.append(hi)
     parts += [d.strip() for d in _details(node, update)]
-    return "; ".join(p for p in parts if p)
+    # Flattened, NOT truncated. `report.record` stores this as each station's `outcome` in
+    # run-report.json and the markdown table, neither of which is parsed by anything — so the
+    # 300-char cap only cost the durable artifact information (a realistic sit_triage row hit the
+    # cap and was cut mid-dict). The console is where the `^`-anchored parser reads, and `step`,
+    # `milestone` and `summary` clamp there.
+    return _one_line("; ".join(p for p in parts if p), limit=100_000)
 
 
 def _fmt_elapsed(sec: float) -> str:
@@ -237,7 +252,30 @@ def _details(node: str, upd: dict) -> list[str]:
     return d
 
 
+def _one_line(text: str, limit: int = 60) -> str:
+    """Agent-supplied text, made safe for the two places a highlight is consumed.
+
+    `ui.step` prints one line and `monitor/app.py::_parse_step_line` reads one line, so a newline
+    truncates the record. `report._markdown` interpolates the same string into a 4-cell markdown
+    table row, so a `|` splits the row.
+    """
+    flat = " ".join(str(text).replace("|", "/").split())
+    # Truncation is MARKED, like every other truncation in this file.
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
+
+
 def _highlight(node: str, upd: dict) -> str:
+    """Sanitised wrapper — the boundary BOTH consumers share (`ui.step` calls this directly;
+    `outcome_line` calls it too).
+
+    `monitor/app.py` parses this console line with `^`-anchored `_DONE_RE` / `_PAUSED_RE` /
+    `_QUOTA_RE`, so a newline in agent-supplied text forges a control message: a completed run with
+    a fabricated PR number, written into `monitor.db`.
+    """
+    return _one_line(_highlight_raw(node, upd), limit=300)
+
+
+def _highlight_raw(node: str, upd: dict) -> str:
     if not isinstance(upd, dict):
         return ""
     if node == "researcher":
@@ -263,11 +301,23 @@ def _highlight(node: str, upd: dict) -> str:
         return f"{checked} file(s) clean"
     if node == "qa_scenarios":
         gaps = upd.get("qa_gan_residual_gaps") or []
-        verdict = upd.get("qa_gan_verdict") or "?"
+        # No `or "?"`: an absent verdict is a real state (older checkpoints, a resumed run), and
+        # "scenarios hardened" below says what is known without inventing one. Clamped AT THE READ
+        # because the gaps branch returns, so a later clamp would guard only one of two exits.
+        verdict = _one_line(upd.get("qa_gan_verdict") or "")
         # Gated on the GAPS, not the verdict -- same reason as the PR-body section in open_pr.
         if gaps:
             return f"{verdict} — {len(gaps)} residual HIGH gap(s)"
-        return f"{verdict} — converged" if verdict else "scenarios hardened"
+        # The recorded `stop_reason`, never the literal "converged" -- that is one of four values
+        # and only rule 1 produces it. A recognised value prints verbatim; anything else is shown
+        # flattened rather than mapped onto a reason that did not happen, because this field is
+        # unvalidated sub-agent JSON.
+        why = str(upd.get("qa_gan_stop_reason") or "").strip()
+        if why not in ("converged", "scores_below_threshold", "plateau", "round_ceiling"):
+            why = _one_line(why)
+        if verdict:
+            return f"{verdict} — {why}" if why else verdict
+        return "scenarios hardened"
     if node == "coder":
         # Only ever mention the evaluation when it actually ran -- with NODE_EVAL off (the default)
         # this is unchanged from before D5.
@@ -352,7 +402,10 @@ def step(node: str, upd: dict, elapsed: float) -> None:
     print(line, flush=True)
     if _at_least("developer"):
         for det in _details(node, upd):
-            print(f"        └ {det}", flush=True)
+            # Clamped like the highlight, and for the same reason: the `└ ` prefix only guards the
+            # FIRST physical line. A newline inside a detail bullet starts an unprefixed line, and
+            # `monitor/app.py`'s `_DONE_RE` / `_PAUSED_RE` / `_QUOTA_RE` are anchored at `^`.
+            print(f"        └ {_one_line(det, limit=300)}", flush=True)
 
 
 def summary(final: dict, total: float) -> None:
@@ -360,7 +413,9 @@ def summary(final: dict, total: float) -> None:
     print("─" * WIDTH)
     print(f"  RESULT: {status}   ·   took {_fmt_elapsed(total)}   ·   finished {_now()}")
     if final.get("final_outcome"):
-        print(f"  {final['final_outcome']}")
+        # Same channel. `final_outcome` is built from agent output (and, on one path, from a
+        # pydantic ValidationError's message), and lands in the same parsed stream.
+        print(f"  {_one_line(final['final_outcome'], limit=300)}")
     t = metrics.totals()
     usage = metrics.fmt(t["input"], t["output"], t["tools"])
     if usage:

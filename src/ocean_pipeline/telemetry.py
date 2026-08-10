@@ -42,7 +42,13 @@ _STATION_NAMES = {
     1: "dependency_resolver", 1.5: "reachability_gate", 1.55: "blocked_review_gate",
     1.6: "qa_scenarios",
     3.5: "prep_container", 3.6: "teardown_container",
-    3.87: "open_pr", 4: "coder", 4.5: "quality_gate", 4.6: "node_eval",
+    3.87: "open_pr", 4: "coder", 4.5: "quality_gate",
+    # 4.05, NOT 4.6: `_eval_node` runs INSIDE `coder` (station 4), BEFORE quality_gate (4.5).
+    # Numbered 4.6 it sorted after a station it precedes, so `maxIf(station_number, ...)` in
+    # the DDL reported max_station_reached = 4.6 for a run whose quality_gate then failed --
+    # past a station it never finished. That is the exact defect this file already documents
+    # for 5.9 / 6.45 below, and the same remedy applies (qa_batch uses 0.05 for the same reason).
+    4.05: "node_eval",
     5: "harsh_review", 5.9: "code_fault_rework",
     5.95: "learn_repo", 6.0: "sit_resolve", 6.1: "sit_author", 6.15: "qa_review_gate",
     6.2: "sit_run", 6.3: "sit_testrail", 6.4: "sit_triage", 6.45: "environment_failure_rework",
@@ -67,18 +73,35 @@ _STATUS = {
     # rule as `gate_refused` below — telemetry status must agree with the node's own final_status.
     "unsupported_route": "failed",
     "gate_refused": "failed",           # rca_done's gate-refused branch; it returns final_status=failed
-    # D5/D6 node accuracy evaluation (station 4.6). Both are TERMINAL, per the rule stated below:
+    # D5/D6 node accuracy evaluation (station 4.05 — renumbered from 4.6 so it sorts
+    # before the stations it evaluates). Both are TERMINAL, per the rule stated below:
     # decide from the CALL SITE, not the name. `_eval_node` emits exactly one of these on every
     # path it takes -- and on the third path (NODE_EVAL off, or the node not in EVAL_NODES) it
-    # emits nothing at all and the station correctly never appears. So there is no path where 4.6
+    # emits nothing at all and the station correctly never appears. So there is no path where 4.05
     # opens a lifecycle it does not close, which is what would make these annotations instead.
     # B1: an annotation. Station 5 (harsh_review) emits its own start/end around this.
     "coverage_gap": "note",
+    # Station 4.5's own annotation: the quality gate could not check every changed file, but it
+    # DID run and its `end` event follows. Was `"skip"` -> `"skipped"`, which closed the station
+    # before that `end`.
+    "gate_unverified": "note",
+    # B1's other annotation: the coverage derivation FAILED while the review itself succeeded.
+    # Was emitted as `"skip"` -> `"skipped"`, which reported the completed review station as
+    # skipped. It is a note on a station that already ended, exactly like `coverage_gap` above.
+    "coverage_unverified": "note",
+    # M1: emitted INSIDE station 6.4, on the path where the gate deliberately does NOT stop. It
+    # already resolved to "note" by fallthrough, so this line changes no behaviour — it makes the
+    # phase VISIBLE to anything that enumerates this table, which is the only way a reviewer can
+    # answer "which events exist and what do they mean?" without grepping two files.
+    "topology_unverified": "note",
     "eval": "completed",
     # "failed" describes the EVALUATOR, not the run: the judge did not produce a judgment. The
     # pipeline continues regardless (the evaluation is advisory), but recording this as "skipped"
     # would read as "we chose not to evaluate" when in fact we tried and could not.
     "eval_could_not_run": "failed",
+    # Station 3.5's exception handler — same distinction: the prep RAISED, so it is a failure, not
+    # a choice. Was `"skip"` -> `"skipped"`.
+    "could_not_run": "failed",
     "blocked_short_circuit": "blocked",
     # qa_batch.py wraps the QA-only subgraph and emits its own pair. `qa_batch_end` is that batch
     # item's REAL terminal event, so it must not fall through to the annotation default — a judge

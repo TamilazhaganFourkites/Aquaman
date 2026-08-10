@@ -250,10 +250,13 @@ def test_the_monitor_guard_matches_the_label_the_driver_actually_emits():
 
 
 def test_the_station_number_is_registered_and_terminal():
-    """Station 4.6 emits telemetry; an unregistered number degrades to a `station_<n>` fallback and
+    """Station 4.05 emits telemetry; an unregistered number degrades to a `station_<n>` fallback and
     a non-terminal status makes its rows vanish from the ClickHouse completed-station aggregate.
     The suite's own invariant tests caught exactly this during implementation."""
-    assert telemetry._STATION_NAMES[4.6] == "node_eval"
+    # 4.05, not 4.6: `_eval_node` runs inside `coder` (4) and BEFORE quality_gate (4.5), so a
+    # higher number made maxIf(station_number) report a station the run never reached.
+    assert telemetry._STATION_NAMES[4.05] == "node_eval"
+    assert 4.6 not in telemetry._STATION_NAMES, "the old out-of-order number is back"
     assert telemetry._STATUS["eval"] in telemetry._TERMINAL_STATUSES
     assert telemetry._STATUS["eval_could_not_run"] in telemetry._TERMINAL_STATUSES
 

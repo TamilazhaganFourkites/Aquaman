@@ -169,3 +169,37 @@ def test_the_preflight_falls_back_to_target_repos_when_no_topology_exists():
     """Back-compat: a run predating topology.json must still be preflighted, not skipped."""
     src = inspect.getsource(nodes.sit_run)
     assert 'else state.get("target_repos")' in src, "no fallback — older runs lose their preflight"
+
+
+def test_the_budget_sizer_reads_a_PHASE_ONE_file(tmp_path, monkeypatch):
+    """`sit_run` sizes the Docker budget from `required_real_services` BEFORE it dispatches the
+    skill — 49 lines before, in the same function. So the file must already exist by then, carrying
+    the classifier's half; `services_up` arrives later, in Station 2 Step 6b.
+
+    Moving the whole write into Station 2 broke this: on a first attempt the read found nothing and
+    the budget fell back to `target_repos`, which this code's own comment calls "routinely
+    over-scoped … and blind to services the ticket never changed but the test still needs". That
+    silently reverted sit-topology #4."""
+    monkeypatch.setattr(config, "ARTIFACTS_ROOT", tmp_path)
+    d = tmp_path / "EXE-phase1"
+    d.mkdir(parents=True)
+    # Phase 1 exactly as Station 0 writes it — no `services_up` key at all.
+    (d / "topology.json").write_text(json.dumps(
+        {"class": "callback_e2e",
+         "required_real_services": ["fkrelay", "notification-worker", "tracking-service"]}))
+
+    required, up, why = nodes._read_topology("EXE-phase1")
+    assert required == ["fkrelay", "notification-worker", "tracking-service"], (
+        "the budget sizer cannot see the classifier's answer, so it falls back to target_repos")
+    assert up == [], "phase 1 carries no observation, by design"
+    assert why == "", "a phase-1 file is not 'unverified' — Step 6b has simply not run yet"
+
+
+def test_a_phase_one_file_still_gates_at_triage():
+    """The other half of the same contract. If a run never reaches Step 6b, the file stays phase-1
+    and `services_up` is empty — so the gate sees every required service as down and returns
+    could_not_verify. That is CORRECT: the run did not complete Station 2, so nothing was verified.
+    Asserted so nobody 'fixes' it by defaulting `services_up` to the required set."""
+    gap = nodes.topology_gap(["fkrelay", "notification-worker"], [])
+    assert gap == ["fkrelay", "notification-worker"], (
+        "a run that never observed its stack must not read as verified")

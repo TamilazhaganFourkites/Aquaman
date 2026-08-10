@@ -53,6 +53,15 @@ def finish(final: dict, out_dir: Path) -> Path | None:
         "finished": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "duration_seconds": round(duration, 1),
         "final_status": final.get("final_status"),
+        # The SIT verdict itself. gan_effect.py pre-registers `automation_result == "passed"`
+        # as its PRIMARY dependent variable; it was absent here, so the analyser silently
+        # substituted `final_status == "completed"` — a DIFFERENT variable — without amending
+        # the pre-registration. Writing the real field is the honest fix; rewriting the
+        # pre-registration to match whatever was convenient is how a pre-registration stops
+        # meaning anything.
+        "automation_result": final.get("automation_result", ""),
+        "failure_class": final.get("failure_class", ""),
+        "coding_attempts": final.get("coding_attempts", 0),
         "final_outcome": final.get("final_outcome"),
         "pr_number": final.get("pr_number"),
         "test_automation_pr_url": final.get("test_automation_pr_url"),
@@ -70,6 +79,21 @@ def finish(final: dict, out_dir: Path) -> Path | None:
         "review_repos_covered": final.get("review_repos_covered") or [],
         "review_coverage_gap": final.get("review_coverage_gap") or [],
         "review_coverage_unverified": final.get("review_coverage_unverified", ""),
+        # gan_effect.py's ARM ASSIGNMENT and its SECONDARY variable. `qa_gan_residual_gaps` splits
+        # runs into the `gaps` / `clean` arms; absent, every run landed in `unknown` and the
+        # comparison had zero runs on either side. `review_findings` is the secondary outcome.
+        # NB `qa_gan_residual_gaps` has no `or []`: None (never recorded) must stay distinct from
+        # [] (recorded, clean).
+        "qa_gan_residual_gaps": final.get("qa_gan_residual_gaps"),
+        "review_findings": final.get("review_findings") or [],
+        # The credential gate's own could-not-measure signal. `flip_ready` fails OPEN when gitleaks
+        # is missing and says the reason is "carried to the terminal so it can never read as
+        # 'scanned and clean'" — but the terminal scrolls away and this file is what survives. Absent
+        # here, a run that scanned NOTHING and a run that scanned clean produced byte-identical
+        # reports, which is the same collapse `review_coverage_unverified` and `eval_unverified`
+        # two lines up exist to prevent.
+        "secret_scan_unverified": final.get("secret_scan_unverified", ""),
+        "secret_findings": final.get("secret_findings") or [],
         "node_evaluations": final.get("node_evaluations") or [],
         # Kept separate from the list above so "the judge could not be run / returned nothing
         # readable" can never be read as "no evaluation found anything wrong".

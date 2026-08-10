@@ -59,5 +59,37 @@ def test_a_timings_record_is_still_well_formed_under_isolation():
     lines = [l for l in config.TIMINGS_LOG.read_text().splitlines() if l.strip()]
     assert lines, "no timings record was written under isolation"
     doc = json.loads(lines[-1])
+    # The EXACT key set `report._append_timings_log` writes, not an `or`-chain over three candidate
+    # spellings. Two of those three ("stations", "nodes") have never been written by any version of
+    # this code, so the assertion could only ever be carried by the first — and would still have
+    # passed had that one been renamed too, as long as some other guessed name appeared. An oracle
+    # that accepts alternatives it has never seen is not asserting a format, it is hoping for one.
+    for key in ("ticket", "execution_id", "finished", "final_status",
+                "total_seconds", "station_seconds"):
+        assert key in doc, f"the timings record lost {key!r}; got {sorted(doc)}"
     assert doc["execution_id"]
-    assert "total_seconds" in doc or "stations" in doc or "nodes" in doc, doc.keys()
+    assert isinstance(doc["station_seconds"], dict)
+
+
+def test_the_suite_cannot_post_telemetry_to_production():
+    """The largest uncovered durable write, and it is not a file.
+
+    `telemetry` POSTs station/execution rows to the production aidev-db MCP endpoint whenever
+    `RCA_TOKEN` is set. Nothing cleared it, so any test driving a real node would have written into
+    production. Inert only because the variable is usually absent — which is luck, not isolation.
+    """
+    import os
+
+    from ocean_pipeline import telemetry
+    assert not os.environ.get("RCA_TOKEN"), "RCA_TOKEN is set during the test session"
+    assert telemetry.RCA_TOKEN == "", (
+        "telemetry.RCA_TOKEN is non-empty — it is read into a module global at import, so clearing "
+        "the environment variable alone does not disarm it")
+
+
+def test_the_checkpoint_db_is_isolated_too():
+    """`CHECKPOINT_DB` is derived from ARTIFACTS_ROOT AT IMPORT, so re-pointing the root alone leaves
+    the LangGraph checkpointer writing into the operator's real state."""
+    from ocean_pipeline import config
+    assert _HOME_STATE not in Path(config.CHECKPOINT_DB).parents, (
+        f"the checkpointer would write to {config.CHECKPOINT_DB}")

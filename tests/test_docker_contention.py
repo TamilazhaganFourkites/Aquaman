@@ -72,11 +72,21 @@ def test_unmeasurable_usage_returns_None_not_zero(monkeypatch):
 
 def test_both_callers_guard_on_None():
     """A caller that dropped the `is not None` check would treat "could not measure" as zero usage
-    and pass a preflight on a machine it never looked at."""
+    and pass a preflight on a machine it never looked at.
+
+    NOTE the missing `continue`: a version that skips any caller whose source does not
+    mention `_docker_used_gb` — which is precisely the mutation this test exists to catch. Delete
+    the call entirely and the old loop skipped that function and passed; the test could only ever
+    fail on a caller that still called the helper AND still guarded it, i.e. on correct code."""
     for fn in (nodes._docker_preflight_reason, nodes._try_acquire_build_slot):
         src = inspect.getsource(fn)
-        if "_docker_used_gb" not in src:
-            continue
+        # The CALL, not the name. Both functions' DOCSTRINGS mention `_docker_used_gb` while
+        # explaining the None contract, so a bare `"_docker_used_gb" in src` stayed true after the
+        # call itself was replaced with a literal — a mutant that makes the headroom check inert
+        # survived it. Prose about a mechanism is not the mechanism.
+        assert "_docker_used_gb(" in src, (
+            f"{fn.__name__} no longer CALLS the helper — the headroom check is inert, which reads "
+            f"identically to a machine with plenty of room")
         assert "is not None" in src, f"{fn.__name__} uses the helper without the None guard"
 
 
@@ -98,11 +108,31 @@ def test_the_over_commit_reason_is_transient_and_says_so():
     assert "manual-findings #18" in src, "the motivating run is no longer cited"
 
 
-def test_the_sit_concurrency_cap_exists():
+def test_the_sit_concurrency_cap_actually_bounds_concurrency():
     """Option (b) of the same tracker item. Both halves matter: the cap bounds how many stacks can
-    exist, the subtraction handles the ones that already do."""
-    assert config.MAX_CONCURRENT_SIT >= 1
-    assert callable(nodes._acquire_sit_slot)
+    exist, the subtraction handles the ones that already do.
+
+    Asserting `MAX_CONCURRENT_SIT >= 1` and `callable(_acquire_sit_slot)` would be vacuous —
+    neither can fail for any code state a human would write. `>= 1` is true of every legal value of
+    the constant, and `callable()` of a module-level `def` is true by construction. So it drove the
+    REAL slot machinery instead: fill the cap with `flock`-backed slots, then prove the next
+    request is refused, then prove a release frees one.
+    """
+    held = [f"EXE-cap-{i}" for i in range(config.MAX_CONCURRENT_SIT)]
+    try:
+        for exec_id in held:
+            assert nodes._try_acquire_sit_slot(exec_id), f"{exec_id} could not take a free slot"
+        # One past the cap. A cap that does not refuse is not a cap.
+        assert not nodes._try_acquire_sit_slot("EXE-cap-overflow"), (
+            f"a {config.MAX_CONCURRENT_SIT + 1}th concurrent SIT was granted a slot — "
+            f"MAX_CONCURRENT_SIT bounds nothing")
+        # And it is a cap, not a permanent wall: releasing one must free exactly one.
+        nodes._release_sit_slot(held[0])
+        assert nodes._try_acquire_sit_slot("EXE-cap-overflow"), "a released slot was never reusable"
+        held[0] = "EXE-cap-overflow"
+    finally:
+        for exec_id in held:
+            nodes._release_sit_slot(exec_id)
 
 
 def test_the_build_slot_also_checks_headroom():

@@ -23,8 +23,11 @@ import pytest
 
 from ocean_pipeline import config, quality
 
-pytestmark = pytest.mark.skipif(shutil.which("gitleaks") is None,
-                                reason="gitleaks not installed on this machine")
+# NOT module-level. A module-wide skipif also silenced the four flip_ready gate tests at the bottom,
+# which mock `secret_scan` entirely and need no scanner — so on CI without gitleaks the whole file
+# reported green while certifying nothing. The skip belongs on the scanner-dependent tests only.
+_needs_gitleaks = pytest.mark.skipif(shutil.which("gitleaks") is None,
+                                     reason="gitleaks not installed on this machine")
 
 # The bait, ASSEMBLED AT RUNTIME rather than written as a literal.
 #
@@ -86,11 +89,13 @@ def _branch(repo: Path, name: str, filename: str, content: str):
     _sh("git", "commit", "-qm", f"{name}: change", cwd=repo)
 
 
+@_needs_gitleaks
 def test_the_fixture_itself_resolves_a_base(repo):
     """Guard the guard. Without an origin every other test here passes on zero findings."""
     assert quality.base_ref(repo, 30) == "origin/main"
 
 
+@_needs_gitleaks
 def test_a_planted_secret_is_found(repo):
     _branch(repo, "MM-1/leak", "cfg.rb", _PLANTED)
     findings, reason, scanned = quality.secret_scan([repo], timeout=60)
@@ -101,6 +106,7 @@ def test_a_planted_secret_is_found(repo):
     assert "gitleaks rule" in findings[0]["summary"]
 
 
+@_needs_gitleaks
 def test_the_secret_itself_never_enters_a_finding(repo):
     """The finding travels much further than the scanner's own output — milestone, telemetry
     output_summary, run-report.json, the Jira comment, monitor.db and the web UI. `--redact` alone
@@ -114,6 +120,7 @@ def test_the_secret_itself_never_enters_a_finding(repo):
         assert f"'{key}'" not in blob, f"a raw {key} field reached the finding"
 
 
+@_needs_gitleaks
 def test_a_clean_diff_is_scanned_and_clean(repo):
     """The direction that matters for trust: `scanned` must be 1, not 0. "Clean" and "never ran"
     both produce zero findings and must be distinguishable."""
@@ -123,6 +130,7 @@ def test_a_clean_diff_is_scanned_and_clean(repo):
     assert scanned == 1, "a clean branch must be SCANNED, not merely finding-free"
 
 
+@_needs_gitleaks
 def test_a_preexisting_secret_on_main_is_not_this_tickets_problem(repo):
     """Scans the diff, not history. Blocking a ticket's flip on a secret it never touched is an
     unactionable stop, and the engineer cannot fix it within this ticket."""
@@ -139,6 +147,7 @@ def test_a_preexisting_secret_on_main_is_not_this_tickets_problem(repo):
     assert scanned == 1, reason
 
 
+@_needs_gitleaks
 def test_a_missing_scanner_is_unverified_not_clean(repo, monkeypatch):
     """Fails OPEN, but never silently: an absent gitleaks must not halt every ready-flip, and must
     not be reported as a clean scan either."""
@@ -150,6 +159,7 @@ def test_a_missing_scanner_is_unverified_not_clean(repo, monkeypatch):
     assert "NOT scanned" in reason, reason
 
 
+@_needs_gitleaks
 def test_a_repo_with_no_base_is_reported_not_skipped(tmp_path):
     bare = tmp_path / "norem"
     bare.mkdir()
@@ -252,6 +262,7 @@ def test_the_knob_is_on_by_default_and_the_state_keys_are_declared():
     assert "secret_scan_unverified" in OceanState.__annotations__
 
 
+@_needs_gitleaks
 def test_every_repo_is_counted_not_just_the_last(repo, tmp_path):
     """`scanned` must ACCUMULATE. A single-repo corpus cannot tell `scanned += 1` from
     `scanned = 1`, and the difference is exactly the "how much did we actually cover" signal the
@@ -270,6 +281,7 @@ def test_every_repo_is_counted_not_just_the_last(repo, tmp_path):
     assert scanned == 2, f"two repos were scanned but only {scanned} counted"
 
 
+@_needs_gitleaks
 def test_the_scanner_is_always_invoked_with_redaction(repo, monkeypatch):
     """Defence in depth, and it needs its own test because the finding is safe WITHOUT it: this
     module never copies `Secret`/`Match` into a finding, so dropping `--redact` leaves every

@@ -23,8 +23,13 @@ mandated lookups are not available to perform. See `_predict` for the full reaso
 The researcher classifies and never codes, opens PRs, or mutates state, so replaying it has no side
 effects beyond its own artifacts dir.
 
-Corpus format — JSONL, one object per line (``#`` lines and blanks ignored):
-    {"ticket_id": "MM-14312", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
+Corpus format — JSONL, one object per line (``#`` lines and blanks ignored). The illustration uses
+a FICTITIOUS ticket id on purpose: the standing rule from this eval's own contamination incident is
+that illustrations must come from outside the corpus, and the previous example was a real corpus row
+with its answer key attached. A docstring is not sent to the graded worker, so this was not live
+contamination — but "the leak is harmless here" is the reasoning that produced the 31/31 run, and a
+rule with an exception is one nobody applies.
+    {"ticket_id": "MM-00000", "route": "coding", "domain_bucket": "ocean_tracking_milestones"}
 `route` is required and always scored. `domain_bucket` is scored ONLY for coding tickets that
 supply a non-empty ground-truth bucket (rca/sop/etc. have no bucket; unverified buckets are
 left "" and skipped rather than scored against a guess).

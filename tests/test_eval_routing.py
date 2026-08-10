@@ -11,14 +11,13 @@ is out of scope here by design.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 
+from conftest import load_module_by_path
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "eval_routing.py"
-_spec = importlib.util.spec_from_file_location("eval_routing", _SCRIPT)
-ev = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ev)
+ev = load_module_by_path(_SCRIPT, "eval_routing")
 
 
 def _row(ticket_id: str, gt: str, pred: str, bucket_ok=None) -> dict:

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from ocean_pipeline import agents, config, gitops, graph, jira, metrics, nodes, report, schemas, telemetry, tracing, ui
+from ocean_pipeline import agents, config, gitops, graph, jira, metrics, nodes, quality, report, schemas, telemetry, tracing, ui
 from ocean_pipeline import cli, qa_batch
 
 
@@ -73,6 +73,14 @@ def _install(script: Script, tmp_path, monkeypatch):
     # tests would fail on every other machine for a reason that has nothing to do with what they
     # assert. The gate's own behaviour is covered directly by the dedicated tests further down.
     monkeypatch.setattr(nodes, "_check_rca_report", lambda text: ([], ""))
+    # Same reasoning, one station later. `flip_ready`'s secret gate now REFUSES a flip when
+    # `quality.repo_dirs` resolves nothing — an unscanned diff must not be sent for human review.
+    # These scripts have no checkout at all, so every one of them resolves zero directories and
+    # would stop there, turning 15 ROUTING tests into 15 assertions about the secret gate. Stub the
+    # scan itself (one directory, no findings), never the refusal: the refusal's own behaviour is
+    # covered directly by test_audit_regressions.py's flip_ready probe and by test_secret_scan.py.
+    monkeypatch.setattr(quality, "repo_dirs", lambda *a, **k: [tmp_path])
+    monkeypatch.setattr(quality, "secret_scan", lambda dirs, timeout=0: ([], "", len(dirs)))
     vdir = tmp_path / "verdicts"
     vdir.mkdir()
     monkeypatch.setattr(config, "automation_verdict_path", lambda tid: vdir / f"{tid}.json")
@@ -4037,6 +4045,9 @@ def test_every_station_reaches_a_terminal_status():
             assert telemetry._STATUS.get(p, telemetry._ANNOTATION_STATUS) in documented, p
 
 
+@pytest.mark.skipif(
+    not (config.FK_AIDEVELOPER_DIR / "skills" / "ocean-automation-testing" / "SKILL.md").exists(),
+    reason="fk-aideveloper checkout not present (run_skill resolves a real SKILL.md from it)")
 def test_run_agent_and_run_skill_actually_record_spend(tmp_path, monkeypatch):
     """This test replaces two `inspect.getsource(...) in ...` string assertions that PASSED on code
     which raised NameError on every call. `run_skill` has no `execution_id` parameter; the F10 line

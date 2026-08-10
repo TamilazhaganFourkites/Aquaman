@@ -56,7 +56,17 @@ echo "════════════════════════�
 
 results=()
 i=0
+# E1, machine-wide. `ocean-pipeline` now refuses to start under an engaged switch, so this loop
+# would keep spawning runs that immediately exit — noisy, and it buries the reason in per-run logs.
+# Checked here too, so the batch stops at the next ticket boundary and says why once.
+KILL_SWITCH="${OCEAN_PIPELINE_KILL_SWITCH:-$HOME/.ocean-pipeline/HALT}"
+
 for t in "${tickets[@]}"; do
+  if [[ -e "$KILL_SWITCH" ]]; then
+    echo "HALTED — $(cat "$KILL_SWITCH" 2>/dev/null | head -1)"
+    echo "  remaining tickets not started; release with: rm $KILL_SWITCH"
+    break
+  fi
   i=$((i + 1))
   log="$LOGDIR/${t}-${TS}.log"
   echo

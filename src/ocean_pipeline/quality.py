@@ -779,6 +779,11 @@ def secret_scan(dirs: list[Path], timeout: float) -> tuple[list[dict], str, int]
     # this block alone keeps every test green because the except arm catches the FileNotFoundError.
     # Do not delete BOTH: without either one, a machine without gitleaks does not fail open at all,
     # it raises out of the middle of the loop and takes the ready-flip with it.
+    if not dirs:
+        # ZERO directories is not a clean scan. `flip_ready` gates on findings, so returning ("",
+        # no findings) here would flip a PR ready having scanned nothing at all -- the same
+        # absence-of-evidence-as-evidence shape the topology gate and the junit gate both refuse.
+        return [], "no repository directories were resolved — NOTHING was scanned", 0
     if not shutil.which(SECRET_SCANNER):
         return [], f"{SECRET_SCANNER} is not installed — NOT scanned", 0
     for repo_dir in dirs:

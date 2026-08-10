@@ -48,7 +48,7 @@ def after_rca_review(state: OceanState) -> str:
     # Reject -> stop cleanly, before any coding starts. Approve -> the same routing as before:
     # RCA Done (terminal report) | Fix needed -> deps+reachability -> coder. In RCA-only mode
     # we always stop at the report; the fix is a separate "RCA Done" run.
-    if str(state.get("rca_approval_decision", "")).lower().startswith("reject"):
+    if schemas.gate_decision(state.get("rca_approval_decision", ""), ("reject", "rejected")):
         return "reject"
     # Finding 3 (judge follow-up): never start autonomous CODING off an RCA that failed its own
     # quality gate. rca_report refused to post it (missing sections / no INDEPENDENT STATUS CHECK),

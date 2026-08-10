@@ -210,6 +210,10 @@ MAX_REVIEW_ITERATIONS = 2
 # `harsh_reviewer`. Closes the one path with no deterministic check at all: today nothing mechanical
 # looks at a diff before an LLM reviews it and a draft PR opens (the junit parse, F1, is downstream at
 # Station 6). Defaults ON — a gate shipped default-off is not shipped.
+# BLAST RADIUS BEYOND THE NAME. `quality_gate` is registered conditionally (graph.py), and the node
+# evaluator's routing hangs off that same node's router — so turning this off also turns off D6
+# enforcement, silently. Worse, `_eval_node` still WRITES `eval_stopped`, and `stop_run` reads it to
+# pick a label, so a later unrelated stop can be labelled `eval_accuracy_failed`.
 QUALITY_GATE = os.environ.get("OCEAN_PIPELINE_QUALITY_GATE", "1").lower() in ("1", "true", "yes")
 # BOUNCES back to the coder before giving up — not gate firings. Kept at 1 deliberately: one bounce
 # costs a FULL coder station (~30 min observed), and a syntax error the coder was handed verbatim and

@@ -126,3 +126,56 @@ def test_a_switch_engaged_before_the_batch_starts_nothing(monkeypatch, tmp_path)
     monkeypatch.setattr(qa_batch, "run_one", _never)
     assert asyncio.run(qa_batch.run_batch(["MM-1", "MM-2"])) == []
     assert called == [], "a pre-engaged switch must start nothing at all"
+
+
+def test_every_driver_that_starts_a_run_consults_the_halt():
+    """E1's stated scope is MACHINE-WIDE, and it shipped consulted in exactly one place.
+
+    `qa_batch` had it; `cli._run` (the ordinary `ocean-pipeline MM-1234` entry point, and the one
+    `run-batch.sh` loops), both monitor batch drivers, and `run-batch.sh` itself did not — so an
+    engaged switch stopped the unattended sweep and nothing else. A stop that one of five entry
+    points honours is a convention, not a stop.
+
+    Asserted per driver by NAME so a new driver added without the consult is visible here, rather
+    than as a run that started during a halt."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    drivers = {
+        "src/ocean_pipeline/qa_batch.py": "kill_switch.status(",
+        "src/ocean_pipeline/cli.py": "kill_switch.status(",
+        "monitor/app.py": "_kill_switch.",
+        "run-batch.sh": "KILL_SWITCH",
+    }
+    missing = [f for f, needle in drivers.items()
+               if needle not in (root / f).read_text(errors="replace")]
+    assert not missing, f"these drivers can start a run during a machine-wide halt: {missing}"
+
+
+def test_the_shell_driver_uses_the_same_path_the_module_does():
+    """`run-batch.sh` cannot import the module, so it re-derives the path — and a drifting default
+    would make the shell loop ignore a switch the Python drivers honour."""
+    import importlib
+    import os
+    import pathlib
+    import re
+
+    from ocean_pipeline import kill_switch
+
+    sh = (pathlib.Path(__file__).resolve().parents[1] / "run-batch.sh").read_text()
+    m = re.search(r'KILL_SWITCH="\$\{OCEAN_PIPELINE_KILL_SWITCH:-\$HOME/([^"}]+)\}"', sh)
+    assert m, "run-batch.sh no longer derives the kill-switch path the documented way"
+
+    # The module's DEFAULT, not its current value: conftest redirects `KILL_SWITCH_PATH` into the
+    # session temp dir, so comparing the live attribute compares the test harness, not the shipped
+    # default the shell has to match.
+    saved = dict(os.environ)
+    try:
+        os.environ.pop("OCEAN_PIPELINE_KILL_SWITCH", None)
+        default = str(importlib.reload(kill_switch).KILL_SWITCH_PATH)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+        importlib.reload(kill_switch)
+    assert default.endswith(m.group(1)), (
+        f"shell default {m.group(1)!r} does not match the module default {default!r}")
