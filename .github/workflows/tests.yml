@@ -1,0 +1,80 @@
+# D5. The repo had THREE workflows and none of them ran a test.
+#
+# That is the defect this file closes, and it is worth naming precisely: `claude-review.yml` and
+# `claude-on-demand.yml` ask a model to look at a PR. A model reading a diff is not a test run — it
+# cannot tell you that `_review_coverage` still returns four values, or that `secret_scan` still
+# refuses to call zero directories clean. Roughly 500 tests existed and every one of them ran only
+# on a laptop, when someone remembered. A suite nobody runs automatically is the same shape as a
+# gate that is on but not connected — the failure this codebase has now catalogued a dozen times.
+#
+# Deliberately narrow. It installs, it runs pytest, it stops:
+#   * no lint / type / coverage step -- none is configured in-repo, and inventing thresholds here
+#     would fail PRs on a standard nobody agreed to.
+#   * no matrix -- `requires-python = ">=3.11"` and one interpreter is the honest scope for a tool
+#     that runs on its author's machine. (Note the skill tools next door DO have to survive 3.7;
+#     that constraint belongs to `fk-aideveloper`, not here.)
+#   * no coverage upload, no artifact publishing, no deploy.
+#
+# It must never touch QAT, TestRail, Jenkins, or `cloudqwest/test-automation` -- those create real
+# records in shared systems. The suite is hermetic (tests/conftest.py redirects every durable path
+# into tmp and clears RCA_TOKEN), and the absence of credentials in this job is the second line of
+# defence, not the first.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A force-push should not leave the superseded run burning a runner.
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          # Explicit. The default key globs `**/requirements.txt`, which here matches only
+          # `monitor/requirements.txt` — a file this job never installs from — so the cache was
+          # keyed on the wrong contents, and deleting that unrelated file would make the setup step
+          # throw "no file matched".
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        # The package plus its declared test extra. `-e` so `src/ocean_pipeline` is importable
+        # under the same layout the tests assume locally.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: pytest
+        # No `-x`: a green-until-first-failure run tells you one thing is broken; the full run tells
+        # you whether it is one thing or thirty, which is the difference between a typo and a
+        # bad merge.
+        #
+        # `-rs` so the SKIP REASONS are printed. A green run here is a SMALLER suite than a green
+        # run on a laptop: ~23 tests skip on a clean runner (gitleaks is not installed, the sibling
+        # fk-aideveloper checkout is absent, gofmt is absent). That is the honest scope for a
+        # hermetic job, but it must be visible in the log rather than inferred from a pass count —
+        # otherwise CI certifies coverage it never ran.
+        run: python -m pytest tests/ -q -rs --junitxml=junit.xml
+
+      - name: Upload junit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: junit.xml
+          if-no-files-found: warn

@@ -12,3 +12,6 @@ checkpoints.sqlite
 .langgraph_api/
 *.log
 .vscode/
+
+# macOS Finder metadata — never belongs in the repo
+.DS_Store

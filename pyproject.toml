@@ -12,7 +12,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+# fastapi is what `monitor/app.py` imports. Without it `tests/test_monitor_slot_release.py` skips
+# wholesale on CI, and the monitor is production code in this repo -- the audit's finding was
+# precisely that app.py is never imported by any test. (pydantic is already a base dependency.
+# `uvicorn` was added here alongside fastapi and removed again: nothing imports it -- it appears in
+# app.py only inside a comment and the logger-name string "uvicorn.access" -- so it was a
+# dependency the justification did not cover.)
+test = ["pytest>=8.0", "fastapi>=0.110"]
 studio = ["langgraph-cli[inmem]>=0.1.55"]   # `langgraph dev` -> LangGraph Studio UI
 langfuse = ["langfuse>=2.53", "langchain>=0.3"]   # self-hosted tracing UI (langfuse.fourkites.com); handler needs langchain
 telemetry = ["mcp>=1.0"]   # aidev-db HTTP MCP client (usually already present via claude-agent-sdk)
