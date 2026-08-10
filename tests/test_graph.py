@@ -1392,7 +1392,7 @@ def test_rca_report_refuses_to_post_a_report_missing_its_own_gates(tmp_path, mon
     # `nodes.rca_report` shells out to whatever is at `config.FK_AIDEVELOPER_DIR` — the live tree,
     # not a pinned copy.
     #
-    # MERGE ORDER — **land Aquaman FIRST**, and see `docs/MERGE-ORDER.md`. Measured both windows:
+    # MERGE ORDER — **land Aquaman FIRST**. Measured both windows:
     # fk-aideveloper-first puts the new checker in front of the OLD prompt, so every report is
     # refused, the gate fails closed and every Ocean RCA run fails for the duration. Aquaman-first is
     # harmless — the old checker simply ignores the new field. Three earlier reviews recommended the
