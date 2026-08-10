@@ -16,6 +16,8 @@ import json
 import os
 import urllib.request
 
+from . import ui
+
 JIRA_BASE_URL = os.environ.get("JIRA_BASE_URL", "https://fourkites.atlassian.net").rstrip("/")
 JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 # Atlassian CLOUD authenticates an API token with Basic <email:token>, NOT Bearer. Bearer is for
@@ -27,8 +29,35 @@ DEBUG = os.environ.get("OCEAN_PIPELINE_JIRA_DEBUG", "").lower() in ("1", "true",
 TIMEOUT = float(os.environ.get("OCEAN_PIPELINE_JIRA_TIMEOUT", "10"))
 
 
+_WARNED_ONCE = False
+
+
 def _enabled() -> bool:
-    return bool(JIRA_API_TOKEN)
+    """Is Jira genuinely reachable — not merely "a token exists"?
+
+    A token alone was the test, and it is wrong for the deployment we actually run against.
+    `_auth_header` sends Bearer when no email is configured, and Atlassian CLOUD answers Bearer with
+    403. So a token-only operator passed this check, every writer built a request that could only
+    fail, and every writer swallows its errors -- which is exactly how the Bearer/403 defect stayed
+    invisible until an eval that reports fetch failures surfaced it. A writer that can only 403 is
+    not enabled.
+
+    Server/DC and OAuth deployments legitimately have no email and Bearer is correct for them, so
+    the email is required only when the host is Atlassian Cloud. Says so ONCE, because a per-write
+    warning on a best-effort path is noise that gets filtered.
+    """
+    global _WARNED_ONCE
+    if not JIRA_API_TOKEN:
+        return False
+    if "atlassian.net" in (JIRA_BASE_URL or "").lower() and not JIRA_EMAIL:
+        if not _WARNED_ONCE:
+            _WARNED_ONCE = True
+            ui.milestone(
+                "Jira is CONFIGURED BUT UNUSABLE: JIRA_BASE_URL is Atlassian Cloud, which requires "
+                "Basic auth, and JIRA_EMAIL is unset — every write would send Bearer and 403. "
+                "Set JIRA_EMAIL. No ticket will be transitioned or commented on this run.")
+        return False
+    return True
 
 
 def _auth_header() -> str:

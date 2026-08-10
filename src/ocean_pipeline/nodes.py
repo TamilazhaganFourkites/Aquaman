@@ -880,7 +880,7 @@ async def researcher(state: OceanState) -> dict:
                             checkout_sync="; ".join(sync_status) or "no target repo to sync")
     return {"route": v.route, "research_packet": _load_json(v.packet_path),
             "target_repos": v.target_repos, "domain_bucket": v.domain_bucket,
-            "recurring_lessons": recurring}
+            "domain_bucket_raw": v.domain_bucket_raw, "recurring_lessons": recurring}
 
 
 # ------------------------------------------------------------------ Station 0.5 — ocean SME consult
@@ -913,7 +913,17 @@ async def sme_consult(state: OceanState) -> dict:
     exec_id = state["execution_id"]
     sme_md = _SME_BY_BUCKET.get(bucket)
     if not sme_md:
-        telemetry.station_event(exec_id, 0.5, "skip", domain_bucket=bucket or "(none)")
+        # Name the token the researcher actually returned. Logging `bucket` alone printed "(none)"
+        # for a typo and for a genuinely bucket-less ticket alike, so a misrouted ticket read as a
+        # correctly-skipped one. Read from STATE, which is per-ticket: a module-level record would
+        # be shared by every ticket in a `qa_batch` process and report ticket 1's typo against
+        # ticket 2.
+        unmatched = state.get("domain_bucket_raw") or ""
+        telemetry.station_event(exec_id, 0.5, "skip", domain_bucket=bucket or "(none)",
+                                unmatched_token=unmatched)
+        if unmatched:
+            ui.milestone(f"no SME for domain_bucket {unmatched!r} — it matched no known bucket, so "
+                         f"this ticket was routed without its domain expert")
         return {"sme_findings": {}}
     telemetry.station_event(exec_id, 0.5, "start", domain_bucket=bucket)
     v: schemas.SmeVerdict = await agents.run_agent(

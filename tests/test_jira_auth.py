@@ -75,3 +75,45 @@ def test_every_authenticated_request_goes_through_the_one_auth_builder():
                 f"jira.py line {getattr(value, 'lineno', '?')} builds an Authorization header "
                 f"without _auth_header() — the scheme fix does not reach this request")
     assert seen >= 1, "no Authorization header found in jira.py — did the request builder move?"
+
+
+def test_a_token_without_an_email_is_NOT_enabled_on_cloud(monkeypatch, capsys):
+    """The other half of the Bearer/403 fix, and without it the first half changes nothing.
+
+    `_auth_header` sends Bearer when no email is set, and Atlassian Cloud answers Bearer with 403.
+    `_enabled()` tested only for a token, so a token-only operator passed it, every writer built a
+    request that could only fail, and every writer swallows its errors — which is precisely how the
+    Bearer/403 defect stayed invisible. A writer that can only 403 is not enabled."""
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "")
+    monkeypatch.setattr(jira, "JIRA_BASE_URL", "https://fourkites.atlassian.net")
+    monkeypatch.setattr(jira, "_WARNED_ONCE", False)
+
+    assert jira._enabled() is False, (
+        "a token-only operator on Cloud is reported as enabled, so every write silently 403s")
+    out = capsys.readouterr().out
+    assert "JIRA_EMAIL" in out, "the misconfiguration is not named, so nobody can act on it"
+
+
+def test_the_warning_is_said_once_not_per_write(monkeypatch, capsys):
+    """These writers are best-effort and run per station; a warning on every call is noise that
+    gets filtered, which is how a real one gets missed."""
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "")
+    monkeypatch.setattr(jira, "JIRA_BASE_URL", "https://fourkites.atlassian.net")
+    monkeypatch.setattr(jira, "_WARNED_ONCE", False)
+
+    for _ in range(3):
+        jira._enabled()
+    # Count the MESSAGE, not a token inside it — "JIRA_EMAIL" appears twice in one emission.
+    assert capsys.readouterr().out.count("CONFIGURED BUT UNUSABLE") == 1
+
+
+def test_server_or_dc_deployments_stay_enabled_without_an_email(monkeypatch):
+    """Bearer is CORRECT for Server/DC and OAuth, which have no email — so requiring one
+    unconditionally (as the monitor's own predicate does) would disable Jira for a deployment
+    where it works. The email is required only where Bearer is guaranteed to fail."""
+    monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "")
+    monkeypatch.setattr(jira, "JIRA_BASE_URL", "https://jira.internal.example.com")
+    assert jira._enabled() is True

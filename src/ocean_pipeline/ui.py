@@ -39,7 +39,7 @@ _LABELS = {
     "blocked_review_gate": "Open questions — awaiting approval",
     "qa_scenarios":       "GAN-hardened test scenarios",
     "coder":              "Coding",
-    "quality_gate":       "Static quality gate",
+    "quality_gate":       "Code quality gate",
     "harsh_reviewer":     "Adversarial code review",
     "open_pr":            "Open draft PR",
     "sit_resolve":        "Local SIT — resolve & gate",

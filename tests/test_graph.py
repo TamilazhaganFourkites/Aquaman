@@ -2682,6 +2682,10 @@ class _FakeJiraResponse:
 
 def test_jira_transition_finds_matching_and_posts(monkeypatch):
     monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    # And an email: `_enabled()` refuses a token-only config against Atlassian Cloud, because Bearer
+    # there can only 403. These tests exercise the request mechanics; `test_jira_auth.py` owns the
+    # configuration check itself.
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "a@b.com")
     calls = []
 
     def fake_urlopen(req, timeout=None):
@@ -2699,6 +2703,7 @@ def test_jira_transition_finds_matching_and_posts(monkeypatch):
 
 def test_jira_transition_no_match_skips_post(monkeypatch):
     monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "a@b.com")
     calls = []
 
     def fake_urlopen(req, timeout=None):
@@ -2712,6 +2717,7 @@ def test_jira_transition_no_match_skips_post(monkeypatch):
 
 def test_jira_transition_swallows_errors(monkeypatch):
     monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "a@b.com")
 
     def fake_urlopen(req, timeout=None):
         raise OSError("network down")
@@ -2722,6 +2728,7 @@ def test_jira_transition_swallows_errors(monkeypatch):
 
 def test_jira_comment_posts_body(monkeypatch):
     monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "a@b.com")
     calls = []
 
     def fake_urlopen(req, timeout=None):
@@ -2738,6 +2745,7 @@ def test_jira_comment_posts_body(monkeypatch):
 
 def test_jira_comment_swallows_errors(monkeypatch):
     monkeypatch.setattr(jira, "JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira, "JIRA_EMAIL", "a@b.com")
 
     def fake_urlopen(req, timeout=None):
         raise OSError("network down")

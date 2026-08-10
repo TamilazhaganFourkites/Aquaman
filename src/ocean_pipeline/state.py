@@ -39,6 +39,7 @@ class OceanState(TypedDict, total=False):
     research_packet: dict
     target_repos: list[TargetRepo]   # carries the language-scoped Docker decision
     domain_bucket: str               # ocean domain; drives the SME-consult node
+    domain_bucket_raw: str           # what the researcher said, iff it matched no known bucket
     sme_findings: dict               # ownership/reuse guidance from the consulted ocean SME
     # Finding 3 (architecture review, "Give Pipeline Memory"): recurring failure patterns this same
     # domain_bucket has hit on PRIOR tickets (lessons.recall_lessons, written by stop_run's

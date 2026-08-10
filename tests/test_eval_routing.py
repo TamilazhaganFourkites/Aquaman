@@ -85,3 +85,21 @@ def test_the_report_can_be_re_derived_not_merely_believed():
 
     # And it survives a JSON round-trip, since it ships inside the report.
     assert json.loads(json.dumps(p))["run_id"] == p["run_id"]
+
+
+def test_the_bucket_accuracy_has_its_own_row_floor():
+    """The floor and the denominator were different sets. `enough` counted `scored` (route rows —
+    29 in the current corpus) while `domain_bucket_accuracy` divides by `bucket_scored`, only the
+    rows carrying a verified ground-truth bucket (~6). So `underpowered` read False while the
+    bucket figure sat on a sixth of the rows: the flag that exists to say "too few" was measuring
+    the set that was not too few."""
+    rows = [_row(f"MM-{i}", "coding", "coding", bucket_ok=True) for i in range(ev.MIN_SCORABLE_ROWS)]
+    for r in rows[3:]:
+        r["bucket_ok"] = None          # only 3 rows carry a scorable bucket
+
+    res = ev._score(rows)
+    assert res["underpowered"] is False, "the ROUTE figure is well powered — that has not changed"
+    assert res["domain_bucket_scored"] == 3
+    assert res["domain_bucket_underpowered"] is True, (
+        "a bucket accuracy over 3 rows is reported as if it were as sound as the route accuracy")
+    assert res["min_scorable_bucket_rows"] == ev.MIN_SCORABLE_BUCKET_ROWS

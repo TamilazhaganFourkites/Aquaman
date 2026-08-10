@@ -425,3 +425,70 @@ def test_no_module_anywhere_holds_a_live_jira_credential():
             live.append(name)
     assert not live, (
         f"these loaded modules hold a live Jira token (values deliberately not shown): {live}")
+
+
+def test_a_typod_domain_bucket_is_distinguishable_from_no_bucket():
+    """C5's residual. The validator blanks an unrecognised bucket, and `sme_consult` logged the
+    already-blanked value — so `domain_bucket="(none)"` covered both a ticket that genuinely has no
+    bucket and one whose bucket was misspelled. A misrouted ticket read as a correctly-skipped one,
+    and the SME that never ran looked like an SME that was never needed.
+
+    A near-miss must still be RECOVERED, not recorded: that recovery is the reason the validator
+    degrades instead of raising."""
+    from ocean_pipeline import schemas
+
+    def _bucket(raw):
+        v = schemas.ResearchVerdict.model_validate(
+            {"route": "coding", "domain_bucket": raw, "packet_path": "/x", "target_repos": []})
+        return v.domain_bucket, v.domain_bucket_raw
+
+    assert _bucket("callback_notifications") == ("", "callback_notifications"), (
+        "a typo'd bucket leaves no trace, so telemetry cannot tell it from a bucket-less ticket")
+    assert _bucket("Ocean_Data-Quality") == ("ocean_data_quality", ""), (
+        "a near-miss must be recovered, not recorded — that recovery is why this degrades")
+    assert _bucket("") == ("", ""), "an absent bucket is not an unmatched token"
+
+
+def _sme_skip_event(monkeypatch, state):
+    """Drive `sme_consult` down its no-SME branch and return the telemetry kwargs it emitted."""
+    seen = {}
+    monkeypatch.setattr(nodes.telemetry, "station_event",
+                        lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(nodes.ui, "milestone", lambda *a, **kw: None)
+    base = {"execution_id": "EXE-T", "ticket_id": "MM-1"}
+    assert asyncio.run(nodes.sme_consult({**base, **state})) == {"sme_findings": {}}
+    return seen
+
+
+def test_the_sme_skip_event_names_the_token_it_could_not_match(monkeypatch):
+    """The record is only worth keeping if the one consumer reads it — so drive the consumer."""
+    seen = _sme_skip_event(monkeypatch, {"domain_bucket": "",
+                                         "domain_bucket_raw": "callback_notifications"})
+    assert seen.get("unmatched_token") == "callback_notifications", (
+        "sme_consult still logs only the blanked value, so the record nothing reads is dead")
+    assert seen.get("domain_bucket") == "(none)"
+
+
+def test_an_unmatched_token_cannot_leak_from_one_ticket_to_the_next(monkeypatch):
+    """The record lives on the VERDICT, not in a module-level list.
+
+    `qa_batch.py` runs every ticket of a batch in ONE process (`results.append(await run_one(t))`),
+    so a module-level record of the unmatched token would still be there when the next ticket
+    arrived: a ticket that genuinely has no bucket would be reported as carrying the PREVIOUS
+    ticket's typo, and would fire the misrouted-ticket milestone. Only the monitor was safe, and
+    only incidentally — it spawns a subprocess per ticket.
+
+    Gating the READ on a truthy `domain_bucket` does not fix this: the validator blanks the bucket
+    in BOTH cases, so that gate suppresses the typo report this record exists to produce."""
+    from ocean_pipeline import schemas
+    from ocean_pipeline.state import OceanState
+
+    assert "domain_bucket_raw" in OceanState.__annotations__, (
+        "LangGraph drops keys OceanState does not declare, so the token would never reach the node")
+
+    schemas.ResearchVerdict.model_validate(          # ticket 1: typo'd bucket
+        {"route": "coding", "domain_bucket": "callback_notifications",
+         "packet_path": "/x", "target_repos": []})
+    seen = _sme_skip_event(monkeypatch, {"domain_bucket": ""})   # ticket 2: genuinely none
+    assert seen.get("unmatched_token") == "", (
+        "the previous ticket's unmatched token leaked into this one's telemetry")

@@ -38,6 +38,24 @@ class ResearchVerdict(BaseModel):
     # Validated below — this used to be a bare `str` whose vocabulary lived in a COMMENT, one line
     # under `route`, which IS a Literal.
     domain_bucket: str = ""
+    # What the researcher said, iff it matched no known bucket -- otherwise "". `sme_consult` logs
+    # the already-blanked `domain_bucket`, so without this a typo'd bucket and a ticket with no
+    # bucket both read as "(none)" and a misrouted ticket looks correctly skipped.
+    #
+    # This MUST stay on the verdict rather than in a module-level record: `qa_batch` runs every
+    # ticket of a batch in ONE process, so anything module-level reports the first ticket's typo
+    # against every later bucket-less ticket. DERIVED, never model-supplied -- the validator below
+    # writes it unconditionally.
+    domain_bucket_raw: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_unmatched_bucket(cls, data):
+        """Stash the raw token BEFORE the field validator canonicalizes it away."""
+        if isinstance(data, dict):
+            raw = str(data.get("domain_bucket") or "").strip()
+            data = {**data, "domain_bucket_raw": "" if cls._canonical_bucket(raw) else raw}
+        return data
 
     @field_validator("domain_bucket", mode="before")
     @classmethod

@@ -135,6 +135,12 @@ async def _run(rows: list[dict], concurrency: int) -> list[dict]:
 # runs and still prints per-ticket results; it just refuses to publish a headline percentage it
 # cannot support. See MM-14816-accuracy-plan.md.
 MIN_SCORABLE_ROWS = 20
+# The BUCKET floor is separate and lower, because the two accuracies are computed over different
+# sets: `enough` counted route rows (29 in the current corpus) while `domain_bucket_accuracy`
+# divides by `bucket_scored` -- only rows carrying a verified ground-truth bucket, ~6. So
+# `underpowered` read False while the bucket figure sat on a sixth of the rows: the flag that
+# exists to say "too few" was measuring the set that was not too few.
+MIN_SCORABLE_BUCKET_ROWS = 10
 
 
 def _score(results: list[dict]) -> dict:
@@ -157,6 +163,7 @@ def _score(results: list[dict]) -> dict:
         (x["gt_route"], x["pred_route"]) for x in scored if not x["route_ok"])
 
     enough = len(scored) >= MIN_SCORABLE_ROWS
+    bucket_enough = len(bucket_scored) >= MIN_SCORABLE_BUCKET_ROWS
     return {
         "n": n,
         "scored": len(scored),
@@ -169,6 +176,8 @@ def _score(results: list[dict]) -> dict:
         "underpowered": (not enough),
         "min_scorable_rows": MIN_SCORABLE_ROWS,
         "domain_bucket_scored": len(bucket_scored),
+        "domain_bucket_underpowered": (not bucket_enough),
+        "min_scorable_bucket_rows": MIN_SCORABLE_BUCKET_ROWS,
         "domain_bucket_accuracy": (round(bucket_ok / len(bucket_scored), 4)
                                    if bucket_scored and enough else None),
         "domain_bucket_correct": bucket_ok,
